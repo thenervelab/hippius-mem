@@ -215,6 +215,14 @@ field.
   manifest this machine publishes now raises the watermark and the durable
   marker at once, and a manifest that differs from the applied one at the
   same version is refused.
+- A writer tip file that names an op the bucket no longer holds (a team
+  re-created under the same name, or a bucket restored from an older copy,
+  with the machine's state directory kept) no longer orphans every later
+  write. The writer chained new ops to the missing one and a fresh reader
+  dropped them all, a restart included. When this machine's own tip entry
+  is ahead of what the process already holds, the writer now checks with
+  one GET that the bucket holds that op and ignores the entry when it does
+  not.
 
 ## [0.7.1] - 2026-11-19
 

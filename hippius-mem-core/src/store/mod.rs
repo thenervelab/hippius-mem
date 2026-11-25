@@ -2480,9 +2480,25 @@ impl MemoryStore {
     /// [`MemError::Storage`] when a GET or a pending op's PUT fails. The write
     /// then fails with nothing appended, and a pending op stays recorded for
     /// the next attempt.
-    async fn machine_tip(&self, snapshot: &TipSnapshot) -> Result<ResolvedTip, MemError> {
+    async fn machine_tip(
+        &self,
+        snapshot: &TipSnapshot,
+        known: SharedTip,
+    ) -> Result<ResolvedTip, MemError> {
         let author = self.author_key();
-        let own = snapshot.authors.get(&author);
+        let own = match snapshot.authors.get(&author) {
+            Some(entry) if self.own_entry_is_stale(&author, entry, known).await? => {
+                tracing::warn!(
+                    team = %self.team,
+                    lamport = entry.committed.lamport,
+                    "this machine's writer tip names an op of this author the bucket does not \
+                     hold (a team re-created under the same name, or a bucket restored from \
+                     an older copy); ignoring it and chaining to what the bucket holds"
+                );
+                None
+            }
+            own => own,
+        };
         let floor = own.map_or(0, newest_lamport);
         let newer_elsewhere = snapshot
             .via_other_endpoint
@@ -2523,7 +2539,8 @@ impl MemoryStore {
     /// ([`OpLogStore::holds_op`], one GET each). An entry that passes names this
     /// bucket's chain and is reported in `absorbed`; one that fails is from
     /// another bucket of the same name (or its pending op never landed and its
-    /// committed op id is unknown) and is left alone. No I/O for `own`.
+    /// committed op id is unknown) and is left alone. No I/O for `own`, which
+    /// [`machine_tip`](Self::machine_tip) has already checked.
     ///
     /// # Errors
     ///
@@ -2572,6 +2589,28 @@ impl MemoryStore {
         }
 
         Ok(resolved)
+    }
+
+    /// Whether this endpoint's own tip `entry` names a committed op of `author`
+    /// the bucket does not hold, so chaining to it would orphan every later op.
+    ///
+    /// Checked (one GET, [`Self::bucket_holds_entry`]) only when the entry's
+    /// committed tip is ahead of `known`, the tip this process already holds
+    /// from its own writes or its sync: a tip this process wrote or read needs
+    /// no second look, so a steady writer pays nothing. An entry at Lamport 0
+    /// (no committed op yet) and one that does not record its op's id cannot be
+    /// checked and are trusted, as before.
+    async fn own_entry_is_stale(
+        &self,
+        author: &VerifyingKey,
+        entry: &AuthorTip,
+        known: SharedTip,
+    ) -> Result<bool, MemError> {
+        let checkable = entry.committed.lamport > known.lamport && entry.committed_op_id.is_some();
+        if !checkable {
+            return Ok(false);
+        }
+        Ok(!self.bucket_holds_entry(author, entry).await?)
     }
 
     /// Whether this bucket holds an op `entry` names: its pending op, or its
@@ -2949,7 +2988,13 @@ impl MemoryStore {
         // that forks the chain; the lock alone fixes nothing without it.
         let snapshot = cross.as_ref().map(WriterLockGuard::snapshot);
         let resolved = match &snapshot {
-            Some(snapshot) => self.machine_tip(snapshot).await?,
+            Some(snapshot) => {
+                let known = SharedTip {
+                    lamport: clock.my_last_lamport,
+                    tip_hash: clock.my_last_hash,
+                };
+                self.machine_tip(snapshot, known).await?
+            }
             None => ResolvedTip::default(),
         };
         if let Some(tip) = &resolved.tip {
@@ -15117,6 +15162,32 @@ mod tests {
         let reader = store_over(Arc::clone(&blob), READER_SEED)?;
         reader.sync().await?;
         assert_eq!(reader.get(id).await?.body, sample_input().body);
+        Ok(())
+    }
+
+    /// A writer tip file that names an op the bucket no longer holds (the team
+    /// re-created under the same name, the state directory kept) does not
+    /// orphan the next writes. The writer adopted the file's tip without a
+    /// check, chained every new op to the missing one, and a fresh reader
+    /// dropped them all as a gap, a restart included.
+    #[tokio::test]
+    async fn a_tip_file_naming_an_op_the_bucket_lost_is_not_chained_to() -> TestResult {
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let first_bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let first = store_over(first_bucket, SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        first.remember(numbered_input(0)).await?;
+        first.remember(numbered_input(1)).await?;
+        drop(first);
+
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let second = store_over(Arc::clone(&bucket), SOLO_SEED)?.with_writer_lock(Some(lock));
+        second.sync().await?;
+        let later = [
+            second.remember(numbered_input(2)).await?,
+            second.remember(numbered_input(3)).await?,
+        ];
+
+        assert_fresh_reader_sees_all(&bucket, &later).await?;
         Ok(())
     }
 
