@@ -52,8 +52,8 @@ use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::{
     AnchorRecord, AnchorResignReport, AnchorSignatureState, UnsignedAnchorPolicy,
-    anchor_record_exists, next_anchor_seq, own_anchored_leaves, persist_anchor_record,
-    read_anchor_records_with_policy, scan_anchor_records,
+    anchor_record_exists, own_anchors, persist_anchor_record, read_anchor_records_with_policy,
+    scan_anchor_records,
 };
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
@@ -1119,12 +1119,13 @@ pub struct MemoryStore {
     // `append_under_serialization` itself, may ever run inside a
     // `select!`/`timeout` that can drop its future — a cancelled call would
     // skip the reclaim arm and silently reintroduce the fork this
-    // guard-ordering exists to prevent. No PRODUCTION caller does that today
-    // (two test-only `tokio::time::timeout` wrappers exist — `server.rs` over
-    // `logic_forget`, `store/mod.rs` over `flush_anchors` — but neither
-    // reaches `mint_and_append`/`commit_edit`: the first blocks at
-    // `await_warm` before the store, the second is the anchor-commit path,
-    // not the op-log write path); keep it that way.
+    // guard-ordering exists to prevent. No caller does that today: the
+    // `tokio::time::timeout` wrappers that exist (the binary's exit flush and
+    // a test in `store/mod.rs`, both over `flush_anchors`, and a test in
+    // `server.rs` over `logic_forget`) never reach
+    // `mint_and_append`/`commit_edit`: `flush_anchors` is the anchor-commit
+    // path, not the op-log write path, and `logic_forget` blocks at
+    // `await_warm` before the store. Keep it that way.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -4988,9 +4989,16 @@ impl MemoryStore {
     /// threshold's worth of ops anchored nothing, ever. Run from
     /// [`flush_anchors`](Self::flush_anchors), which the binary calls when a
     /// session ends, so an ending session also anchors what an earlier one
-    /// that crashed left behind. Costs a full verified op-log read (op objects
-    /// come from the local cache when one is configured) and one GET per own
-    /// anchor record.
+    /// that crashed left behind.
+    ///
+    /// Coverage is a watermark, not a set: an op counts as covered when its
+    /// Lamport value is at or below the newest op this author's newest signed
+    /// record covers ([`own_anchors`]). Costs one LIST of this author's anchor
+    /// prefix and (in steady state) one GET, one LIST of the op-log keys, and
+    /// one GET per own op above the watermark, so it does not grow with the
+    /// author's history. An op below the watermark that no record lists (an
+    /// op a concurrent process under this identity wrote and never anchored)
+    /// stays unanchored.
     ///
     /// Two live processes under one identity can both queue the same uncovered
     /// op, and one still buffering an op queues it too; the op is then in two
@@ -5044,23 +5052,23 @@ impl MemoryStore {
         state.pending = leaves;
     }
 
-    /// This author's verified ops that no own anchor record covers, in Lamport
-    /// order.
+    /// This author's signed ops above its anchor watermark, in Lamport order.
     async fn uncovered_own_ops(&self) -> Result<Vec<PendingLeaf>, MemError> {
         let author = self.author_key();
-        let covered = own_anchored_leaves(&self.blob, &self.team, &author).await?;
-        let ops = self.oplog.read_all(&self.team).await?;
-        let mut uncovered: Vec<PendingLeaf> = ops
+        let through = own_anchors(&self.blob, &self.team, &author)
+            .await?
+            .anchored_through();
+        let ops = self
+            .oplog
+            .read_own_after(&self.team, &author, through)
+            .await?;
+        Ok(ops
             .iter()
-            .filter(|op| op.author_key == author)
             .map(|op| PendingLeaf {
                 hash: op.hash(),
                 lamport: op.lamport,
             })
-            .filter(|leaf| !covered.contains(&leaf.hash))
-            .collect();
-        uncovered.sort_by_key(|leaf| leaf.lamport);
-        Ok(uncovered)
+            .collect())
     }
 
     /// This store's sr25519 public key — the identity its ops and anchor records
@@ -5073,8 +5081,8 @@ impl MemoryStore {
     ///
     /// The first call in a process also queues this author's ops that no own
     /// anchor record covers ([`requeue_uncovered_own_ops`](Self::requeue_uncovered_own_ops)):
-    /// a verified op-log read and one GET per own record, whose failure is
-    /// logged and does not fail the flush.
+    /// two LISTs and a GET per own op above the anchor watermark, whose failure
+    /// is logged and does not fail the flush.
     ///
     /// Returns `Ok(None)` when nothing is pending. Intended for tests and graceful
     /// shutdown; the threshold path in [`MemoryStore::schedule_anchor`] handles
@@ -5366,17 +5374,18 @@ impl MemoryStore {
     /// refresh. Called only from [`reserve_seq_and_persist`](Self::reserve_seq_and_persist),
     /// under the cross-process lock it holds.
     ///
-    /// The seq comes from the keys under this author's own prefix
-    /// ([`next_anchor_seq`]): one LIST, no GET of any record. Reading every
-    /// record's body cost one GET per teammate record on every batch commit,
-    /// and took the seq from any body that claimed this author, wherever it
-    /// was stored.
+    /// The seq comes from this author's own prefix ([`own_anchors`]): one LIST
+    /// and, in steady state, one GET, never a teammate's record. The first free
+    /// seq above the newest record this author signed, so a key planted under
+    /// the prefix (one at `u64::MAX` included) is stepped over, not built on.
     ///
     /// # Errors
     ///
-    /// Whatever [`next_anchor_seq`] reports.
+    /// Whatever [`own_anchors`] or its `next_seq` report.
     async fn reseed_next_seq(&self) -> Result<(), MemError> {
-        let next = next_anchor_seq(&self.blob, &self.team, &self.author_key()).await?;
+        let next = own_anchors(&self.blob, &self.team, &self.author_key())
+            .await?
+            .next_seq()?;
         let mut state = self
             .anchor_state
             .lock()
@@ -15332,30 +15341,102 @@ mod tests {
         Ok(())
     }
 
-    /// An object under this author's anchor prefix naming seq `u64::MAX` fails
-    /// the anchor with an error. The seq used to saturate at `u64::MAX`, find it
-    /// taken, and retry the same seq forever, inside the write that triggered
-    /// the anchor.
+    /// A record under this author's anchor prefix at seq `u64::MAX` that this
+    /// author never signed (here a copy of its real record with the seq and
+    /// Lamport range raised) does not stop its anchoring: the next batch lands
+    /// at seq 1 and holds the new op. The seq used to be one past the highest
+    /// key, so that one object failed every later batch of the author.
     #[tokio::test]
-    async fn an_anchor_record_at_the_last_seq_fails_the_anchor_instead_of_hanging() -> TestResult {
+    async fn a_planted_anchor_record_at_the_last_seq_does_not_stop_anchoring() -> TestResult {
         // Yielding, so the timeout below can fire on a loop that never ends; the
         // in-memory store alone completes every call without returning to the
         // runtime.
         let blob: Arc<dyn BlobStore> = Arc::new(YieldingBlob(MemoryBlobStore::default()));
         let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
-        let planted = format!(
+        store.remember(numbered_input(0)).await?;
+        store.flush_anchors().await?;
+        let mut planted = read_anchor_records(&blob, TEAM)
+            .await?
+            .pop()
+            .ok_or("the first batch was anchored")?;
+        planted.seq = u64::MAX;
+        planted.meta.last_lamport = u64::MAX;
+        let key = format!(
             "{TEAM}/_anchors/{}/{:020}",
             store.author_key().to_hex(),
             u64::MAX
         );
+        blob.put(&key, serde_json::to_vec(&planted)?).await?;
+
+        let later = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        later.remember(numbered_input(1)).await?;
+        let flushed = tokio::time::timeout(Duration::from_mins(1), later.flush_anchors()).await??;
+
+        assert!(flushed.is_some(), "the new op was anchored");
+        let seqs: Vec<u64> = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.seq)
+            .collect();
+        assert_eq!(seqs, [0, 1]);
+        Ok(())
+    }
+
+    /// A key under this author's prefix that is not of the minted
+    /// `{seq:020}` shape (here `.../0`) occupies no seq, so the first batch
+    /// still lands at seq 0.
+    #[tokio::test]
+    async fn an_anchor_key_not_of_the_minted_shape_occupies_no_seq() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let planted = format!("{TEAM}/_anchors/{}/0", store.author_key().to_hex());
         blob.put(&planted, b"{}".to_vec()).await?;
         store.remember(sample_input()).await?;
 
-        let flushed = tokio::time::timeout(Duration::from_mins(1), store.flush_anchors()).await?;
-        assert!(
-            matches!(flushed, Err(MemError::Malformed(_))),
-            "got {flushed:?}"
+        store.flush_anchors().await?;
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(
+            records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            [0]
         );
+        Ok(())
+    }
+
+    /// A session's exit flush costs the same reads whether this author anchored
+    /// one batch before or forty: coverage comes from the newest signed record,
+    /// not from a GET of every record and a read of the whole team's log.
+    #[tokio::test]
+    async fn the_exit_requeue_does_not_grow_with_anchored_history() -> TestResult {
+        let gets_to_flush = |earlier_batches: usize| async move {
+            let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let earlier = store_with(Arc::clone(&bucket), SOLO_SEED, Arc::new(NoopAnchor), 1)?;
+            for n in 0..earlier_batches {
+                earlier.remember(numbered_input(n)).await?;
+            }
+            drop(earlier);
+            let meter = Arc::new(InstrumentedBlobStore::new(Arc::clone(&bucket)));
+            let later = store_with(
+                Arc::clone(&meter) as Arc<dyn BlobStore>,
+                SOLO_SEED,
+                Arc::new(NoopAnchor),
+                16,
+            )?;
+            later.remember(numbered_input(1000)).await?;
+            let before = meter.stats().get.calls;
+            later.flush_anchors().await?;
+            let leaves = read_anchor_records(&bucket, TEAM)
+                .await?
+                .last()
+                .map(|record| record.leaves.len());
+            Ok::<_, Box<dyn std::error::Error>>((meter.stats().get.calls - before, leaves))
+        };
+
+        let (one, one_leaves) = gets_to_flush(1).await?;
+        let (forty, forty_leaves) = gets_to_flush(40).await?;
+        assert_eq!(one, forty, "GETs per exit flush");
+        assert_eq!(one_leaves, Some(1), "only the new op is anchored");
+        assert_eq!(forty_leaves, Some(1), "only the new op is anchored");
         Ok(())
     }
 

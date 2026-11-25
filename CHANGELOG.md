@@ -181,14 +181,16 @@ field.
   full. The sweep now deletes only checkpoints older than the one just
   written, and a process downloads a checkpoint that does not open only
   once.
-- Committing an anchor batch reads the next sequence number from the keys
-  under this author's own `_anchors/{author}/` prefix, with one LIST and no
-  GET. It used to download every anchor record of every teammate, under the
-  writer lock, on each batch (201 GETs with 200 teammate records), and took
-  the number from any record body that claimed this author, so one record
-  naming the last possible number made every sixteenth write spin forever.
-  Such a key now fails the anchor with an error, and a run of collisions
-  gives up after 8 attempts.
+- Committing an anchor batch reads the next sequence number from this
+  author's own `_anchors/{author}/` prefix only: one LIST, and a GET of the
+  newest record, whose signature must verify under the author's key. The
+  batch takes the first free number above that record. It used to download
+  every anchor record of every teammate, under the writer lock, on each
+  batch (201 GETs with 200 teammate records), and took the number from any
+  record body that claimed this author, so one record naming the last
+  possible number made every sixteenth write spin forever. A key at the last
+  number that this author did not sign is now stepped over, and a run of
+  collisions gives up after 8 attempts.
 - A member whose `author_seed_hex` is not its mnemonic's seed (the setup
   `join --bundle` and the installer create, one random seed per machine)
   now loads the key of an epoch the founder rotated to. Its member key, and
@@ -228,9 +230,13 @@ field.
   Ctrl-C (stdio and `serve`). The buffer lived only in memory, so a stdio
   session, one process per agent session, anchored nothing unless it wrote
   16 ops, and `reconcile` checked almost no batches. An ending session also
-  anchors this author's earlier ops that no batch record covers, such as
-  those of a session that crashed. A code comment and `docs/SECURITY.md`
-  said this already happened.
+  anchors this author's earlier ops above its newest signed batch record,
+  such as those of a session that crashed: one LIST of its anchor prefix
+  and one GET, one LIST of the op log and a GET per such op, so the cost
+  does not grow with the author's history. The exit flush is bounded at 4 s,
+  under the Hermes plugin's 5 s grace, and what it leaves is anchored by the
+  next session. A code comment and `docs/SECURITY.md` said this already
+  happened.
 - Docs: `docs/SECURITY.md` and `docs/AGENTS-SUPPORT.md` now state the full
   cost of one identity writing from two machines: after a fork the losing
   machine's later writes are dropped too until its process restarts, each

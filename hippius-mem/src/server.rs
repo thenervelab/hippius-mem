@@ -92,6 +92,14 @@ pub const DEFAULT_RECALL_K: usize = 12;
 /// warmup so it never fires during healthy (merely slow) startup.
 const WARMUP_READ_WAIT: Duration = Duration::from_secs(90);
 
+/// Longest a session's exit waits on its anchor flush. Under the 5 s the
+/// Hermes plugin waits after closing stdin before it sends SIGTERM
+/// (`SHUTDOWN_GRACE` in `integrations/hermes/hippius_mem/__init__.py`), so a
+/// slow gateway ends the flush instead of the process being killed mid-write.
+/// Dropping the flush future mid-way loses only in-memory leaves; the op-log
+/// write path never runs inside it.
+const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// How long the pre-read auto-refresh may block before a read gives up and serves
 /// the current (possibly slightly stale) index.
 ///
@@ -1041,14 +1049,23 @@ impl MemoryServer {
     /// author's ops an earlier session left unanchored, when the session ends.
     ///
     /// Skipped for a read-only session, which writes nothing to the bucket.
-    /// Best-effort: a failure is logged, since every op stays in the op-log
-    /// either way.
+    /// Best-effort and bounded by [`EXIT_FLUSH_TIMEOUT`]: a failure or a flush
+    /// that runs out of time is logged, since every op stays in the op-log
+    /// either way and the next session's flush queues what this one left.
     pub async fn flush_on_exit(&self) {
         if !self.holds_write_role() {
             return;
         }
-        if let Err(err) = self.store.flush_anchors().await {
-            tracing::warn!(error = %err, "could not anchor the session's last ops at exit");
+        match tokio::time::timeout(EXIT_FLUSH_TIMEOUT, self.store.flush_anchors()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "could not anchor the session's last ops at exit");
+            }
+            Err(_) => tracing::warn!(
+                timeout = ?EXIT_FLUSH_TIMEOUT,
+                "anchoring the session's last ops did not finish before exit; the next session \
+                 anchors them"
+            ),
         }
     }
 

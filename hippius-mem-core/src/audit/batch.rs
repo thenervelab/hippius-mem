@@ -8,7 +8,7 @@
 //! inclusion proof for any single op long after the batch was sealed — the root
 //! alone is an opaque commitment no reader could open.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -260,27 +260,74 @@ pub async fn persist_anchor_record(
         .await
 }
 
-/// The first anchor seq `author_key` has not used: one past the highest seq
-/// named by an object under the author's own `{team}/_anchors/{author_key}/`
-/// prefix, or 0 when there is none.
+/// What `author_key`'s own anchor records say: which seqs their keys occupy,
+/// and the newest record this author signed.
 ///
-/// Read from the keys of one LIST, with no GET: the seq is in the key, and a
-/// record occupies its key whether or not its body is signed or parses. Only
-/// keys exactly of the form [`anchor_record_key`] mints count, so a body that
-/// claims this author from another author's prefix, or a key with extra
-/// segments, never moves the seq.
+/// Read by [`own_anchors`]. The bucket is writable by every member, so a key
+/// under this author's prefix proves nothing about who wrote it: only a record
+/// whose signature verifies under `author_key` sets the seq floor and the
+/// coverage watermark. A key that is not, at `u64::MAX` or anywhere else, is
+/// only stepped over.
+#[derive(Debug)]
+pub(crate) struct OwnAnchors {
+    /// Every seq a key of the minted shape occupies, whatever its body.
+    taken: BTreeSet<u64>,
+    /// The highest-seq record signed by this author: its seq, and the Lamport
+    /// value of the newest op it covers.
+    newest: Option<(u64, u64)>,
+}
+
+impl OwnAnchors {
+    /// The first seq above this author's newest signed record that no key
+    /// occupies.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Malformed`] when every seq up to `u64::MAX` above that
+    /// record is taken.
+    pub(crate) fn next_seq(&self) -> Result<u64, MemError> {
+        let exhausted = || {
+            MemError::Malformed(
+                "every anchor seq above this author's newest record is taken".into(),
+            )
+        };
+        let mut seq = match self.newest {
+            None => 0,
+            Some((seq, _)) => seq.checked_add(1).ok_or_else(exhausted)?,
+        };
+        while self.taken.contains(&seq) {
+            seq = seq.checked_add(1).ok_or_else(exhausted)?;
+        }
+        Ok(seq)
+    }
+
+    /// The Lamport value of the newest op this author's newest signed record
+    /// covers: the ops above it are the ones no record covers yet. `None` when
+    /// this author has no signed record.
+    pub(crate) fn anchored_through(&self) -> Option<u64> {
+        self.newest.map(|(_, lamport)| lamport)
+    }
+}
+
+/// Read [`OwnAnchors`] for `author_key`: one LIST of its own
+/// `{team}/_anchors/{author_key}/` prefix, then one GET per key from the
+/// highest seq down until a record parses, names this author and seq, and
+/// carries a valid signature by `author_key`. In steady state that is the
+/// first key, so one GET. Only keys exactly of the form [`anchor_record_key`]
+/// mints count. An author whose records all predate signing (legacy, unsigned)
+/// has no newest record until it persists its first signed one.
 ///
 /// # Errors
 ///
-/// Whatever [`BlobStore::list`] reports, and [`MemError::Malformed`] when a key
-/// names seq `u64::MAX`, after which no seq is free.
-pub(crate) async fn next_anchor_seq(
+/// Whatever [`BlobStore::list`] or [`BlobStore::get`] report, except a key that
+/// vanished between the two.
+pub(crate) async fn own_anchors(
     blob: &Arc<dyn BlobStore>,
     team: &str,
     author_key: &VerifyingKey,
-) -> Result<u64, MemError> {
+) -> Result<OwnAnchors, MemError> {
     let prefix = format!("{team}/_anchors/{}/", author_key.to_hex());
-    let highest = blob
+    let taken: BTreeSet<u64> = blob
         .list(&prefix)
         .await?
         .iter()
@@ -289,57 +336,24 @@ pub(crate) async fn next_anchor_seq(
             let seq = suffix.parse::<u64>().ok()?;
             (format!("{seq:020}") == suffix).then_some(seq)
         })
-        .max();
-    match highest {
-        None => Ok(0),
-        Some(seq) => seq.checked_add(1).ok_or_else(|| {
-            MemError::Malformed(format!(
-                "an anchor record under {prefix} names seq {seq}, so no later seq is free"
-            ))
-        }),
-    }
-}
-
-/// Every leaf of `author_key`'s own anchor records: the ops this author has
-/// already anchored.
-///
-/// One LIST of the author's prefix and one GET per own record. Only keys of the
-/// minted shape whose body parses and names `author_key` count; the body's
-/// signature is not checked, because a planted record here can only make this
-/// author skip re-anchoring the ops it lists, leaving them unanchored as they
-/// were before the re-queue existed.
-///
-/// # Errors
-///
-/// Whatever [`BlobStore::list`] or [`BlobStore::get`] report, except a key that
-/// vanished between the two.
-pub(crate) async fn own_anchored_leaves(
-    blob: &Arc<dyn BlobStore>,
-    team: &str,
-    author_key: &VerifyingKey,
-) -> Result<HashSet<Blake3Hash>, MemError> {
-    let prefix = format!("{team}/_anchors/{}/", author_key.to_hex());
-    let mut leaves = HashSet::new();
-    for key in blob.list(&prefix).await? {
-        let minted = key
-            .strip_prefix(&prefix)
-            .and_then(|suffix| suffix.parse::<u64>().ok())
-            .is_some_and(|seq| anchor_record_key(team, author_key, seq) == key);
-        if !minted {
-            continue;
-        }
-        let bytes = match blob.get(&key).await {
+        .collect();
+    let mut newest = None;
+    for &seq in taken.iter().rev() {
+        let bytes = match blob.get(&anchor_record_key(team, author_key, seq)).await {
             Ok(bytes) => bytes,
             Err(MemError::NotFound { .. }) => continue,
             Err(err) => return Err(err),
         };
         if let Ok(record) = serde_json::from_slice::<AnchorRecord>(&bytes)
             && record.author_key == *author_key
+            && record.seq == seq
+            && record.signature_state() == AnchorSignatureState::Valid
         {
-            leaves.extend(record.leaves);
+            newest = Some((seq, record.meta.last_lamport));
+            break;
         }
     }
-    Ok(leaves)
+    Ok(OwnAnchors { taken, newest })
 }
 
 /// Whether `author_key` already has a persisted anchor record at `seq`.
