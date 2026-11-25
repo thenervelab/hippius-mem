@@ -997,6 +997,11 @@ struct KnownKeyCheck {
 /// to the other half ahead still keeps the op's blob while it is completed.
 const PENDING_OP_MAX_AGE: Duration = Duration::from_secs(MIN_GC_GRACE.as_secs() / 2);
 
+// The argument above holds only while an op that may still be completed is at
+// most half the grace window old; a longer age leaves gc less than half the
+// window of clock difference to absorb.
+const _: () = assert!(2 * PENDING_OP_MAX_AGE.as_secs() <= MIN_GC_GRACE.as_secs());
+
 /// The shortest grace window `gc` accepts for a real sweep. A write whose op
 /// PUT was not confirmed is completed by the next write on its machine only
 /// while the op is younger than half of this, so the other half bounds the
