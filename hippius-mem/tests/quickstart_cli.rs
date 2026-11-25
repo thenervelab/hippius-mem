@@ -19,8 +19,9 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
 )]
 
-use std::os::unix::fs::PermissionsExt as _;
 mod support;
+
+use std::os::unix::fs::PermissionsExt as _;
 
 /// Run `hippius-mem quickstart --no-wire` against an isolated `HOME` and
 /// `HIPPIUS_MEM_CONFIG`, returning the process output.

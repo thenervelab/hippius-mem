@@ -40,8 +40,8 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         .await
         .context("failed to build the store for this profile")?;
     crate::profile::bootstrap_key_ring(&store, cfg.max_epoch).await;
-    // Without this a vault rotated past this machine's `max_epoch` is surveyed
-    // with every newer note missing and nothing said.
+    // Without this a vault rotated past the newest key this process holds is
+    // surveyed with every newer note missing and nothing said.
     crate::admin::warn_if_epoch_superseded(&store).await;
     store
         .sync()

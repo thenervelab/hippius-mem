@@ -44,10 +44,9 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
     // Best-effort, and independent of the mnemonic gate above (listing the
-    // `_keys/` prefix needs no identity): warn when the bucket has published a
-    // wrapped-key epoch newer than this machine's configured `max_epoch` (the
-    // recorded `bootstrap_epochs` gotcha's warning-side counterpart). Never
-    // blocks or noisily fails the `SessionStart` hook this brief serves.
+    // `_keys/` prefix needs no identity): warn when the founder provisioned an
+    // epoch newer than the one this process seals under. Never blocks or
+    // noisily fails the `SessionStart` hook this brief serves.
     crate::admin::warn_if_epoch_superseded(&store).await;
     // Sync straight away rather than through `refresh_if_stale`: this is a fresh
     // process with an empty index and no refresh watermark, so the probe could

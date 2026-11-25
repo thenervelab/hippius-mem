@@ -12,10 +12,10 @@
     reason = "tests assert on hand-built fixtures where construction cannot fail"
 )]
 
-use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
 mod support;
 
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::Stdio;
 
 /// 64 hex chars decoding to 32 bytes — valid team-key material.

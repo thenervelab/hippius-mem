@@ -17,9 +17,9 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
 )]
 
-use std::io::Write as _;
 mod support;
 
+use std::io::Write as _;
 use std::process::Stdio;
 
 use anyhow::Context as _;

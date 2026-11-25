@@ -995,7 +995,7 @@ struct KnownKeyCheck {
 /// Age past which an op a previous write did not confirm is dropped instead of
 /// completed. Half of [`MIN_GC_GRACE`], so `gc` on a machine whose clock is up
 /// to the other half ahead still keeps the op's blob while it is completed.
-const PENDING_OP_MAX_AGE: Duration = Duration::from_hours(1);
+const PENDING_OP_MAX_AGE: Duration = Duration::from_secs(MIN_GC_GRACE.as_secs() / 2);
 
 /// The shortest grace window `gc` accepts for a real sweep. A write whose op
 /// PUT was not confirmed is completed by the next write on its machine only
@@ -2758,7 +2758,7 @@ impl MemoryStore {
             });
         }
 
-        if self.pending_blob_was_reclaimed(author, op).await? {
+        if self.pending_op_must_be_dropped(author, op).await? {
             tracing::warn!(
                 lamport = op.lamport,
                 note = %op.note_id,
@@ -2793,7 +2793,7 @@ impl MemoryStore {
     /// Whether pending `op` names a note blob the bucket no longer holds, or
     /// one `gc` may reclaim before the op lands, while the bucket does not hold
     /// `op` itself (see [`Self::complete_pending_op`]).
-    async fn pending_blob_was_reclaimed(
+    async fn pending_op_must_be_dropped(
         &self,
         author: &VerifyingKey,
         op: &Op,
@@ -5033,7 +5033,8 @@ impl MemoryStore {
     /// record covers ([`own_anchors`]). Costs one LIST of this author's anchor
     /// prefix and (in steady state) one GET, one LIST of the op-log keys, and
     /// one GET per own op above the watermark, so it does not grow with the
-    /// author's history. An op below the watermark that no record lists (an
+    /// author's history in GETs (the op-log LIST still grows with the team's
+    /// log). An op below the watermark that no record lists (an
     /// op a concurrent process under this identity wrote and never anchored)
     /// stays unanchored.
     ///
@@ -15576,6 +15577,32 @@ mod tests {
             .map(|record| record.seq)
             .collect();
         assert_eq!(seqs, [0, 1]);
+        Ok(())
+    }
+
+    /// A byte-for-byte copy of this author's real signed record, put at the
+    /// seq `u64::MAX` key, does not count either: its signature is valid, but
+    /// it names another seq than its key. Taken as the newest record it would
+    /// leave no seq above it, failing every later batch.
+    #[tokio::test]
+    async fn a_signed_anchor_record_copied_to_another_seq_does_not_count() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        store.flush_anchors().await?;
+        let prefix = format!("{TEAM}/_anchors/{}/", store.author_key().to_hex());
+        let real = blob.get(&format!("{prefix}{:020}", 0)).await?;
+        blob.put(&format!("{prefix}{:020}", u64::MAX), real).await?;
+
+        let later = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        later.remember(numbered_input(1)).await?;
+        let flushed = later.flush_anchors().await?;
+
+        assert!(flushed.is_some(), "the new op was anchored");
+        assert!(
+            blob.get(&format!("{prefix}{:020}", 1)).await.is_ok(),
+            "the batch landed at seq 1"
+        );
         Ok(())
     }
 

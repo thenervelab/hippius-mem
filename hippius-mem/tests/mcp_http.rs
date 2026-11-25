@@ -14,9 +14,9 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes"
 )]
 
-use std::io::BufRead as _;
 mod support;
 
+use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -63,14 +63,6 @@ impl HttpDaemon {
         std::fs::write(&token_path, format!("{TOKEN}\n"))?;
 
         let mut command = support::binary();
-        for (name, _) in std::env::vars_os() {
-            if name
-                .to_str()
-                .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
-            {
-                command.env_remove(name);
-            }
-        }
         command
             .args(["serve", "--port", "0", "--token-file"])
             .arg(&token_path)
@@ -153,14 +145,6 @@ fn run_serve_to_exit(
     std::fs::write(&token_path, format!("{TOKEN}\n"))?;
 
     let mut command = support::binary();
-    for (name, _) in std::env::vars_os() {
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
-        {
-            command.env_remove(name);
-        }
-    }
     let output = command
         .args(["serve", "--port", "0", "--token-file"])
         .arg(&token_path)

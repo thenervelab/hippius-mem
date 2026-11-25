@@ -15,9 +15,9 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
 )]
 
-use std::collections::BTreeSet;
 mod support;
 
+use std::collections::BTreeSet;
 use std::process::Command;
 use std::sync::Arc;
 
