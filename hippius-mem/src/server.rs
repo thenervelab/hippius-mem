@@ -1052,10 +1052,10 @@ impl MemoryServer {
     ///
     /// Skipped for a read-only session, which writes nothing to the bucket.
     /// Best-effort and bounded by [`EXIT_FLUSH_TIMEOUT`] unless the store
-    /// anchors on chain (see [`MemoryStore::anchors_on_chain`]): a failure or a
-    /// flush that runs out of time is logged, since every op stays in the
-    /// op-log either way and the next session's flush queues what this one
-    /// left.
+    /// anchors on chain (see [`MemoryStore::anchors_on_chain`]), where the
+    /// caller decides when to stop waiting: a failure or a flush that runs
+    /// out of time is logged, since every op stays in the op-log either way
+    /// and the next session's flush queues what this one left.
     pub async fn flush_on_exit(&self) {
         if !self.holds_write_role() {
             return;

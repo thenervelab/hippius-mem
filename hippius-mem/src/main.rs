@@ -297,7 +297,18 @@ async fn main() -> anyhow::Result<()> {
         }
         () = terminated() => {}
     }
-    runtime.server.flush_on_exit().await;
+    // A flush that anchors on chain has no time bound, since one cancelled
+    // after submission can land on chain with no record of it. A SIGTERM or
+    // Ctrl-C during the flush ends it, so an operator can still stop a
+    // session whose chain node hangs; the handler installed above means the
+    // signal no longer ends the process by itself.
+    tokio::select! {
+        () = runtime.server.flush_on_exit() => {}
+        () = terminated() => tracing::warn!(
+            "stopped anchoring the session's last ops at exit on a signal; the next session \
+             anchors them"
+        ),
+    }
     Ok(())
 }
 
