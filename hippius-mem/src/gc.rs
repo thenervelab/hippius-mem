@@ -73,11 +73,13 @@ fn parse_args(args: &[String]) -> anyhow::Result<GcArgs> {
     // in-flight-write duration plus cross-machine clock skew, so 0 is never safe
     // for a real sweep. A dry run deletes nothing, so it may preview at 0; checking
     // after the loop is what lets `--dry-run` come before or after the value.
-    if grace_hours == 0 && !dry_run {
+    let min_hours = hippius_mem_core::MIN_GC_GRACE.as_secs() / SECS_PER_HOUR;
+    if grace_hours < min_hours && !dry_run {
         bail!(
-            "--grace-hours 0 disables the in-flight-write safety window and can permanently \
-             delete a note whose op is still being appended; use at least 1 (the default is \
-             {DEFAULT_GRACE_HOURS}), or add --dry-run to preview what 0 would reclaim"
+            "--grace-hours {grace_hours} is shorter than the in-flight-write safety window and \
+             can permanently delete a note whose op is still being appended; use at least \
+             {min_hours} (the default is {DEFAULT_GRACE_HOURS}), or add --dry-run to preview \
+             what it would reclaim"
         );
     }
 
@@ -284,7 +286,7 @@ mod tests {
 
     /// The safety-critical direction: a blob a live note's durable op still names
     /// must never be deleted, even at the most aggressive grace setting `run`'s own
-    /// `--grace-hours 0` guard refuses to allow through the CLI. Exercises the
+    /// minimum grace guard refuses to allow through the CLI. Exercises the
     /// keep/delete decision on BOTH a referenced and an unreferenced blob in the
     /// same sweep, so it also proves gc actually distinguishes them rather than
     /// merely keeping (or merely deleting) everything.
@@ -360,21 +362,31 @@ mod tests {
     // configuration or store — they exercise the one piece of decision logic that
     // actually lives in this file rather than in `sweep_orphan_blobs`.
 
-    #[tokio::test]
-    async fn run_rejects_a_zero_grace_window() -> anyhow::Result<()> {
-        match run(&["--grace-hours".to_owned(), "0".to_owned()]).await {
-            Err(err) => {
-                assert!(
-                    err.to_string()
-                        .contains("disables the in-flight-write safety window"),
-                    "the error must explain why 0 is refused, got: {err}"
-                );
-                Ok(())
-            }
-            Ok(()) => Err(anyhow::anyhow!(
-                "--grace-hours 0 must be refused, but run() succeeded"
-            )),
+    /// A grace window under two hours is refused for a real sweep: an op the
+    /// gateway did not confirm is completed by the next write on its machine
+    /// for up to one hour, and its blob must outlive that on every `gc`
+    /// machine's clock.
+    #[test]
+    fn a_grace_window_under_two_hours_is_refused() -> anyhow::Result<()> {
+        for hours in ["0", "1"] {
+            let args = ["--grace-hours".to_owned(), hours.to_owned()];
+            let err = super::parse_args(&args)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("--grace-hours {hours} must be refused"))?;
+            assert!(
+                err.to_string().contains("in-flight-write safety window"),
+                "the error must explain the refusal, got: {err}"
+            );
         }
+        let args = ["--grace-hours".to_owned(), "2".to_owned()];
+        assert_eq!(
+            super::parse_args(&args)?,
+            super::GcArgs {
+                dry_run: false,
+                grace_hours: 2
+            }
+        );
+        Ok(())
     }
 
     /// Regression test: the zero-window refusal suggested `--dry-run`, then refused

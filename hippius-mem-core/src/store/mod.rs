@@ -992,6 +992,17 @@ struct KnownKeyCheck {
     at: Instant,
 }
 
+/// Age past which an op a previous write did not confirm is dropped instead of
+/// completed. Half of [`MIN_GC_GRACE`], so `gc` on a machine whose clock is up
+/// to the other half ahead still keeps the op's blob while it is completed.
+const PENDING_OP_MAX_AGE: Duration = Duration::from_hours(1);
+
+/// The shortest grace window `gc` accepts for a real sweep. A write whose op
+/// PUT was not confirmed is completed by the next write on its machine only
+/// while the op is younger than half of this, so the other half bounds the
+/// clock difference between that machine and the one running `gc`.
+pub const MIN_GC_GRACE: Duration = Duration::from_hours(2);
+
 /// What this process found when it last looked for an epoch newer than the
 /// one it seals under, and when.
 #[derive(Debug, Clone, Copy)]
@@ -1265,6 +1276,9 @@ pub struct MemoryStore {
     newest_epoch: Mutex<Option<KnownNewestEpoch>>,
     // How long a verdict is used: `KEY_CHECK_RECHECK` outside tests.
     key_check_recheck: Duration,
+    // Age past which an unconfirmed op is dropped, not completed:
+    // `PENDING_OP_MAX_AGE` outside tests.
+    pending_op_max_age: Duration,
     // Whether the blob store enforces create-only writes, measured once per
     // process by the first publish of a key check (`probe_create_only`).
     create_only: Mutex<Option<CreateOnly>>,
@@ -1429,6 +1443,7 @@ impl MemoryStore {
             key_checks: Mutex::new(BTreeMap::new()),
             newest_epoch: Mutex::new(None),
             key_check_recheck: KEY_CHECK_RECHECK,
+            pending_op_max_age: PENDING_OP_MAX_AGE,
             create_only: Mutex::new(None),
             synced_tip_revision: Mutex::new(None),
             undecodable: Mutex::new(BTreeMap::new()),
@@ -2707,14 +2722,18 @@ impl MemoryStore {
     /// warned and ignored, and the outcome of whatever that writer did is not
     /// known, as with no file at all.
     ///
-    /// A pending Remember or Edit whose op the bucket does not hold and whose
-    /// blob is gone is dropped too. Its blob was unreferenced while the op was
+    /// A pending Remember or Edit whose op the bucket does not hold is dropped
+    /// too when its blob is gone, or when the op was minted longer than
+    /// [`PENDING_OP_MAX_AGE`] ago. Its blob was unreferenced while the op was
     /// pending, so `gc` past its grace window may have reclaimed it, and an op
-    /// naming a missing blob makes the note unreadable for every reader. This
-    /// costs two GETs, only on this rare path. What it cannot close: the
-    /// original op PUT still in flight and landing after this check. That PUT
-    /// was answered with an error long enough ago for `gc` to run, so it is not
-    /// waited for.
+    /// naming a missing blob makes the note unreadable for every reader. The
+    /// age bound closes the gap between this check and the PUT: `gc` refuses a
+    /// grace window shorter than [`MIN_GC_GRACE`], so a blob younger than
+    /// [`PENDING_OP_MAX_AGE`] is not reclaimed unless the two machines' clocks
+    /// differ by more than the difference. This costs two GETs, only on this
+    /// rare path. What it cannot close: the original op PUT still in flight and
+    /// landing after this check. That PUT was answered with an error long
+    /// enough ago for `gc` to run, so it is not waited for.
     async fn complete_pending_op(
         &self,
         author: &VerifyingKey,
@@ -2744,7 +2763,8 @@ impl MemoryStore {
                 lamport = op.lamport,
                 note = %op.note_id,
                 "dropping an op a previous write on this machine did not confirm: its note \
-                 blob is no longer in the bucket (reclaimed by gc), so that write is lost"
+                 blob is no longer in the bucket (reclaimed by gc), or it is old enough that \
+                 gc may reclaim it, so that write is lost"
             );
             return Ok(AuthorTip {
                 pending: None,
@@ -2770,8 +2790,9 @@ impl MemoryStore {
         })
     }
 
-    /// Whether pending `op` names a note blob the bucket no longer holds, while
-    /// the bucket does not hold `op` itself (see [`Self::complete_pending_op`]).
+    /// Whether pending `op` names a note blob the bucket no longer holds, or
+    /// one `gc` may reclaim before the op lands, while the bucket does not hold
+    /// `op` itself (see [`Self::complete_pending_op`]).
     async fn pending_blob_was_reclaimed(
         &self,
         author: &VerifyingKey,
@@ -2795,6 +2816,13 @@ impl MemoryStore {
             .await?
         {
             return Ok(false);
+        }
+        let minted = UNIX_EPOCH + Duration::from_millis(op.op_id.timestamp_ms());
+        let age = SystemTime::now()
+            .duration_since(minted)
+            .unwrap_or(Duration::ZERO);
+        if age >= self.pending_op_max_age {
+            return Ok(true);
         }
         // Past the local cache: a copy cached on this machine says nothing about
         // whether the bucket still holds the blob.
@@ -3485,6 +3513,15 @@ impl MemoryStore {
     pub async fn probe_team_key(&self, epoch: u64) -> Result<KeyProbe, MemError> {
         let key = self.key_for_epoch(epoch)?;
         self.probe_epoch_key(epoch, &key).await
+    }
+
+    /// A store that drops every unconfirmed op older than `max_age` instead of
+    /// completing it, so a test of the age bound does not wait
+    /// [`PENDING_OP_MAX_AGE`].
+    #[cfg(test)]
+    pub(crate) fn with_pending_op_max_age(mut self, max_age: Duration) -> Self {
+        self.pending_op_max_age = max_age;
+        self
     }
 
     /// A store that re-reads its key verdict on every write, so a test of the
@@ -15631,6 +15668,45 @@ mod tests {
             swept.orphans_reclaimed, 1,
             "the edit's blob was unreferenced"
         );
+
+        let later = store.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[id, later]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        reader.sync().await?;
+        assert_eq!(reader.get(id).await?.body, sample_input().body);
+        Ok(())
+    }
+
+    /// A pending edit older than the age bound is dropped even though its blob
+    /// is still in the bucket: `gc` on another machine may delete that blob
+    /// between the check and the op's PUT, and the op would then name a
+    /// missing blob.
+    #[tokio::test]
+    async fn a_pending_edit_past_the_age_bound_is_dropped() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?
+            .with_writer_lock(Some(lock))
+            .with_pending_op_max_age(Duration::ZERO);
+        let id = store.remember(numbered_input(0)).await?;
+
+        fake.arm();
+        let edit = RememberInput {
+            body: "the edited body".to_owned(),
+            ..numbered_input(0)
+        };
+        let err = store
+            .edit(id, edit)
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        fake.disarm();
 
         let later = store.remember(numbered_input(1)).await?;
 

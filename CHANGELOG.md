@@ -172,7 +172,11 @@ field.
   before the next write on that machine, no longer leaves the note
   unreadable for the whole team. The next write used to complete the op,
   which then named a deleted blob; it now drops that op and logs that the
-  unconfirmed write is lost, and the note keeps its previous version.
+  unconfirmed write is lost, and the note keeps its previous version. Such
+  a write is also dropped once it is an hour old, because `gc` on another
+  machine could delete its blob between the check and the op's PUT, and
+  `gc` now refuses `--grace-hours` below 2 for a real sweep (it refused only
+  0), so the two hours cover that hour plus an hour of clock difference.
 - A checkpoint no longer deletes itself when the bucket holds three or more
   checkpoint objects at higher keys that this machine cannot open (a team
   re-created under the same name, a foreign upload). The retention sweep
