@@ -344,6 +344,21 @@ async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyho
     );
     drop(daemon_like);
 
+    // The same member's CLI says so before any write: `doctor` fails, and a
+    // command that reads the team (`brief`) warns.
+    let doctor = member.command(Mnemonic::Unset).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        !doctor.status.success()
+            && doctor_err.contains("rotated to epoch 1, and HIPPIUS_MEM_MNEMONIC is not set"),
+        "doctor must fail for a machine that cannot open the newest epoch: {doctor_err}"
+    );
+    let brief = member.command(Mnemonic::Unset).arg("brief").output()?;
+    let brief_err = String::from_utf8_lossy(&brief.stderr);
+    assert!(
+        brief.status.success() && brief_err.contains("rotated its key to epoch 1"),
+        "brief must warn that this process holds no key for epoch 1: {brief_err}"
+    );
     assert_eq!(
         key_epochs_of(live.raw_bucket(), &member.address()?).await?,
         [0],
