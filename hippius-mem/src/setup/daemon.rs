@@ -35,7 +35,10 @@ const HEALTH_POLL: Duration = Duration::from_millis(100);
 pub(crate) fn install_and_start(home: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
     write_unit(home, launch)?;
 
-    let started = start(home);
+    let started = start(home).and_then(|()| match &launch.http {
+        Some(http) => require_daemon_accepts_token(DEFAULT_HTTP_PORT, &http.token),
+        None => Ok(()),
+    });
     if started.is_err() {
         // A unit that cannot come up must not stay behind: launchd / systemd
         // would respawn it at every login (and on every non-zero exit) for a
@@ -271,6 +274,47 @@ fn wait_for_health(port: u16, want_ok: bool, budget: Duration) -> bool {
     }
 }
 
+/// Fail unless the daemon on `port` accepts this user's `token`.
+///
+/// `/health` is unauthenticated, and the port is one fixed loopback port for
+/// every user of the host, so on a shared host another user's daemon answers
+/// it too. Wiring this user's clients to it would send their bearer token and
+/// every tool call to that user's process. An authenticated request tells the
+/// two apart: a daemon started from this user's config accepts the token.
+fn require_daemon_accepts_token(port: u16, token: &str) -> anyhow::Result<()> {
+    match loopback_token_status(port, token) {
+        Some(401 | 403) => anyhow::bail!(
+            "the process on 127.0.0.1:{port} refused this user's token: another hippius-mem \
+             serve (another user's, or one started from another config) holds the port; stop \
+             it, or keep this user's clients on stdio"
+        ),
+        Some(_) => Ok(()),
+        None => {
+            anyhow::bail!("the process on 127.0.0.1:{port} did not answer an authenticated request")
+        }
+    }
+}
+
+/// The HTTP status the daemon on `port` answers to an authenticated
+/// `GET /path-notes` with `token`, or `None` when nothing answers. The request
+/// carries no query, so an accepting daemon answers 400; a refused token is
+/// 401 whatever the query.
+fn loopback_token_status(port: u16, token: &str) -> Option<u16> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).ok()?;
+    let _ = stream.set_read_timeout(Some(HEALTH_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HEALTH_PROBE_TIMEOUT));
+    let req = format!(
+        "GET /path-notes HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let head = std::str::from_utf8(buf.get(..12)?).ok()?;
+    head.strip_prefix("HTTP/1.1 ")?.parse().ok()
+}
+
 /// Unauthenticated GET `/health` on the default loopback MCP port.
 fn loopback_health_ok(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -352,8 +396,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        SERVICE_NAME, SystemdField, loopback_health_ok, macos_plist, systemd_quote, systemd_unit,
-        unit_path, xml_escape,
+        SERVICE_NAME, SystemdField, loopback_health_ok, loopback_token_status, macos_plist,
+        systemd_quote, systemd_unit, unit_path, xml_escape,
     };
     use crate::setup::mcp::HEALTH_BODY;
     use crate::setup::mcp::McpLaunch;
@@ -436,6 +480,36 @@ mod tests {
             config_path: PathBuf::from("/cfg/hippius-mem.toml"),
             http: None,
         };
+    }
+
+    /// A daemon that refuses the token (another user's, on the shared loopback
+    /// port) is told apart from one that accepts it. `install` judged the
+    /// daemon by the unauthenticated `/health` alone, so it wired this user's
+    /// clients and token to whichever process held the port.
+    #[test]
+    fn the_token_probe_reads_the_daemons_answer() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        for (status, line) in [(401, "401 Unauthorized"), (400, "400 Bad Request")] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 512];
+                    let _ = stream.read(&mut buf);
+                    let response = format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\n\r\n");
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            assert_eq!(loopback_token_status(port, "tok"), Some(status));
+            let _ = handle.join();
+        }
+        assert_eq!(
+            loopback_token_status(1, "tok"),
+            None,
+            "nothing listens on port 1"
+        );
     }
 
     #[test]

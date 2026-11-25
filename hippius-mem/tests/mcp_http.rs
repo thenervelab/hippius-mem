@@ -729,6 +729,31 @@ fn path_notes_route_rejects_a_missing_bearer_token() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// The answers `install`'s token probe tells a daemon apart by: a bare
+/// `GET /path-notes` is 400 with this daemon's token and 401 with another.
+/// The probe exists because `/health` answers the same for every daemon on the
+/// shared port; if this route started answering the right token with 401, or
+/// any token with 400, the probe would misjudge whose daemon holds the port.
+#[test]
+fn a_bare_path_notes_request_tells_the_right_token_from_another()
+-> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let url = daemon.url.replace("/mcp", "/path-notes");
+    let client = reqwest::blocking::Client::new();
+    let status_with = |token: &str| -> Result<reqwest::StatusCode, reqwest::Error> {
+        Ok(client.get(&url).bearer_auth(token).send()?.status())
+    };
+    assert_eq!(
+        status_with(&daemon.token)?,
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        status_with("another-users-token")?,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    Ok(())
+}
+
 /// Run `hippius-mem <args>` against `daemon`, from a directory with no git
 /// remote, so `--repo` is exactly what the test passes.
 fn cli(
