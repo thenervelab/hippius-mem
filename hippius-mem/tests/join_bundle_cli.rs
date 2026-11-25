@@ -85,6 +85,44 @@ fn stdin_bundle_writes_a_fresh_0600_config() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A joiner of a team that rotated its key, with no `HIPPIUS_MEM_MNEMONIC`,
+/// is told to set it and run `join` again: no member key was published, so
+/// the founder's `provision` cannot reach this machine yet. Catches the
+/// next steps claiming a key was published when none was.
+#[test]
+fn a_rotated_team_joined_without_a_mnemonic_is_told_to_publish_later() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+
+    let mut child = support::binary()
+        .args(["join", "--bundle", "-"])
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(format!("{}max_epoch = 2\n", bundle_text()).as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "join --bundle - failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ROTATED its key: to receive wrapped epoch keys, set"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("your member key is published"), "{stdout}");
+    Ok(())
+}
+
 #[test]
 fn parse_failure_stderr_never_echoes_the_secret() -> anyhow::Result<()> {
     // The confirmed spec-review repro: an unterminated `secret = "...` string

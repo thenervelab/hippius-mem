@@ -28,6 +28,10 @@ use serde_json::{Value, json};
 /// The team namespace this test owns, cleared before and after the run.
 const TEAM: &str = "rw-rotation-live";
 
+/// The team namespace the bundle-join test owns, apart from [`TEAM`] so the
+/// two tests can run at once.
+const JOIN_TEAM: &str = "rw-join-bundle-live";
+
 /// The team key every machine starts with (epoch 0).
 const TEAM_KEY_HEX: &str = "24acd7ca317cb31b657364ac6aa260e1a3ed469a2c296973ad21d5b42e0b1835";
 
@@ -167,9 +171,9 @@ impl Live {
     }
 }
 
-async fn clear_team(bucket: &dyn BlobStore) {
+async fn clear_team(bucket: &dyn BlobStore, team: &str) {
     for key in bucket
-        .list(&format!("{TEAM}/"))
+        .list(&format!("{team}/"))
         .await
         .unwrap_or_else(|_| Vec::new())
     {
@@ -295,7 +299,7 @@ async fn key_epochs_of(bucket: S3BlobStore, author: &str) -> anyhow::Result<Vec<
 #[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
 async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyhow::Result<()> {
     let live = Live::from_env()?;
-    clear_team(&live.raw_bucket()).await;
+    clear_team(&live.raw_bucket(), TEAM).await;
 
     let founder = Machine::new(
         31,
@@ -339,6 +343,7 @@ async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyho
         "a server without the new key must refuse the write: {text}"
     );
     drop(daemon_like);
+
     assert_eq!(
         key_epochs_of(live.raw_bucket(), &member.address()?).await?,
         [0],
@@ -355,6 +360,48 @@ async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyho
         "the member's write after the removal is sealed under the rotated key"
     );
 
-    clear_team(&live.raw_bucket()).await;
+    clear_team(&live.raw_bucket(), TEAM).await;
+    Ok(())
+}
+
+/// `join --bundle` with `HIPPIUS_MEM_MNEMONIC` set publishes this machine's
+/// member key, so the founder's next `provision` can wrap a rotated key to it,
+/// and its next steps say so. Catches a join that skips the publish.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn joining_by_bundle_with_a_mnemonic_publishes_the_member_key() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    clear_team(&live.raw_bucket(), JOIN_TEAM).await;
+
+    let joiner = Machine::new(
+        34,
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    )?;
+    let bundle_path = joiner.home.path().join("invite.toml");
+    std::fs::write(
+        &bundle_path,
+        format!(
+            "s3_endpoint = \"{endpoint}\"\nbucket = \"{bucket}\"\nteam = \"{JOIN_TEAM}\"\n\
+             max_epoch = 1\nteam_key_hex = \"{TEAM_KEY_HEX}\"\naccess_key_id = \"{access}\"\n\
+             secret = \"{secret}\"\n",
+            endpoint = live.endpoint,
+            bucket = live.bucket,
+            access = live.access_key_id,
+            secret = live.secret,
+        ),
+    )?;
+    let stdout = joiner.run(&["join", "--bundle", &bundle_path.to_string_lossy()])?;
+    assert!(
+        stdout.contains("your member key is published"),
+        "the next steps name the published key: {stdout}"
+    );
+
+    let member_keys = live
+        .raw_bucket()
+        .list(&format!("{JOIN_TEAM}/_memberkeys/"))
+        .await?;
+    assert_eq!(member_keys.len(), 1, "one member key: {member_keys:?}");
+
+    clear_team(&live.raw_bucket(), JOIN_TEAM).await;
     Ok(())
 }
