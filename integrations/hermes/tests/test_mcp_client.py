@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -30,6 +31,29 @@ class McpClientTests(unittest.TestCase):
         written = stdin.getvalue().splitlines()
         self.assertEqual(json.loads(written[0])["method"], "initialize")
         self.assertEqual(json.loads(written[1])["method"], "notifications/initialized")
+
+    def test_a_child_that_never_answers_fails_the_request(self) -> None:
+        # The reply never comes: readline used to block the turn forever.
+        read_end, write_end = os.pipe()
+        stdout = os.fdopen(read_end, "r")
+        try:
+            client = McpStdioClient(io.StringIO(), stdout, timeout=0.2)
+            with self.assertRaisesRegex(McpError, "no reply"):
+                client.request("initialize", {})
+        finally:
+            os.close(write_end)
+            stdout.close()
+
+    def test_a_dead_childs_stdin_is_an_mcp_error(self) -> None:
+        # A BrokenPipeError used to reach the Hermes turn, which catches only
+        # McpError.
+        class Broken(io.StringIO):
+            def write(self, _text: str) -> int:
+                raise BrokenPipeError(32, "Broken pipe")
+
+        client = McpStdioClient(Broken(), io.StringIO(""))
+        with self.assertRaisesRegex(McpError, "stdin is closed"):
+            client.call_tool("recall", {"text": "x"})
 
     def test_call_tool_forwards_arguments_and_returns_text(self) -> None:
         replies = [

@@ -274,6 +274,12 @@ field.
   with several users it used to accept any daemon whose unauthenticated
   `/health` answered, and send this user's token and tool calls to it. A
   hand-run `serve` still treats any healthy daemon on the port as its own.
+- Hermes plugin: a request to a hippius-mem child that never answers fails
+  after 120 s instead of blocking the turn, a dead child's broken pipe is
+  reported like any other tool failure instead of raising into the turn,
+  `shutdown` returns (closing stdin, then SIGTERM, then SIGKILL) even when
+  a background refresh is waiting on a stuck child, and a failed boot
+  reports the child's last stderr lines.
 
 ## [0.7.1] - 2026-11-19
 

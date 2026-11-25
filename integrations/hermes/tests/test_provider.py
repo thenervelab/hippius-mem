@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -66,6 +67,25 @@ class ProviderTests(unittest.TestCase):
             for line in self.last_call.read_text(encoding="utf-8").splitlines()
             if line
         ]
+
+    def test_shutdown_returns_while_a_refresh_waits_on_a_stuck_child(self) -> None:
+        # A background refresh is blocked waiting for a reply that never comes,
+        # and the child ignores EOF and SIGTERM. shutdown closed stdout under
+        # the blocked reader and never returned; it must kill the child.
+        os.environ["HIPPIUS_MEM_FAKE_STUBBORN"] = "1"
+        os.environ["HIPPIUS_MEM_FAKE_NEVER_ANSWER"] = "refresh"
+        try:
+            provider = self._provider()
+            proc = provider._proc
+            provider.sync_turn("user", "assistant")
+            time.sleep(0.2)
+            started = time.monotonic()
+            provider.shutdown()
+            self.assertLess(time.monotonic() - started, 30.0)
+            self.assertIsNotNone(proc.poll(), "the child is gone")
+        finally:
+            os.environ.pop("HIPPIUS_MEM_FAKE_STUBBORN", None)
+            os.environ.pop("HIPPIUS_MEM_FAKE_NEVER_ANSWER", None)
 
     def test_initialize_requires_hermes_home(self) -> None:
         provider = HippiusMemProvider()

@@ -52,6 +52,11 @@ def _ok(msg_id: object, payload: object) -> dict:
 
 
 def main() -> None:
+    if os.environ.get("HIPPIUS_MEM_FAKE_STUBBORN"):
+        # Stands in for a child that does not exit on EOF or SIGTERM.
+        import signal
+
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
@@ -87,6 +92,8 @@ def main() -> None:
             if last_path:
                 with open(last_path, "a", encoding="utf-8") as handle:
                     handle.write(json.dumps({"name": name, "arguments": arguments}) + "\n")
+            if name == os.environ.get("HIPPIUS_MEM_FAKE_NEVER_ANSWER"):
+                continue
             if name == "recall":
                 reply = _ok(msg_id, RECALL_PAYLOAD)
             elif name == "brief":
@@ -109,3 +116,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    if os.environ.get("HIPPIUS_MEM_FAKE_STUBBORN"):
+        import time
+
+        while True:
+            time.sleep(1)

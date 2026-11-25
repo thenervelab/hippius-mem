@@ -9,8 +9,15 @@ deps.
 from __future__ import annotations
 
 import json
+import queue
 import threading
 from typing import Any, TextIO
+
+# Seconds one request may wait for its reply before it fails. A cold
+# hippius-mem answers its first recall only after the startup sync, which takes
+# tens of seconds on a large team, so this is generous; it exists so a hung
+# child fails the Hermes turn instead of blocking it forever.
+REQUEST_TIMEOUT = 120.0
 
 
 class McpError(RuntimeError):
@@ -21,14 +28,28 @@ class McpStdioClient:
     """One JSON-RPC session over a pair of text streams.
 
     `request` is serialized: prefetch and a background `refresh` can overlap
-    at the provider, so the lock keeps request ids and replies paired.
+    at the provider, so the lock keeps request ids and replies paired. A
+    reader thread owns `stdout`, so a request waits on a queue with a timeout
+    rather than in `readline`, and a broken pipe or a closed stdout becomes
+    an `McpError` the provider already handles.
     """
 
-    def __init__(self, stdin: TextIO, stdout: TextIO) -> None:
+    def __init__(
+        self, stdin: TextIO, stdout: TextIO, timeout: float = REQUEST_TIMEOUT
+    ) -> None:
         self._stdin = stdin
-        self._stdout = stdout
+        self._timeout = timeout
         self._next_id = 1
         self._lock = threading.Lock()
+        # Lines from stdout; `None` once it reached EOF (and it stays there).
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        self._reader = threading.Thread(
+            target=_read_lines,
+            args=(stdout, self._lines),
+            name="hippius-mem-stdout",
+            daemon=True,
+        )
+        self._reader.start()
 
     def handshake(self, client_name: str = "hippius-mem-hermes") -> dict[str, Any]:
         """MCP `initialize` + `notifications/initialized`."""
@@ -85,16 +106,26 @@ class McpStdioClient:
 
     def _send(self, payload: dict[str, Any]) -> None:
         line = json.dumps(payload, separators=(",", ":"))
-        self._stdin.write(line + "\n")
-        self._stdin.flush()
+        try:
+            self._stdin.write(line + "\n")
+            self._stdin.flush()
+        except (OSError, ValueError) as err:
+            # A dead child (BrokenPipeError) or a pipe closed by shutdown.
+            raise McpError(f"MCP subprocess stdin is closed: {err}") from err
 
     def _recv_matching(self, msg_id: int) -> dict[str, Any]:
         # Skip notifications (no id) and any other-id replies so a server
         # log line that slipped onto stdout does not desynchronize us —
         # those fail json.loads and are skipped too, up to a bound.
         for _ in range(32):
-            raw = self._stdout.readline()
-            if raw == "":
+            try:
+                raw = self._lines.get(timeout=self._timeout)
+            except queue.Empty:
+                raise McpError(
+                    f"no reply from the MCP subprocess within {self._timeout:g}s"
+                ) from None
+            if raw is None:
+                self._lines.put(None)
                 raise McpError("MCP subprocess closed stdout")
             try:
                 reply = json.loads(raw)
@@ -105,6 +136,15 @@ class McpStdioClient:
             if reply.get("id") == msg_id:
                 return reply
         raise McpError(f"no JSON-RPC reply with id {msg_id}")
+
+
+def _read_lines(stream: TextIO, lines: queue.Queue[str | None]) -> None:
+    try:
+        for raw in iter(stream.readline, ""):
+            lines.put(raw)
+    except (OSError, ValueError):
+        pass
+    lines.put(None)
 
 
 def _content_text(result: dict[str, Any]) -> str:
