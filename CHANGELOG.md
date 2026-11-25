@@ -189,6 +189,15 @@ field.
   naming the last possible number made every sixteenth write spin forever.
   Such a key now fails the anchor with an error, and a run of collisions
   gives up after 8 attempts.
+- A member whose `author_seed_hex` is not its mnemonic's seed (the setup
+  `join --bundle` and the installer create, one random seed per machine)
+  now loads the key of an epoch the founder rotated to. Its member key, and
+  so the founder's wrap, is stored under the author address, but the
+  bootstrap looked the wrap up under the mnemonic's address, so after
+  `rotate` or `remove` no such member received the new key and every
+  machine kept sealing under the old one. `doctor` now fails when the team
+  has rotated past epoch 0 and this machine has no wrap of the newest
+  epoch it can open, and `join` logs the address the founder provisions to.
 
 ## [0.7.1] - 2026-11-19
 

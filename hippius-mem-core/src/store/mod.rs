@@ -1623,7 +1623,8 @@ impl MemoryStore {
     /// overwrite a live key).
     ///
     /// For every `epoch` in `epochs`, look up this member's [`crate::WrappedKey`]
-    /// in the bucket and unwrap it with `identity`'s x25519 secret; on success the
+    /// in the bucket under this store's author address and unwrap it with
+    /// `identity`'s x25519 secret; on success the
     /// key joins the ring (via [`MemoryStore::add_epoch_key`]). Epochs this member
     /// cannot unwrap — no wrap addressed to them (a non-member, or one removed
     /// before that epoch), a tampered wrap, a backend miss, or a wrap whose
@@ -1650,6 +1651,11 @@ impl MemoryStore {
     ) -> Result<usize, MemError> {
         let team = self.team.as_str();
         let secret = identity.x25519_secret();
+        // The wrap sits under the address the member key was signed with, which
+        // is this store's author (`join_as_member`), not `identity.ss58`: the two
+        // differ whenever `author_seed_hex` is not the mnemonic's seed, which is
+        // the per-machine setup `join --bundle` and the installer create.
+        let recipient = self.signer.author_ss58();
         let mut added = 0_usize;
         for &epoch in epochs {
             // `self.founder` is the same operator pin `sync`/`provision_members` load
@@ -1661,7 +1667,7 @@ impl MemoryStore {
                 self.blob.as_ref(),
                 team,
                 epoch,
-                &identity.ss58,
+                &recipient,
                 &secret,
                 self.founder.as_ref(),
             )
@@ -10249,7 +10255,10 @@ mod tests {
 
         let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
         let signer = crate::signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
-        let member_key = crate::MemberKey::create_signed(&signer, &identity);
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        // Signed by the store's author, as `join_as_member` publishes it: the
+        // wrap is stored under that address.
+        let member_key = crate::MemberKey::create_signed(store.signer.as_ref(), &identity);
         let epoch1_key = SecretKey::from_bytes(EPOCH1_KEY);
 
         // Provision the member's epoch-1 wrap under a FOREIGN team, then bootstrap
@@ -10264,7 +10273,6 @@ mod tests {
             &signer,
         )
         .await?;
-        let store = store_over(blob.clone(), SOLO_SEED)?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(
             added, 0,
@@ -10285,6 +10293,43 @@ mod tests {
         .await?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(added, 1, "a wrap under this store's own team loads");
+        Ok(())
+    }
+
+    /// A member whose author seed is not its mnemonic's (the documented setup:
+    /// `join --bundle` and the installer mint a random seed per machine) loads
+    /// the key of an epoch the founder rotated to after it joined. The wrap is
+    /// stored under the author address the member key was signed with, and the
+    /// bootstrap looked it up under the mnemonic's address instead, so no member
+    /// ever received a rotated key.
+    #[tokio::test]
+    async fn a_member_with_its_own_author_seed_loads_a_rotated_epoch() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        assert_ne!(
+            member.author, identity.ss58,
+            "the fixture needs the two to differ"
+        );
+        member.join_as_member(&identity).await?;
+
+        let rotation = founder.rotate_key(0).await?;
+        assert!(
+            rotation.wrapped.contains(&member.author),
+            "{:?}",
+            rotation.wrapped
+        );
+        let sealed_at_1 = founder.remember(numbered_input(7)).await?;
+
+        let restarted = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        let added = restarted
+            .bootstrap_epoch_keys(&identity, &[0, rotation.new_epoch])
+            .await?;
+        assert_eq!(added, 1, "the rotated epoch's wrap loads");
+        restarted.sync().await?;
+        assert_eq!(restarted.get(sealed_at_1).await?.summary, "numbered note 7");
         Ok(())
     }
 

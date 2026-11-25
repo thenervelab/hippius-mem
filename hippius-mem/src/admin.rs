@@ -299,9 +299,12 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
     store.join_as_member(&identity).await?;
     // Pick up any epoch keys the founder already provisioned to this member.
     bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    // The member key, and so the founder's wrap, is under the author address,
+    // not the mnemonic's (`join_as_member`).
+    let member = cfg.primary_profile().signer()?.author_ss58();
     tracing::info!(
         team = %cfg.team,
-        member = %identity.ss58.as_str(),
+        member = %member.as_str(),
         "published member key; the founder can now `provision` the team key to it"
     );
     Ok(())

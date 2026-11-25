@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyProbe, MemoryStore, OpLogStore,
-    QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails,
-    highest_published_epoch, load_manifest, matches_published_key_check, open, probe_create_only,
-    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
+    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyProbe, MemError, MemoryStore,
+    OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail, derive_identity,
+    find_suppressed_tails, highest_published_epoch, load_manifest, matches_published_key_check,
+    open, probe_create_only, read_heads, read_wrapped_key, seal, unwrap_team_key,
+    wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -326,8 +327,75 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         tracing::warn!("{line}");
     }
 
+    // Checked here, reported after the probes below, so a machine that cannot
+    // open the newest epoch still sees what else is wrong.
+    let author = profile
+        .signer()
+        .context("deriving the author identity from author_seed_hex failed")?
+        .author_ss58();
+    let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").ok();
+    let newest_epoch =
+        newest_epoch_unopenable_line(blob.as_ref(), &profile.name, &author, mnemonic.as_deref())
+            .await;
+
     let store = key_probe_store(cfg, profile).await?;
-    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store).await
+    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store).await?;
+    if let Some(line) = newest_epoch {
+        bail!("{line}");
+    }
+    Ok(())
+}
+
+/// The failure line when `team` has rotated past epoch 0 and this machine
+/// cannot open the newest epoch's key, or `None` when it can (or the team never
+/// rotated).
+///
+/// A machine loads a rotated epoch's key only from the wrap under its author
+/// address `author`, opened with the x25519 key of `mnemonic`
+/// (`HIPPIUS_MEM_MNEMONIC`). Without it the machine reads no note sealed under
+/// that epoch, and its own writes stay on an older key a removed member may
+/// hold, while `rotate` and `remove` report success. Epoch 0 is skipped: its
+/// key is `team_key_hex`. A listing or fetch fault other than a missing wrap
+/// yields `None`, like the other best-effort checks here; the storage probe
+/// reports those.
+async fn newest_epoch_unopenable_line(
+    blob: &dyn BlobStore,
+    team: &str,
+    author: &Ss58,
+    mnemonic: Option<&str>,
+) -> Option<String> {
+    let epoch = highest_published_epoch(blob, team).await.ok()?;
+    if epoch == 0 {
+        return None;
+    }
+    let wrapped = match read_wrapped_key(blob, team, epoch, author.as_str()).await {
+        Ok(wrapped) => wrapped,
+        Err(MemError::NotFound { .. }) => {
+            return Some(format!(
+                "FAIL: team {team:?} rotated to epoch {epoch}, and no wrap of its key is \
+                 addressed to this machine ({author}); run `hippius-mem join` here, then ask \
+                 the founder to run `hippius-mem provision`",
+                author = author.as_str(),
+            ));
+        }
+        Err(_) => return None,
+    };
+    let Some(mnemonic) = mnemonic else {
+        return Some(format!(
+            "FAIL: team {team:?} rotated to epoch {epoch}, and HIPPIUS_MEM_MNEMONIC is not set, \
+             so this machine cannot open that epoch's key; set it to this member's mnemonic"
+        ));
+    };
+    let opened = derive_identity(mnemonic, crate::admin::HIPPIUS_SS58_PREFIX)
+        .and_then(|identity| unwrap_team_key(team, &wrapped, &identity.x25519_secret(), epoch));
+    match opened {
+        Ok(_) => None,
+        Err(err) => Some(format!(
+            "FAIL: team {team:?} epoch {epoch}: the wrap addressed to this machine does not \
+             open with HIPPIUS_MEM_MNEMONIC ({err}); check that it is the mnemonic this \
+             machine joined with"
+        )),
+    }
 }
 
 /// Config used to build the store `doctor` probes with: never load an
@@ -1152,11 +1220,11 @@ mod tests {
 
     use super::{
         PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key, config_for_key_probe,
-        create_only_line, head_regression_lines, offline_report_lines, op_log_integrity_lines,
-        probe_encryption_boundary, probe_live, probe_storage_then_team_key,
-        published_check_matches, quarantine_lines, removed_member_still_holds_key_lines,
-        resolve_profile_for_remote, stale_max_epoch_line, suppressed_tail_lines,
-        unsigned_or_unauthorized_wrapped_key_lines,
+        create_only_line, head_regression_lines, newest_epoch_unopenable_line,
+        offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
+        probe_storage_then_team_key, published_check_matches, quarantine_lines,
+        removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
+        suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
     use crate::setup::hermes::HermesWiring;
@@ -2490,6 +2558,52 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// `doctor` fails on a team rotated past epoch 0 whose newest wrap this
+    /// machine cannot open: none under its author address, or no mnemonic to
+    /// open it with. It used to exit 0 while the machine read none of the
+    /// rotated epoch's notes.
+    #[tokio::test]
+    async fn newest_epoch_unopenable_line_fails_without_an_openable_wrap() -> Result<(), MemError> {
+        const TEAM: &str = "clientx";
+        const PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let author = Sr25519Signer::from_seed_with_prefix(&[4_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let team_key = SecretKey::from_bytes([1u8; 32]);
+
+        let blob = MemoryBlobStore::default();
+        let at_epoch_0 = MemberKey::create_signed(&author, &identity);
+        provision_team_key(&blob, TEAM, &team_key, 0, &[at_epoch_0], None, &author).await?;
+        let author_ss58 = author.author_ss58();
+        assert_eq!(
+            newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, None).await,
+            None,
+            "epoch 0 is team_key_hex, never a failure"
+        );
+
+        // Rotated, with the wrap under the mnemonic's own address, not the
+        // machine's author address.
+        let mnemonic_signer = signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let elsewhere = MemberKey::create_signed(&mnemonic_signer, &identity);
+        provision_team_key(&blob, TEAM, &team_key, 1, &[elsewhere], None, &author).await?;
+        let line = newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, Some(PHRASE))
+            .await
+            .expect("no wrap under the author address must fail");
+        assert!(line.contains("no wrap"), "{line}");
+
+        let here = MemberKey::create_signed(&author, &identity);
+        provision_team_key(&blob, TEAM, &team_key, 1, &[here], None, &author).await?;
+        assert_eq!(
+            newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, Some(PHRASE)).await,
+            None
+        );
+        let line = newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, None)
+            .await
+            .expect("no mnemonic must fail");
+        assert!(line.contains("HIPPIUS_MEM_MNEMONIC"), "{line}");
+        Ok(())
     }
 
     /// The doctor-surface test for the stale-`max_epoch` warning: a store

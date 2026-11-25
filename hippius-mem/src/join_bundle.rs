@@ -45,11 +45,11 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use hippius_mem_core::derive_identity;
+use hippius_mem_core::{Signer, derive_identity};
 use zeroize::Zeroizing;
 
-// The shared SS58 prefix keeps the published member identity aligned with the
-// address the founder's `provision` wraps the team key to.
+// The shared SS58 prefix derives the member's x25519 identity exactly as `join`
+// does, so a wrap sealed to the published member key opens with it.
 use crate::admin::HIPPIUS_SS58_PREFIX;
 use crate::bundle::InviteBundle;
 use crate::config::Config;
@@ -688,9 +688,10 @@ async fn publish_member_key(cfg: &Config, team: &str) -> anyhow::Result<bool> {
     )?;
     // Pick up any epoch keys the founder already provisioned to this member.
     crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    let member = profile.signer()?.author_ss58();
     tracing::info!(
         team = %team,
-        member = %identity.ss58.as_str(),
+        member = %member.as_str(),
         "published member key; the founder can now `provision` the team key to it"
     );
     Ok(true)
