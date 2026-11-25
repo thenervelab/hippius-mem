@@ -60,9 +60,9 @@ use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
-    Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, highest_published_epoch,
-    load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
-    rotate_team_key,
+    Identity, ManifestMarker, MemberKey, TeamManifest, create_wraps, fetch_team_key,
+    highest_published_epoch, load_manifest, load_member_keys, publish_manifest, publish_member_key,
+    put_wraps, seal_wraps,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -6386,6 +6386,18 @@ impl MemoryStore {
                 );
                 Some(current.clone())
             }
+            // Two different manifests cannot both be version N of one honest
+            // chain: the founder signs each version once. Keep the one already
+            // trusted, so a replacement at the same version cannot change the
+            // roster without the version moving.
+            (Some(current), Some(new)) if new.version == current.version && new != *current => {
+                tracing::warn!(
+                    version = current.version,
+                    "refusing a team manifest that differs from the applied one at the same \
+                     version; keeping the applied one"
+                );
+                Some(current.clone())
+            }
             // First load, or a version at/above the watermark: apply and record it.
             (_, Some(new)) => {
                 *applied = Some(new.clone());
@@ -7280,7 +7292,7 @@ impl MemoryStore {
                 pinned.as_str(),
             )));
         }
-        let current = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        let current = self.current_manifest().await?;
         let next_version = match &current {
             Some(manifest) => {
                 if manifest.founder != self.author {
@@ -7312,7 +7324,31 @@ impl MemoryStore {
             next_version,
             recovery_key,
         );
-        publish_manifest(self.blob.as_ref(), &manifest).await
+        publish_manifest(self.blob.as_ref(), &manifest).await?;
+        self.record_published_manifest(&manifest).await;
+        Ok(())
+    }
+
+    /// Raise the rollback watermark and the durable marker to `manifest`, which
+    /// this store just published.
+    ///
+    /// Without this the next manifest consumer in the same process (the
+    /// rotation `remove` runs right after publishing the shrunk roster) reads
+    /// the bucket again, and a bucket that lost or garbled the new object hands
+    /// it the previous version: the removed member would be wrapped the new key.
+    /// The marker write is best-effort, as in
+    /// [`current_manifest`](Self::current_manifest).
+    async fn record_published_manifest(&self, manifest: &TeamManifest) {
+        self.monotonic_manifest(Some(manifest.clone()));
+        if let Some(marker) = &self.manifest_marker
+            && let Err(err) = marker.store(manifest).await
+        {
+            tracing::warn!(
+                error = %err,
+                version = manifest.version,
+                "failed to persist the durable manifest marker; cross-restart rollback protection may lag"
+            );
+        }
     }
 
     /// Founder action: publish a manifest naming `recovery_key`, at
@@ -7414,7 +7450,8 @@ impl MemoryStore {
             ));
         }
 
-        let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
+        let live = self
+            .current_manifest()
             .await?
             .ok_or_else(|| MemError::ManifestUnavailable {
                 team: self.team.clone(),
@@ -7442,6 +7479,7 @@ impl MemoryStore {
             Some(recovery_key),
         );
         publish_manifest(self.blob.as_ref(), &manifest).await?;
+        self.record_published_manifest(&manifest).await;
         Ok((manifest, previous_recovery_key))
     }
 
@@ -7490,7 +7528,8 @@ impl MemoryStore {
             ));
         }
 
-        let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
+        let live = self
+            .current_manifest()
             .await?
             .ok_or_else(|| MemError::ManifestUnavailable {
                 team: self.team.clone(),
@@ -7529,7 +7568,7 @@ impl MemoryStore {
     /// Whatever [`load_manifest`] reports (storage, deserialization, or a
     /// founder-consistency failure).
     pub async fn membership_manifest(&self) -> Result<Option<TeamManifest>, MemError> {
-        load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await
+        self.current_manifest().await
     }
 
     /// The current member set of this store's team.
@@ -7568,23 +7607,24 @@ impl MemoryStore {
     ///
     /// [`MemError::KeyUnavailable`] if this store's key-ring lacks the current
     /// epoch's key (it is not the founder, or the key was never configured), or
-    /// whatever [`load_member_keys`] / `provision_team_key` report.
+    /// whatever [`load_manifest`] / [`load_member_keys`] / the wrap writes report.
     pub async fn provision_members(&self) -> Result<usize, MemError> {
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
         let epoch = self.current_epoch();
         let team_key = self.key_for_epoch(epoch)?;
+        let manifest = self.current_manifest().await?;
         // This store's own signer is the provisioner: it signs every wrap this
         // call produces, recorded in each `WrappedKey` as proof of who sealed it.
-        provision_team_key(
-            self.blob.as_ref(),
+        let wraps = seal_wraps(
             &self.team,
             &team_key,
             epoch,
             &member_keys,
+            manifest.as_ref(),
             self.founder.as_ref(),
             self.signer.as_ref(),
-        )
-        .await?;
+        )?;
+        put_wraps(self.blob.as_ref(), wraps).await?;
         Ok(member_keys.len())
     }
 
@@ -7629,14 +7669,14 @@ impl MemoryStore {
     ///   unreadable to the whole team once this process exits.
     /// - [`MemError::EpochTaken`] when the chosen epoch already has a key check,
     ///   or another rotation's wrap appears there while this one writes.
-    /// - Whatever [`load_manifest`] / [`load_member_keys`] / `rotate_team_key`
+    /// - Whatever [`load_manifest`] / [`load_member_keys`] / the wrap writes
     ///   report (storage, serialization, crypto).
     pub async fn rotate_key(&self, known_max_epoch: u64) -> Result<RotationOutcome, MemError> {
         // Authz first, before any bucket write. `load_manifest` already honours
         // the pin (only the pinned founder's manifests load), so a Some(manifest)
         // under a pin is necessarily the pin's — the author check below then
         // reduces to "is this signer the founder".
-        let manifest = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        let manifest = self.current_manifest().await?;
         match (&manifest, &self.founder) {
             (Some(manifest), _) if manifest.founder != self.author => {
                 return Err(MemError::Unauthorized(format!(
@@ -7670,16 +7710,19 @@ impl MemoryStore {
         let new_epoch = self.next_rotation_epoch(known_max_epoch).await?;
         let new_key = SecretKey::generate();
         // This store's own signer is the provisioner for the rotation too.
-        let wrapped = rotate_team_key(
-            self.blob.as_ref(),
+        // The manifest resolved above, through the rollback watermark, decides
+        // who receives the new key; a fresh bucket read here could elect an
+        // older roster that still lists a removed member.
+        let wraps = seal_wraps(
             &self.team,
             &new_key,
             new_epoch,
             &member_keys,
+            manifest.as_ref(),
             self.founder.as_ref(),
             self.signer.as_ref(),
-        )
-        .await?;
+        )?;
+        let wrapped = create_wraps(self.blob.as_ref(), &self.team, new_epoch, wraps).await?;
         if wrapped.is_empty() {
             // No wraps were published, so the bucket is unchanged; refusing here
             // keeps the write epoch on a key the team can actually read.
@@ -10408,6 +10451,168 @@ mod tests {
             "got {refused:?}"
         );
         assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        Ok(())
+    }
+
+    /// Publish member keys for M and C to `blob`, returning their addresses.
+    async fn publish_m_and_c(
+        blob: &Arc<dyn BlobStore>,
+    ) -> Result<(crate::Ss58, crate::Ss58), Box<dyn std::error::Error>> {
+        const PHRASE_M: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        const PHRASE_C: &str =
+            "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+        let mut addresses = Vec::new();
+        for (seed, phrase) in [([21_u8; 32], PHRASE_M), ([22_u8; 32], PHRASE_C)] {
+            let signer = Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?;
+            let identity = crate::derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
+            let member_key = MemberKey::create_signed(&signer, &identity);
+            crate::publish_member_key(blob.as_ref(), TEAM, &member_key).await?;
+            addresses.push(member_key.ss58);
+        }
+        let [m, c] = <[crate::Ss58; 2]>::try_from(addresses).map_err(|_| "two members")?;
+        Ok((m, c))
+    }
+
+    /// A founder machine with a durable manifest marker, after it removed C:
+    /// manifest v0 named M and C, v1 names only M, and epoch 1 is wrapped to M.
+    /// Returns the bucket, the marker's directory, M's and C's addresses.
+    async fn founder_after_removing_c() -> Result<
+        (
+            Arc<dyn BlobStore>,
+            tempfile::TempDir,
+            crate::Ss58,
+            crate::Ss58,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let dir = tempfile::tempdir()?;
+        let (m, c) = publish_m_and_c(&blob).await?;
+
+        let founder = founder_with_marker(&blob, &dir)?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone(), c.clone()]))
+            .await?;
+        let founder = founder_with_marker(&blob, &dir)?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone()]))
+            .await?;
+        let rotation = founder.rotate_key(0).await?;
+        assert!(
+            !rotation.wrapped.contains(&c),
+            "C was removed before the rotation"
+        );
+        Ok((blob, dir, m, c))
+    }
+
+    /// `remove`'s two steps in one process: the rotation after publishing the
+    /// shrunk roster uses that roster even when the bucket no longer serves it.
+    /// The publish did not raise the rollback watermark, so the rotation read
+    /// the bucket, elected the previous manifest, and wrapped the removed member.
+    #[tokio::test]
+    async fn a_rotation_after_a_publish_uses_the_published_roster() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (m, c) = publish_m_and_c(&blob).await?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone(), c.clone()]))
+            .await?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone()]))
+            .await?;
+        garble_manifest(&blob, 1).await?;
+
+        let rotation = founder.rotate_key(0).await?;
+        assert!(!rotation.wrapped.contains(&c), "{:?}", rotation.wrapped);
+        Ok(())
+    }
+
+    /// The founder store over `blob` with its durable manifest marker in `dir`.
+    fn founder_with_marker(
+        blob: &Arc<dyn BlobStore>,
+        dir: &tempfile::TempDir,
+    ) -> Result<MemoryStore, MemError> {
+        let marker: Arc<dyn ManifestMarker> = Arc::new(crate::FileManifestMarker::new(
+            dir.path().join("team.manifest.json"),
+        ));
+        Ok(store_over(Arc::clone(blob), SOLO_SEED)?.with_manifest_marker(Some(marker)))
+    }
+
+    /// The manifest object at `version`, replaced with bytes that do not parse.
+    async fn garble_manifest(blob: &Arc<dyn BlobStore>, version: u64) -> TestResult {
+        let key = format!("{TEAM}/_manifest/{version:020}");
+        blob.put(&key, b"not a manifest".to_vec()).await?;
+        Ok(())
+    }
+
+    /// A later `rotate` on the founder machine does not wrap the new key to a
+    /// member the newest manifest removed, when that manifest's object is
+    /// garbled. The rotation read the bucket without the rollback watermark,
+    /// elected the previous manifest, and wrapped the key to the removed member.
+    #[tokio::test]
+    async fn a_garbled_newest_manifest_does_not_reach_a_founders_rotation() -> TestResult {
+        let (blob, dir, m, c) = founder_after_removing_c().await?;
+        garble_manifest(&blob, 1).await?;
+
+        let restarted = founder_with_marker(&blob, &dir)?;
+        let rotation = restarted.rotate_key(1).await?;
+        assert!(rotation.wrapped.contains(&m), "{:?}", rotation.wrapped);
+        assert!(!rotation.wrapped.contains(&c), "{:?}", rotation.wrapped);
+        Ok(())
+    }
+
+    /// The founder's next membership change after a garbled newest manifest
+    /// starts from that manifest, not the one before it. It used to start from
+    /// the previous roster, so removing M signed the removed C back in, at the
+    /// version readers already held, which they accepted.
+    #[tokio::test]
+    async fn a_garbled_newest_manifest_does_not_reach_a_founders_next_remove() -> TestResult {
+        let (blob, dir, m, c) = founder_after_removing_c().await?;
+        garble_manifest(&blob, 1).await?;
+
+        let restarted = founder_with_marker(&blob, &dir)?;
+        let mut members = restarted
+            .membership_manifest()
+            .await?
+            .ok_or("the marker holds a manifest")?
+            .members;
+        assert!(!members.contains(&c), "{members:?}");
+        members.remove(&m);
+        restarted.publish_membership(members).await?;
+
+        let live = load_manifest(blob.as_ref(), TEAM, None)
+            .await?
+            .ok_or("published")?;
+        assert_eq!(live.version, 2);
+        assert!(!live.members.contains(&c), "{:?}", live.members);
+        Ok(())
+    }
+
+    /// A manifest replaced at the version a reader already applied, with
+    /// another roster, does not change that reader's members.
+    #[tokio::test]
+    async fn a_replaced_manifest_at_the_applied_version_is_refused() -> TestResult {
+        let (blob, _dir, m, c) = founder_after_removing_c().await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        let applied = reader.members().await?;
+        assert!(!applied.contains(&c), "{applied:?}");
+
+        let founder_signer =
+            Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?;
+        let replaced = TeamManifest::create_signed(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([m.clone(), c]),
+            1,
+        );
+        blob.put(
+            &format!("{TEAM}/_manifest/{:020}", 1),
+            serde_json::to_vec(&replaced)?,
+        )
+        .await?;
+
+        assert_eq!(reader.members().await?, applied);
         Ok(())
     }
 

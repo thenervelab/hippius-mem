@@ -207,6 +207,14 @@ field.
   the highest epoch with a wrap in the bucket, a rotation to an epoch that
   already has a key check is refused (`MemError::EpochTaken`), and a
   rotation's wraps are create-only writes where the gateway enforces them.
+- The founder's `rotate`, `remove`, `provision`, `members` and recovery
+  commands use the same manifest rollback protection as `sync`. They read
+  the bucket's manifest directly, so when the newest manifest object was
+  garbled or gone, a rotation wrapped the new key to a member that manifest
+  had removed, and the next `remove` signed the removed member back in. A
+  manifest this machine publishes now raises the watermark and the durable
+  marker at once, and a manifest that differs from the applied one at the
+  same version is refused.
 
 ## [0.7.1] - 2026-11-19
 
