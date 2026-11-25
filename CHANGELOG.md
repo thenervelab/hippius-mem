@@ -181,6 +181,14 @@ field.
   full. The sweep now deletes only checkpoints older than the one just
   written, and a process downloads a checkpoint that does not open only
   once.
+- Committing an anchor batch reads the next sequence number from the keys
+  under this author's own `_anchors/{author}/` prefix, with one LIST and no
+  GET. It used to download every anchor record of every teammate, under the
+  writer lock, on each batch (201 GETs with 200 teammate records), and took
+  the number from any record body that claimed this author, so one record
+  naming the last possible number made every sixteenth write spin forever.
+  Such a key now fails the anchor with an error, and a run of collisions
+  gives up after 8 attempts.
 
 ## [0.7.1] - 2026-11-19
 

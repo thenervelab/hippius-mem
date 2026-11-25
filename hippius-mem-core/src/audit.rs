@@ -31,10 +31,10 @@ pub use batch::{
 // literal. `cfg(test)` because no non-test code outside `batch` reads it.
 #[cfg(test)]
 pub(crate) use batch::ANCHOR_RECORD_SIGNING_DOMAIN;
-// `anchor_record_exists` is crate-internal: only `MemoryStore`'s
-// cross-process-locked anchor-persist path needs the fail-on-exists check, so
+// `anchor_record_exists` and `next_anchor_seq` are crate-internal: only
+// `MemoryStore`'s cross-process-locked anchor-persist path needs them, so
 // it stays off the curated public facade the rest of this module presents.
-pub(crate) use batch::anchor_record_exists;
+pub(crate) use batch::{anchor_record_exists, next_anchor_seq};
 // The raw scan is crate-internal for the same reason: only the store's resign
 // flow may see `Invalid` records (to count and warn — never to read or sign),
 // so the public facade keeps serving only the policy readers above.

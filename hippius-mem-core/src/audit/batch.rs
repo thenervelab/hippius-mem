@@ -260,6 +260,46 @@ pub async fn persist_anchor_record(
         .await
 }
 
+/// The first anchor seq `author_key` has not used: one past the highest seq
+/// named by an object under the author's own `{team}/_anchors/{author_key}/`
+/// prefix, or 0 when there is none.
+///
+/// Read from the keys of one LIST, with no GET: the seq is in the key, and a
+/// record occupies its key whether or not its body is signed or parses. Only
+/// keys exactly of the form [`anchor_record_key`] mints count, so a body that
+/// claims this author from another author's prefix, or a key with extra
+/// segments, never moves the seq.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::list`] reports, and [`MemError::Malformed`] when a key
+/// names seq `u64::MAX`, after which no seq is free.
+pub(crate) async fn next_anchor_seq(
+    blob: &Arc<dyn BlobStore>,
+    team: &str,
+    author_key: &VerifyingKey,
+) -> Result<u64, MemError> {
+    let prefix = format!("{team}/_anchors/{}/", author_key.to_hex());
+    let highest = blob
+        .list(&prefix)
+        .await?
+        .iter()
+        .filter_map(|key| key.strip_prefix(&prefix))
+        .filter_map(|suffix| {
+            let seq = suffix.parse::<u64>().ok()?;
+            (format!("{seq:020}") == suffix).then_some(seq)
+        })
+        .max();
+    match highest {
+        None => Ok(0),
+        Some(seq) => seq.checked_add(1).ok_or_else(|| {
+            MemError::Malformed(format!(
+                "an anchor record under {prefix} names seq {seq}, so no later seq is free"
+            ))
+        }),
+    }
+}
+
 /// Whether `author_key` already has a persisted anchor record at `seq`.
 ///
 /// `BlobStore` has no conditional/if-absent put, so this GET-before-PUT is what

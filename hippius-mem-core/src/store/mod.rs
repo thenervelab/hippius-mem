@@ -52,8 +52,8 @@ use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::{
     AnchorRecord, AnchorResignReport, AnchorSignatureState, UnsignedAnchorPolicy,
-    anchor_record_exists, persist_anchor_record, read_anchor_records,
-    read_anchor_records_with_policy, scan_anchor_records,
+    anchor_record_exists, next_anchor_seq, persist_anchor_record, read_anchor_records_with_policy,
+    scan_anchor_records,
 };
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
@@ -979,6 +979,12 @@ struct KnownKeyCheck {
 /// refusing after a wrong one is replaced, at one GET per epoch per minute at
 /// most on the write path. Arbitrary within that reasoning.
 const KEY_CHECK_RECHECK: Duration = Duration::from_mins(1);
+
+/// How many seqs [`MemoryStore::reserve_seq_and_persist`] tries before it fails
+/// the anchor. Arbitrary: under the writer lock a collision needs a second
+/// machine under the same identity, and each retry re-reads the seq from the
+/// bucket, so two in a row are already rare.
+const ANCHOR_SEQ_ATTEMPTS: u32 = 8;
 
 /// How many times [`MemoryStore::lock_for_edit`] syncs and retries when another
 /// process on this machine committed since this process last synced. One sync
@@ -5021,8 +5027,8 @@ impl MemoryStore {
     ///
     /// # Fail-on-exists, and why a retry loop
     ///
-    /// [`BlobStore`] has no conditional/if-absent put (see its trait doc), so
-    /// [`anchor_record_exists`] performs a GET-before-PUT instead. Under the held
+    /// A create-only put is not enforced by every gateway (`doctor` probes it),
+    /// so [`anchor_record_exists`] performs a GET-before-PUT instead. Under the held
     /// lock this is sufficient, not merely best-effort: nothing else can persist
     /// to the reserved key while `cross` is held, so the loop below exists for the
     /// residual cases the lock cannot cover — no [`WriterLock`](crate::WriterLock)
@@ -5030,6 +5036,9 @@ impl MemoryStore {
     /// identity, both already-documented open gaps. On a detected collision the
     /// seq is re-reserved (via a fresh [`reseed_next_seq`] call, so the retry
     /// picks up whatever collided) rather than the record silently overwriting it.
+    /// The loop gives up after [`ANCHOR_SEQ_ATTEMPTS`] collisions, and a seq past
+    /// `u64::MAX` is an error, so a planted record can fail an anchor but never
+    /// hang the write that triggered it.
     ///
     /// # Errors
     ///
@@ -5040,14 +5049,16 @@ impl MemoryStore {
 
         self.reseed_next_seq().await?;
 
-        loop {
+        for attempt in 1.. {
             record.seq = {
                 let mut state = self
                     .anchor_state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let seq = state.next_seq;
-                state.next_seq = state.next_seq.saturating_add(1);
+                state.next_seq = seq.checked_add(1).ok_or_else(|| {
+                    MemError::Malformed("this author's anchor seqs are exhausted".to_owned())
+                })?;
                 seq
             };
             // The anchor sink cannot know the per-author batch seq — it is
@@ -5061,15 +5072,22 @@ impl MemoryStore {
                 *slot = record.seq;
             }
 
-            if anchor_record_exists(&self.blob, &self.team, &record.author_key, record.seq).await? {
-                tracing::warn!(
-                    seq = record.seq,
-                    "anchor seq collided with an existing record; re-seeding and retrying"
-                );
-                self.reseed_next_seq().await?;
-                continue;
+            if !anchor_record_exists(&self.blob, &self.team, &record.author_key, record.seq).await?
+            {
+                break;
             }
-            break;
+            if attempt == ANCHOR_SEQ_ATTEMPTS {
+                return Err(MemError::Storage(format!(
+                    "anchor seq {} is taken after {ANCHOR_SEQ_ATTEMPTS} attempts; another \
+                     writer under this identity keeps claiming seqs",
+                    record.seq
+                )));
+            }
+            tracing::warn!(
+                seq = record.seq,
+                "anchor seq collided with an existing record; re-seeding and retrying"
+            );
+            self.reseed_next_seq().await?;
         }
 
         // Sign LAST, after the retry loop settled the final `seq` and stamped a
@@ -5090,24 +5108,17 @@ impl MemoryStore {
     /// refresh. Called only from [`reserve_seq_and_persist`](Self::reserve_seq_and_persist),
     /// under the cross-process lock it holds.
     ///
+    /// The seq comes from the keys under this author's own prefix
+    /// ([`next_anchor_seq`]): one LIST, no GET of any record. Reading every
+    /// record's body cost one GET per teammate record on every batch commit,
+    /// and took the seq from any body that claimed this author, wherever it
+    /// was stored.
+    ///
     /// # Errors
     ///
-    /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
+    /// Whatever [`next_anchor_seq`] reports.
     async fn reseed_next_seq(&self) -> Result<(), MemError> {
-        let author_key = self.author_key();
-        // Deliberately the plain (Accept) reader, NOT this store's
-        // `unsigned_anchor_policy`: seq allocation is keyspace bookkeeping, not
-        // evidence. A legacy unsigned record of our own still occupies its
-        // `{author_key}/{seq}` object key, so a strict read that hid it here
-        // would under-seed `next_seq` and make every anchor walk the occupied
-        // seqs one detected collision (two bucket reads each) at a time.
-        let records = read_anchor_records(&self.blob, &self.team).await?;
-        let next = records
-            .iter()
-            .filter(|record| record.author_key == author_key)
-            .map(|record| record.seq.saturating_add(1))
-            .max()
-            .unwrap_or(0);
+        let next = next_anchor_seq(&self.blob, &self.team, &self.author_key()).await?;
         let mut state = self
             .anchor_state
             .lock()
@@ -14660,6 +14671,60 @@ mod tests {
 
         assert_fresh_reader_sees_all(&blob, &[acked]).await?;
         assert_eq!(store.oplog.read_all(TEAM).await?.len(), 2);
+        Ok(())
+    }
+
+    /// An object under this author's anchor prefix naming seq `u64::MAX` fails
+    /// the anchor with an error. The seq used to saturate at `u64::MAX`, find it
+    /// taken, and retry the same seq forever, inside the write that triggered
+    /// the anchor.
+    #[tokio::test]
+    async fn an_anchor_record_at_the_last_seq_fails_the_anchor_instead_of_hanging() -> TestResult {
+        // Yielding, so the timeout below can fire on a loop that never ends; the
+        // in-memory store alone completes every call without returning to the
+        // runtime.
+        let blob: Arc<dyn BlobStore> = Arc::new(YieldingBlob(MemoryBlobStore::default()));
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let planted = format!(
+            "{TEAM}/_anchors/{}/{:020}",
+            store.author_key().to_hex(),
+            u64::MAX
+        );
+        blob.put(&planted, b"{}".to_vec()).await?;
+        store.remember(sample_input()).await?;
+
+        let flushed = tokio::time::timeout(Duration::from_mins(1), store.flush_anchors()).await?;
+        assert!(
+            matches!(flushed, Err(MemError::Malformed(_))),
+            "got {flushed:?}"
+        );
+        Ok(())
+    }
+
+    /// Committing an anchor batch reads no anchor record: the next seq comes
+    /// from the keys of this author's own prefix. It used to GET every record
+    /// of every teammate, under the writer lock, on each batch.
+    #[tokio::test]
+    async fn an_anchor_batch_reads_no_teammate_record() -> TestResult {
+        let gets_to_flush = |teammate_records: u64| async move {
+            let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let teammate = store_over(Arc::clone(&bucket), OTHER_SEED)?;
+            for seq in 0..teammate_records {
+                let key = format!(
+                    "{TEAM}/_anchors/{}/{seq:020}",
+                    teammate.author_key().to_hex()
+                );
+                bucket.put(&key, b"{}".to_vec()).await?;
+            }
+            let meter = Arc::new(InstrumentedBlobStore::new(Arc::clone(&bucket)));
+            let store = store_over(Arc::clone(&meter) as Arc<dyn BlobStore>, SOLO_SEED)?;
+            store.remember(sample_input()).await?;
+            let before = meter.stats().get.calls;
+            store.flush_anchors().await?;
+            Ok::<u64, Box<dyn std::error::Error>>(meter.stats().get.calls - before)
+        };
+
+        assert_eq!(gets_to_flush(50).await?, gets_to_flush(0).await?);
         Ok(())
     }
 
