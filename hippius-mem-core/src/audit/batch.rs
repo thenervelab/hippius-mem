@@ -367,9 +367,9 @@ pub(crate) async fn own_anchors(
 
 /// Whether `author_key` already has a persisted anchor record at `seq`.
 ///
-/// `BlobStore` has no conditional/if-absent put, so this GET-before-PUT is what
-/// gives [`persist_anchor_record`]'s caller fail-on-exists semantics instead of
-/// the blind overwrite a bare `put` would perform. It is sound only under the
+/// [`persist_anchor_record`] writes with a plain `put`, so this GET-before-PUT
+/// is what gives its caller fail-on-exists semantics instead of the blind
+/// overwrite that `put` would perform. It is sound only under the
 /// caller's discipline: [`crate::store::MemoryStore`] calls this and the
 /// following `persist_anchor_record` under one continuously-held cross-process
 /// [`WriterLock`](crate::oplog::WriterLock) acquisition, so no other
