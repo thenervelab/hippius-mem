@@ -307,7 +307,6 @@ fn upsert_toml_mcp(
 }
 
 fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
-    refuse_symlink(path)?;
     let mut doc = match load_toml_document(path) {
         Ok(doc) => doc,
         Err(e) if path_missing_or_malformed(path, &e) => return Ok(()),
@@ -324,6 +323,17 @@ fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
     }
     if servers.is_empty() {
         doc.remove("mcp_servers");
+    }
+    // Checked only now: a linked config without the entry needs no write, so
+    // an uninstall over every detected agent passes it by.
+    if let Some(link) = symlink_on_path(path) {
+        bail!(
+            "{} is a symlink; hippius-mem does not rewrite {} through a link, because the \
+             write would replace the link with a regular file. Remove the \
+             `[mcp_servers.{SERVER_NAME}]` entry from the link's target by hand",
+            link.display(),
+            path.display()
+        );
     }
     super::atomic::atomic_write(path, doc.to_string().as_bytes())
 }
@@ -365,20 +375,29 @@ fn toml_value_to_item(value: toml::Value) -> anyhow::Result<toml_edit::Item> {
 /// (the home directory itself) are not, since a home under a linked path is a
 /// normal system layout, not a checkout.
 fn refuse_symlink(path: &Path) -> anyhow::Result<()> {
-    for link in [Some(path), path.parent()].into_iter().flatten() {
-        if std::fs::symlink_metadata(link).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            bail!(
-                "{} is a symlink; hippius-mem does not edit {} through a link, because the \
-                 entry can carry a bearer token and would land in the link's target. Replace \
-                 the link with a regular file or directory, or add the \
-                 `[mcp_servers.{SERVER_NAME}]` entry to the target by hand (for the HTTP \
-                 daemon, keep the token out of a tracked file)",
-                link.display(),
-                path.display()
-            );
-        }
+    if let Some(link) = symlink_on_path(path) {
+        bail!(
+            "{} is a symlink; hippius-mem does not edit {} through a link, because the \
+             entry can carry a bearer token and would land in the link's target. Replace \
+             the link with a regular file or directory, or add the \
+             `[mcp_servers.{SERVER_NAME}]` entry to the target by hand (for the HTTP \
+             daemon, keep the token out of a tracked file)",
+            link.display(),
+            path.display()
+        );
     }
     Ok(())
+}
+
+/// `path` itself or its directory, whichever is a symlink, as
+/// [`refuse_symlink`] checks them.
+fn symlink_on_path(path: &Path) -> Option<&Path> {
+    [Some(path), path.parent()]
+        .into_iter()
+        .flatten()
+        .find(|link| {
+            std::fs::symlink_metadata(link).is_ok_and(|meta| meta.file_type().is_symlink())
+        })
 }
 
 fn path_missing_or_malformed(path: &Path, err: &anyhow::Error) -> bool {
@@ -764,7 +783,9 @@ mod tests {
     }
 
     /// The same for a config whose directory is the link (`~/.codex` linked
-    /// into a dotfiles checkout, as GNU stow does), on install and uninstall.
+    /// into a dotfiles checkout, as GNU stow does). Uninstall passes such a
+    /// config by when it holds no entry, so an uninstall over every detected
+    /// agent goes on to the rest, and refuses it when the entry is there.
     #[cfg(unix)]
     #[test]
     fn a_config_in_a_symlinked_directory_is_refused_and_left_alone() {
@@ -784,11 +805,33 @@ mod tests {
         );
         AgentId::Codex
             .unregister(home.path())
-            .expect_err("uninstall refuses it too");
+            .expect("a linked config without the entry is left alone");
         assert_eq!(
             std::fs::read_to_string(&real).expect("read"),
             "model = \"o4\"\n",
             "the link's target is untouched"
+        );
+
+        let with_entry = "model = \"o4\"\n\n[mcp_servers.hippius-mem]\ncommand = \"x\"\n";
+        std::fs::write(&real, with_entry).expect("seed");
+        let refused = AgentId::Codex
+            .unregister(home.path())
+            .expect_err("uninstall refuses to rewrite through the link");
+        assert!(
+            format!("{refused:#}").contains("by hand"),
+            "the error says what to do: {refused:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read"),
+            with_entry,
+            "the link's target is untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.path().join(".codex"))
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the directory is still a link"
         );
     }
 
