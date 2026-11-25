@@ -22540,4 +22540,56 @@ mod tests {
         );
         Ok(())
     }
+
+    /// An edit with a version precondition, the first write after this
+    /// machine dropped an unconfirmed op, goes through. The settle step must
+    /// record the dropped op as gone: while the tip file still named it as
+    /// pending, every settle found it again and the edit gave up as busy.
+    #[tokio::test]
+    async fn an_edit_with_a_precondition_after_a_dropped_pending_op_goes_through() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?
+            .with_writer_lock(Some(lock))
+            .with_pending_op_max_age(Duration::ZERO);
+        let id = store.remember(numbered_input(0)).await?;
+
+        fake.arm();
+        let unconfirmed = store.remember(numbered_input(1)).await;
+        assert!(
+            matches!(unconfirmed, Err(MemError::WriteOutcomeUnknown { .. })),
+            "got {unconfirmed:?}"
+        );
+        fake.disarm();
+
+        let version = store.current_version(id)?;
+        let edit = RememberInput {
+            body: "the edited body".to_owned(),
+            ..numbered_input(0)
+        };
+        store
+            .edit_with_precondition(id, edit, Some(version))
+            .await?;
+        assert_eq!(store.hydrate(id).await?.body, "the edited body");
+        Ok(())
+    }
+
+    /// A steady writer's next write reads no op object back: the tip file
+    /// names the op this process wrote itself, which needs no check against
+    /// the bucket. Catches the check running on every write, one GET each.
+    #[tokio::test]
+    async fn a_steady_writers_next_write_reads_no_op_back() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+        store.remember(numbered_input(0)).await?;
+        store.remember(numbered_input(1)).await?;
+
+        bucket.reset();
+        store.remember(numbered_input(2)).await?;
+        assert_eq!(bucket.oplog_gets.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
 }
