@@ -54,6 +54,11 @@ struct StderrDrain {
 
 impl HttpDaemon {
     fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_on_port(0)
+    }
+
+    /// [`spawn`](Self::spawn) on `port`; `0` lets the OS pick one.
+    fn spawn_on_port(port: u16) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let config_path = dir.path().join("hippius-mem.toml");
         let vault_root = dir.path().join("vault");
@@ -64,7 +69,7 @@ impl HttpDaemon {
 
         let mut command = support::binary();
         command
-            .args(["serve", "--port", "0", "--token-file"])
+            .args(["serve", "--port", &port.to_string(), "--token-file"])
             .arg(&token_path)
             .current_dir(dir.path())
             .env("HOME", dir.path())
@@ -754,6 +759,63 @@ fn serve_on_a_taken_port_exits_0_only_for_a_daemon_with_its_token()
     assert!(!other.status.success(), "{stderr}");
     assert!(
         stderr.contains("does not prove it holds this user's token"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A `serve` started while the previous daemon is still releasing the port
+/// waits for it and takes the port. Catches a serve that probes the occupant
+/// at once: the dying occupant proves no token, so that serve fails, and the
+/// user service it runs under starts no daemon on a restart.
+#[test]
+fn serve_takes_a_port_its_previous_occupant_releases() -> Result<(), Box<dyn std::error::Error>> {
+    let occupant = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = occupant.local_addr()?.port();
+    // Held past `serve`'s start, released well inside its retry window
+    // (eight binds 150 ms apart). Arbitrary.
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(600));
+        drop(occupant);
+    });
+
+    let daemon = HttpDaemon::spawn_on_port(port)?;
+    releaser
+        .join()
+        .map_err(|_| "the releasing thread panicked")?;
+    assert_eq!(daemon.url, format!("http://127.0.0.1:{port}/mcp"));
+    Ok(())
+}
+
+/// A port `serve` may not bind at all fails at once with the bind error, not
+/// after the retries meant for a port another process is releasing, and not
+/// as "held by a process that does not prove it holds this user's token".
+/// Skipped where this user may bind port 1 (root, or a lowered
+/// `ip_unprivileged_port_start`).
+#[test]
+fn serve_reports_a_port_it_may_not_bind() -> Result<(), Box<dyn std::error::Error>> {
+    match std::net::TcpListener::bind("127.0.0.1:1") {
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
+        _ => return Ok(()),
+    }
+    let dir = tempfile::tempdir()?;
+    let token_path = dir.path().join("mcp-token");
+    std::fs::write(&token_path, format!("{TOKEN}\n"))?;
+
+    let output = support::binary()
+        .args(["serve", "--port", "1", "--token-file"])
+        .arg(&token_path)
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("HIPPIUS_MEM_CONFIG", dir.path().join("hippius-mem.toml"))
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("failed to bind loopback MCP port 1") && !stderr.contains("does not prove"),
         "{stderr}"
     );
     Ok(())
