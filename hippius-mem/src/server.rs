@@ -1950,9 +1950,9 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, HeadWatermarks, InMemoryIndex, MemError, MemoryBlobStore,
-        MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer,
-        Sr25519Signer, read_heads,
+        AnchorReceipt, AuditAnchor, BatchMeta, Blake3Hash, BlobStore, HashEmbedder, HeadWatermarks,
+        InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor,
+        OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer, read_heads,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -2053,6 +2053,58 @@ mod tests {
             1,
         );
         MemoryServer::new(Arc::new(store))
+    }
+
+    /// An anchor sink whose submission never completes: a chain node that
+    /// accepted the connection and stalled, or a gateway that stopped answering.
+    #[derive(Debug)]
+    struct StalledAnchor;
+
+    #[async_trait::async_trait]
+    impl AuditAnchor for StalledAnchor {
+        async fn anchor(
+            &self,
+            _root: Blake3Hash,
+            _meta: BatchMeta,
+        ) -> Result<AnchorReceipt, MemError> {
+            std::future::pending().await
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A session whose exit flush never finishes still ends: off chain, the
+    /// flush is cut at `EXIT_FLUSH_TIMEOUT`. Catches a flush awaited without
+    /// that bound, which keeps a closed session's process alive for good.
+    #[tokio::test]
+    async fn an_exit_flush_that_never_finishes_ends_at_the_timeout() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            index,
+            OpLogStore::new(blob),
+            Arc::new(StalledAnchor),
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        );
+        let server = MemoryServer::new(Arc::new(store));
+        server.logic_remember(sample_remember()).await.unwrap();
+
+        // Ten times the bound, so only a flush that ignores it runs into this.
+        let outer = super::EXIT_FLUSH_TIMEOUT * 10;
+        assert!(
+            tokio::time::timeout(outer, server.flush_on_exit())
+                .await
+                .is_ok(),
+            "the exit flush outlived its {:?} bound",
+            super::EXIT_FLUSH_TIMEOUT
+        );
     }
 
     fn sample_remember() -> RememberParams {
