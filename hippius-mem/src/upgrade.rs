@@ -18,9 +18,10 @@
 //! `storage = "s3"` with the new bucket/credentials, preserving every other
 //! field ([`render_upgraded_config`]); then rebuild the store from the
 //! rewritten config, bootstrap any rotated epoch keys, re-run the `doctor`
-//! probe against that EXACT config, and sync the index from the bucket —
-//! proving the copied history is readable end to end before the command
-//! reports success.
+//! probe against that EXACT config, and sync the index from the bucket
+//! before the command reports success. The probe proves the key and the
+//! bucket work; the sync does not prove every copied note opens, because it
+//! skips a note it cannot decode with a warning instead of failing.
 //!
 //! Config load/rewrite deliberately mirrors `quickstart.rs`/`join_bundle.rs`,
 //! not [`Config::from_env_and_file`]: it resolves the SAME path
@@ -682,7 +683,8 @@ fn reload_config(path: &Path) -> anyhow::Result<Config> {
 /// probe against this EXACT config — never `doctor::run(&[])`, which
 /// re-resolves its own config from the environment/cwd (see the module
 /// docs) — then a `refresh`-equivalent sync so the local index rebuilds
-/// from the bucket, proving the copied history is readable end to end.
+/// from the bucket. The sync skips a note it cannot decode with a warning,
+/// so it is not proof that every copied note opens.
 ///
 /// # Errors
 ///

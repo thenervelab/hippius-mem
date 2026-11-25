@@ -57,6 +57,14 @@ read. What that does and does not buy you, stated plainly.
   release. An epoch counts as rotated only when a wrap at it is signed by the founder or
   the recovery key the manifest names, so an object planted under `_keys/` neither stops
   writes nor moves the next rotation's epoch.
+- **The `serve` daemon's loopback port is shared by every user of the machine.** Clients
+  wired to the HTTP daemon send this user's bearer token and every tool call to
+  `127.0.0.1:17432`. `install` checks once that the daemon there proves it holds this
+  user's token (`/token-proof`), but clients do not check again: when this user's daemon
+  is not running (stopped, crashed, or before login), another local user who binds the
+  port receives the token and the calls. On a machine with other users, wire agents over
+  stdio: `install` from a build without the `http-mcp` feature wires every client that way. A per-user Unix socket would remove the shared
+  port; it is not in this release.
 - **`reconcile`'s anchoring checks detect accidental loss, not adversarial suppression.**
   They cross-check the visible op-log against anchored Merkle roots and flag an anchored
   op that has gone missing or a record whose root disagrees with its leaves — i.e.
