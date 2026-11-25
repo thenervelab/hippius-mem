@@ -746,6 +746,28 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("read"), USER_CONFIG);
     }
 
+    /// A config that exists but cannot be read as text fails the install and
+    /// keeps its bytes. Only a missing file starts from an empty document:
+    /// taking every read error for "missing" replaced the user's whole file
+    /// with the one table hippius-mem writes.
+    #[test]
+    fn an_unreadable_codex_config_fails_the_install_and_is_left_alone() {
+        // Valid TOML in Latin-1, so not UTF-8: `read_to_string` fails with
+        // `InvalidData`, not `NotFound`.
+        const USER_CONFIG: &[u8] = b"# caf\xe9 settings\nmodel = \"o4\"\n";
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        let path = home.path().join(".codex/config.toml");
+        std::fs::write(&path, USER_CONFIG).expect("seed");
+
+        let refused = AgentId::Codex.register(home.path(), &launch());
+        assert!(
+            refused.is_err(),
+            "an unreadable config must fail the install"
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), USER_CONFIG);
+    }
+
     /// A config symlinked into a dotfiles checkout is refused, so the entry
     /// (which can carry the bearer token) never lands in the tracked target,
     /// and the link is not replaced by a file either.
