@@ -271,14 +271,15 @@ fn toml_entry_has_url(path: &Path) -> bool {
 /// Upsert `[mcp_servers.hippius-mem]` in a Grok/Codex `config.toml`.
 ///
 /// Edits the document in place, so everything outside our table keeps its
-/// bytes: comments, key order, inline tables. A symlinked config (a dotfiles
-/// checkout) is written through to its target, not replaced by a file.
+/// bytes: comments, key order, inline tables. A symlinked config is refused
+/// ([`refuse_symlink`]).
 fn upsert_toml_mcp(
     path: &Path,
     launch: &McpLaunch,
     prefer_http: bool,
     auth: TomlHttpAuth,
 ) -> anyhow::Result<()> {
+    refuse_symlink(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
@@ -299,14 +300,14 @@ fn upsert_toml_mcp(
         SERVER_NAME,
         toml_value_to_item(launch.toml_entry(prefer_http, auth))?,
     );
-    let target = write_target(path)?;
     if launch.writes_token(prefer_http) {
-        return super::atomic::atomic_write_private(&target, doc.to_string().as_bytes());
+        return super::atomic::atomic_write_private(path, doc.to_string().as_bytes());
     }
-    super::atomic::atomic_write(&target, doc.to_string().as_bytes())
+    super::atomic::atomic_write(path, doc.to_string().as_bytes())
 }
 
 fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
+    refuse_symlink(path)?;
     let mut doc = match load_toml_document(path) {
         Ok(doc) => doc,
         Err(e) if path_missing_or_malformed(path, &e) => return Ok(()),
@@ -324,7 +325,7 @@ fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
     if servers.is_empty() {
         doc.remove("mcp_servers");
     }
-    super::atomic::atomic_write(&write_target(path)?, doc.to_string().as_bytes())
+    super::atomic::atomic_write(path, doc.to_string().as_bytes())
 }
 
 /// The config at `path` as an editable document; empty when the file is
@@ -352,14 +353,22 @@ fn toml_value_to_item(value: toml::Value) -> anyhow::Result<toml_edit::Item> {
         .context("the serialized MCP entry holds its own key")
 }
 
-/// The file a write to `path` replaces: the symlink's target when `path` is
-/// a symlink, so a config kept in a dotfiles checkout stays a link. These
-/// configs live under the user's own home directory.
-fn write_target(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+/// Refuse to edit a config that is a symlink.
+///
+/// Writing through the link would put the entry, which can carry this user's
+/// bearer token, into the link's target, typically a dotfiles checkout that is
+/// committed and pushed. Replacing the link with a file would break the
+/// user's setup instead. Neither is this command's call to make.
+fn refuse_symlink(path: &Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
-            .with_context(|| format!("resolving the symlink {} failed", path.display())),
-        _ => Ok(path.to_path_buf()),
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "{} is a symlink; hippius-mem does not edit a config through a link, because the \
+             entry can carry a bearer token and would land in the link's target. Replace the \
+             link with a regular file, or add the `[mcp_servers.{SERVER_NAME}]` entry to the \
+             target by hand (for the HTTP daemon, keep the token out of a tracked file)",
+            path.display()
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -708,12 +717,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("read"), USER_CONFIG);
     }
 
-    /// A config symlinked into a dotfiles checkout stays a symlink, and the
-    /// entry lands in the file it points at. The rename-over write replaced
-    /// the link with a regular file.
+    /// A config symlinked into a dotfiles checkout is refused, so the entry
+    /// (which can carry the bearer token) never lands in the tracked target,
+    /// and the link is not replaced by a file either.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_codex_config_stays_a_symlink() {
+    fn a_symlinked_codex_config_is_refused_and_left_alone() {
         let home = TempDir::new().expect("tempdir");
         let dotfiles = home.path().join("dotfiles");
         std::fs::create_dir_all(&dotfiles).expect("dir");
@@ -723,20 +732,25 @@ mod tests {
         let link = home.path().join(".codex/config.toml");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-        AgentId::Codex
+        let refused = AgentId::Codex
             .register(home.path(), &launch())
-            .expect("register");
+            .expect_err("a symlinked config is refused");
 
-        let meta = std::fs::symlink_metadata(&link).expect("stat");
         assert!(
-            meta.file_type().is_symlink(),
-            "the config is still a symlink"
+            format!("{refused:#}").contains(&link.display().to_string()),
+            "the error names the path: {refused:#}"
         );
         assert!(
-            std::fs::read_to_string(&real)
-                .expect("read")
-                .contains("[mcp_servers.hippius-mem]"),
-            "the entry is in the link's target"
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the config is still a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read"),
+            "model = \"o4\"\n",
+            "the link's target is untouched"
         );
     }
 

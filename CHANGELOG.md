@@ -253,8 +253,10 @@ field.
 - `install` and `install --uninstall` edit Codex's and Grok's
   `config.toml` in place: comments, key order and inline tables outside the
   `[mcp_servers.hippius-mem]` table are kept, uninstall gives back the file
-  as it was, and a config that is a symlink (a dotfiles checkout) stays one,
-  with the entry written to its target. The file used to be re-serialized
+  as it was. A config that is a symlink (a dotfiles checkout) is refused
+  with an error naming it, and neither the link nor its target is changed:
+  writing through the link would put the entry, which can carry the bearer
+  token, into a file the user may commit. The file used to be re-serialized
   whole. This adds the `toml_edit` crate to the binary, already in the
   lockfile.
 - `upgrade` refuses a destination bucket whose team prefix already holds
