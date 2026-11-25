@@ -48,7 +48,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // wrapped-key epoch newer than this machine's configured `max_epoch` (the
     // recorded `bootstrap_epochs` gotcha's warning-side counterpart). Never
     // blocks or noisily fails the `SessionStart` hook this brief serves.
-    crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
+    crate::admin::warn_if_epoch_superseded(&store).await;
     // Sync straight away rather than through `refresh_if_stale`: this is a fresh
     // process with an empty index and no refresh watermark, so the probe could
     // never skip the sync, and its op-key count would only repeat the LIST the

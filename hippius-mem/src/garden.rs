@@ -42,7 +42,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     crate::profile::bootstrap_key_ring(&store, cfg.max_epoch).await;
     // Without this a vault rotated past this machine's `max_epoch` is surveyed
     // with every newer note missing and nothing said.
-    crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
+    crate::admin::warn_if_epoch_superseded(&store).await;
     store
         .sync()
         .await

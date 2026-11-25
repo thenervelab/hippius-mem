@@ -263,8 +263,11 @@ sub-token revocation, is the manual step above):
    (the same path as `rotate --members`). Older epochs stay wrapped, so previously
    shared notes remain readable; writes sealed under the new epoch are unreadable to
    the removed member. It then prints the ACTION REQUIRED block: every remaining
-   member raises `max_epoch` and restarts, or post-rotation notes silently never
-   appear on their machine.
+   member restarts their MCP server with `HIPPIUS_MEM_MNEMONIC` set, which loads the
+   new epoch's key. No config edit is needed: startup loads keys up to the newest epoch
+   the founder provisioned. A server that cannot load the new key, such as the `serve`
+   daemon (it runs without the mnemonic), refuses every write with an error naming the
+   new epoch instead of sealing notes under the old key the removed member holds.
 
 **Resumable.** Steps 2 and 3 are not atomic (they are `rotate --members`'s
 semantics): the rotation can refuse — typically `NothingToRotate` because no
@@ -281,10 +284,10 @@ remaining member has `join`ed yet — after the shrunk membership already landed
   rotation entirely and says so; nothing else needs fixing. If they still do —
   either a fresh removal, or a half-done resume where rotation never completed —
   it rotates exactly as before. This matters because **every real rotation forces
-  a team-wide `max_epoch` raise**: without this check, re-running `remove` (or
-  simply re-running it against an address that was never a member) after the
-  removal had already fully completed would mint a needless new epoch and force
-  every remaining member to bump `max_epoch` and restart for no security benefit.
+  a team-wide restart**: without this check, re-running `remove` (or simply
+  re-running it against an address that was never a member) after the removal had
+  already fully completed would mint a needless new epoch and force every remaining
+  member to restart for no security benefit.
 - A rotation that could not run yet (`NothingToRotate`) is reported to stdout, not
   treated as a command failure — `remove`'s own job (shrinking membership) is done
   regardless. Have the remaining members `join`, then re-run `hippius-mem remove

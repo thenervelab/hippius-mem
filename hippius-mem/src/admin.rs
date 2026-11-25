@@ -526,7 +526,7 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
 /// never-a-member typo; [`plan_removal`] cannot and need not tell those
 /// apart) does not rotate: nothing changed in this invocation, so rotating
 /// again would mint a gratuitous new epoch and force every remaining
-/// member to bump `max_epoch`, for no security benefit — Task 12's
+/// member to restart, for no security benefit — Task 12's
 /// churn-avoidance, preserved.
 ///
 /// One residual, documented rather than silently reintroduced: a HALF-DONE
@@ -661,10 +661,7 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     } else {
-        tracing::warn!(
-            "HIPPIUS_MEM_MNEMONIC is unset: rotating with only the configured key-ring; \
-             the new epoch is floored by max_epoch, not by the epochs in the bucket"
-        );
+        tracing::warn!("HIPPIUS_MEM_MNEMONIC is unset: rotating with only the configured key-ring");
     }
 
     Ok((cfg, store))
@@ -769,8 +766,9 @@ async fn publish_and_rotate(
 
     // Operator-facing output goes to the stdout handle directly (the workspace
     // denies the `print!` family); write failures are ignored like `members`'.
-    // The ACTION REQUIRED block is the point of the command: a rotation nobody's
-    // config follows silently hides every post-rotation note from the team.
+    // The ACTION REQUIRED block is the point of the command: until a member's
+    // server restarts with its mnemonic, it refuses writes and shows none of the
+    // post-rotation notes.
     let mut out = std::io::stdout();
     let _ = writeln!(
         out,
@@ -788,28 +786,28 @@ async fn publish_and_rotate(
     match outcome.key_check {
         Some(KeyCheckPublished::Published { .. } | KeyCheckPublished::AlreadyPublished) => {}
         Some(KeyCheckPublished::Refused) => tracing::warn!(
-            "a key check for the new epoch already exists and is not this key's; run              `hippius-mem admin keycheck publish --replace` from this machine"
+            "a key check for the new epoch already exists and is not this key's; run \
+             `hippius-mem admin keycheck publish --replace` from this machine"
         ),
         Some(KeyCheckPublished::KeyFailsOnNotes) => tracing::warn!(
-            "no team-key check was published for the new epoch: this machine's new key              opens fewer than half of that epoch's oldest notes it tried; run              `hippius-mem doctor`, or `hippius-mem admin keycheck publish` from a machine              whose key opens those notes"
+            "no team-key check was published for the new epoch: this machine's new key \
+             opens fewer than half of that epoch's oldest notes it tried; run \
+             `hippius-mem doctor`, or `hippius-mem admin keycheck publish` from a machine \
+             whose key opens those notes"
         ),
         None => tracing::warn!(
-            "could not publish the new epoch's team-key check; run `hippius-mem admin              keycheck publish` from this machine"
+            "could not publish the new epoch's team-key check; run `hippius-mem admin \
+             keycheck publish` from this machine"
         ),
     }
     let _ = writeln!(
         out,
         "\n==================== ACTION REQUIRED ====================\n\
-         Every member must now update their machine:\n\
-         \n\
-           1. Set max_epoch = {epoch} in hippius-mem.toml\n\
-              (or export HIPPIUS_MEM_MAX_EPOCH={epoch}).\n\
-           2. Restart the MCP server — and any running `dashboard`, which\n\
-              caches stores per vault — so each bootstraps the new epoch key.\n\
-         \n\
-         A stale max_epoch fails SILENTLY: startup only bootstraps epochs\n\
-         0..=max_epoch, so notes sealed under epoch {epoch} simply never\n\
-         appear on that machine — no error is raised.\n\
+         Every member must now restart the MCP server, and any running\n\
+         `dashboard` (it caches stores per vault), with HIPPIUS_MEM_MNEMONIC\n\
+         set, so each loads the epoch {epoch} key. A process without it,\n\
+         such as the `serve` daemon, cannot load the key: it refuses every\n\
+         write and does not show notes sealed under epoch {epoch}.\n\
          ==========================================================",
         epoch = outcome.new_epoch
     );
@@ -1084,7 +1082,7 @@ pub(crate) async fn members(args: &[String]) -> anyhow::Result<()> {
 /// would keep sealing new notes under epoch 0 — a key a removed member still
 /// holds. The ring's max is by construction an epoch this member can decrypt, so
 /// sealing under it is always safe for the writer; teammates see those notes once
-/// their own `max_epoch` catches up (the loud instruction `rotate` prints).
+/// their own servers restart with their mnemonic (the instruction `rotate` prints).
 ///
 /// Non-fatal by contract: a fresh bucket, an un-provisioned epoch, or a derivation
 /// failure is logged and skipped — the server still serves with its configured
@@ -1101,14 +1099,26 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             return;
         }
     };
-    // Inclusive 0..=max_epoch: there is no on-bucket epoch discovery, so the
-    // operator names the highest rotated epoch via `max_epoch` and we try each.
-    let epochs: Vec<u64> = (0..=max_epoch).collect();
+    // Up to the newest epoch the founder provisioned, so a rotation reaches
+    // this machine without anyone raising `max_epoch` first; `max_epoch` still
+    // widens the range when the lookup fails. Only a founder-signed wrap
+    // counts, so a key planted at a huge epoch cannot make this walk it.
+    let newest = match store.newest_provisioned_epoch(max_epoch).await {
+        Ok(newest) => newest.unwrap_or(max_epoch),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not look up the team's newest key epoch; trying epochs up to max_epoch"
+            );
+            max_epoch
+        }
+    };
+    let epochs: Vec<u64> = (0..=newest).collect();
     match store.bootstrap_epoch_keys(&identity, &epochs).await {
         Ok(added) => {
             // Seal future writes under the newest epoch this member holds. Only
-            // ever advances (never rolls back): a member who could not unwrap
-            // the newest epoch keeps writing under their newest readable one.
+            // ever advances (never rolls back). A member who could not unwrap
+            // the newest epoch has its writes refused (`EpochSuperseded`).
             if let Some(top) = store.highest_epoch()
                 && top > store.current_epoch()
             {
@@ -1120,7 +1130,7 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             }
             tracing::info!(
                 added,
-                max_epoch,
+                newest,
                 "bootstrapped accessible epoch keys from the bucket"
             );
         }
@@ -1131,51 +1141,28 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
     }
 }
 
-/// Best-effort: warn (loudly, at WARN level) when `store`'s bucket has
-/// published a wrapped-key epoch newer than `configured_max_epoch`.
+/// Best-effort: warn when the team's founder provisioned an epoch newer than
+/// the one `store` seals under, so this process neither reads the notes
+/// sealed under it nor writes (its writes are refused with
+/// [`MemError::EpochSuperseded`]).
 ///
-/// This is the warning-side counterpart to [`bootstrap_epochs`]: that function
-/// only tries epochs `0..=max_epoch` because it has no way to see what the
-/// bucket actually holds, so a `max_epoch` an operator forgets to raise after
-/// a teammate's `rotate` silently hides every note sealed under the new epoch
-/// — the recorded, twice-recurred `bootstrap_epochs` gotcha. Calling this
-/// after every store build closes that: it needs no identity (unlike
-/// `bootstrap_epochs`, it only lists the `_keys/` prefix), so it runs
-/// unconditionally, not gated on `HIPPIUS_MEM_MNEMONIC`.
-///
-/// Never raises `max_epoch` itself — the pin is security-relevant (it bounds
-/// how many epoch keys startup tries to fetch), so only the operator decides
-/// to widen it. A fetch failure (offline, missing permissions) is silent: this
-/// check exists to add a hint on top of whatever already runs, never to become
-/// a new failure mode of its own.
-pub(crate) async fn warn_if_max_epoch_stale(store: &MemoryStore, configured_max_epoch: u64) {
-    let Ok(published) = store.highest_published_epoch().await else {
-        return;
-    };
-    if published > configured_max_epoch {
-        let message = max_epoch_stale_message(published);
-        tracing::warn!(configured = configured_max_epoch, published, "{message}");
+/// Needs no identity, only the `_keys/` listing (and a wrap GET when it names a
+/// newer epoch), so it runs whether or not `HIPPIUS_MEM_MNEMONIC` is set: that
+/// is the case it exists for, the `serve` daemon. A lookup failure is silent:
+/// the write path reports its own.
+pub(crate) async fn warn_if_epoch_superseded(store: &MemoryStore) {
+    let sealing = store.current_epoch();
+    if let Ok(Some(newest)) = store.newest_provisioned_epoch(sealing).await {
+        let team = store.team();
+        tracing::warn!(
+            sealing,
+            newest,
+            "team {team} rotated its key to epoch {newest}, and this process holds keys only up \
+             to epoch {sealing}: notes sealed under the newer key stay unreadable here and writes \
+             are refused; set HIPPIUS_MEM_MNEMONIC to this member's mnemonic and restart (the \
+             `serve` daemon cannot load rotated keys)"
+        );
     }
-}
-
-/// The stale-`max_epoch` warning's message text, extracted so it is directly
-/// unit-testable without capturing `tracing` output (mirrors
-/// `doctor::stale_max_epoch_line`, which is a pure `String`-returning
-/// function for the same reason).
-///
-/// `max_epoch` is a TOP-LEVEL [`crate::config::Config`] field, never a
-/// `[[teams]]` profile one — [`crate::config::TeamProfile`] carries
-/// `#[serde(deny_unknown_fields)]`, so an operator who follows a message
-/// pointing at a team profile would add `max_epoch` there and break parsing
-/// for every subsequent command (including the MCP server). The wording
-/// below must therefore always point at the top level, never at a team
-/// profile.
-fn max_epoch_stale_message(published: u64) -> String {
-    format!(
-        "this machine's max_epoch hides rotated notes: raise max_epoch to {published} at the \
-         TOP LEVEL of hippius-mem.toml -- it is a top-level setting, never a per-team \
-         profile field -- or new-epoch notes stay invisible"
-    )
 }
 
 /// Usage line shared by every `admin quarantine` refusal.
@@ -1772,8 +1759,8 @@ mod tests {
 
     use super::{
         HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, Unpublished, admin,
-        bootstrap_epochs, keycheck_problems, max_epoch_stale_message, parse_keycheck_args,
-        parse_members, parse_provision_args, parse_publish_membership_args, parse_quarantine_args,
+        bootstrap_epochs, keycheck_problems, parse_keycheck_args, parse_members,
+        parse_provision_args, parse_publish_membership_args, parse_quarantine_args,
         parse_remove_args, parse_rotate_args, pending_revoke_reminder, plan_removal, plan_warnings,
         print_recovery_outcome, print_recovery_seed, provision_unpublished_warnings,
         publish_and_rotate, publish_key_checks, reject_args, reject_recover_args,
@@ -2837,26 +2824,5 @@ mod tests {
             "the banner must show the fresh recovery seed: {rendered}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn max_epoch_stale_message_points_at_the_top_level_not_a_teams_profile() {
-        // Finding #15: max_epoch is a TOP-LEVEL Config field; TeamProfile
-        // carries `#[serde(deny_unknown_fields)]`, so an operator who
-        // follows a message pointing at "[[teams]]" would add max_epoch
-        // there and break parsing for every subsequent command.
-        let message = max_epoch_stale_message(5);
-        assert!(
-            message.to_lowercase().contains("top level"),
-            "the message must name the top level: {message}"
-        );
-        assert!(
-            !message.contains("[[teams]]"),
-            "the message must not point at a [[teams]] profile: {message}"
-        );
-        assert!(
-            message.contains("raise max_epoch to 5"),
-            "the message must name the actionable fix: {message}"
-        );
     }
 }

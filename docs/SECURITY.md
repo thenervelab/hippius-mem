@@ -46,6 +46,17 @@ read. What that does and does not buy you, stated plainly.
   revoked at the gateway — the one step that stays manual. Until then, a removed member
   can still read and write the bucket directly and decrypt notes sealed under the
   un-rotated key.
+- **After a rotation, a process that cannot load the new key stops writing.** A process
+  loads a rotated epoch's key only with `HIPPIUS_MEM_MNEMONIC` set (the wrap is opened
+  with the mnemonic's x25519 key). The `serve` daemon the installer wires runs without it,
+  so after a `rotate` or `remove` it refuses every write (`EpochSuperseded`, naming the
+  new epoch) and does not show notes sealed under the new epoch, until it can load the
+  key. It never seals a note under the older key a removed member holds. Its writes
+  resume only on a server started with the mnemonic; deriving the encryption key from
+  the per-machine `author_seed_hex` instead is a planned format change, not in this
+  release. An epoch counts as rotated only when a wrap at it is signed by the founder or
+  the recovery key the manifest names, so an object planted under `_keys/` neither stops
+  writes nor moves the next rotation's epoch.
 - **`reconcile`'s anchoring checks detect accidental loss, not adversarial suppression.**
   They cross-check the visible op-log against anchored Merkle roots and flag an anchored
   op that has gone missing or a record whose root disagrees with its leaves — i.e.

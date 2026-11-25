@@ -258,6 +258,9 @@ jobs:
       - name: gc's live sweep against a real S3 bucket
         run: cargo test -p hippius-mem --locked --test gc_s3 -- --ignored --nocapture
 
+      - name: a member removal through the binary against a real S3 bucket
+        run: cargo test -p hippius-mem --locked --test rotation_s3 -- --ignored --nocapture
+
       # `--bin hippius-mem`, NOT `--lib`: `config.rs` is a module of main.rs, so
       # its unit tests compile into the binary's test target. `--lib` here builds
       # lib.rs (which owns only `server`), matches zero tests, and still exits 0.

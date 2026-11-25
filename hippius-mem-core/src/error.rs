@@ -75,6 +75,28 @@ pub enum MemError {
         /// The epoch whose key is missing from the ring.
         epoch: u64,
     },
+    /// A write would seal under an epoch older than the newest one the team's
+    /// founder provisioned, so it is refused.
+    //
+    // A rotation exists to keep new notes from a removed member, who still
+    // holds the older keys. A process that never loaded the new key (no
+    // mnemonic, or it started before the rotation) would otherwise keep
+    // sealing under the old one with nothing reported.
+    #[error(
+        "team {team} rotated its key to epoch {newest}, and this process holds keys only up to \
+         epoch {epoch}, so it refuses to seal a write under the older key; restart it with \
+         HIPPIUS_MEM_MNEMONIC set to this member's mnemonic so it loads the new key (the \
+         `serve` daemon runs without it and cannot), and ask the founder to `provision` if it \
+         still holds no key"
+    )]
+    EpochSuperseded {
+        /// The team that rotated.
+        team: String,
+        /// The epoch the refused write would have sealed under.
+        epoch: u64,
+        /// The newest epoch the founder provisioned.
+        newest: u64,
+    },
     /// A semantic-embedding model could not be loaded or failed to embed text.
     //
     // Its own category, not `Storage` (the S3 gateway) or `Malformed` (bad

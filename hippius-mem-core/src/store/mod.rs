@@ -61,8 +61,8 @@ use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, 
 use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
     Identity, ManifestMarker, MemberKey, TeamManifest, create_wraps, fetch_team_key,
-    highest_published_epoch, load_manifest, load_member_keys, publish_manifest, publish_member_key,
-    put_wraps, seal_wraps,
+    first_provisioned_epoch, load_manifest, load_member_keys, publish_manifest, publish_member_key,
+    put_wraps, seal_wraps, wrap_keys_above,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -992,6 +992,17 @@ struct KnownKeyCheck {
     at: Instant,
 }
 
+/// What this process found when it last looked for an epoch newer than the
+/// one it seals under, and when.
+#[derive(Debug, Clone, Copy)]
+struct KnownNewestEpoch {
+    /// The epoch the lookup was made above: the one writes sealed under.
+    sealing: u64,
+    /// The newest epoch above `sealing` the founder provisioned, if any.
+    newer: Option<u64>,
+    at: Instant,
+}
+
 /// How long a verdict is used before the published check is read again.
 /// Bounds how long a running server keeps writing after a check is published
 /// or replaced (`--replace` can turn a match into a mismatch), or keeps
@@ -1247,6 +1258,10 @@ pub struct MemoryStore {
     // the team's published key check (see `keycheck`), and when. Re-read after
     // `KEY_CHECK_RECHECK`.
     key_checks: Mutex<BTreeMap<u64, KnownKeyCheck>>,
+    // Whether the founder provisioned an epoch newer than the one writes seal
+    // under, as last looked up, and when. Looked up again after the same
+    // interval as `key_checks`.
+    newest_epoch: Mutex<Option<KnownNewestEpoch>>,
     // How long a verdict is used: `KEY_CHECK_RECHECK` outside tests.
     key_check_recheck: Duration,
     // Whether the blob store enforces create-only writes, measured once per
@@ -1283,7 +1298,7 @@ impl fmt::Debug for MemoryStore {
 /// post-rotation read set: an address absent here holds no wrap of the new
 /// epoch and cannot read notes sealed under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "the caller must relay the new epoch to the team (max_epoch config) or the rotation is silently invisible to them"]
+#[must_use = "the caller must tell the team to restart with their mnemonics, or their servers refuse writes and miss the new epoch's notes"]
 pub struct RotationOutcome {
     /// The freshly minted epoch new writes now seal under.
     pub new_epoch: u64,
@@ -1411,6 +1426,7 @@ impl MemoryStore {
             missing_lock_warned: std::sync::atomic::AtomicBool::new(false),
             // No epoch checked yet; the first write or `check_team_key` fills it.
             key_checks: Mutex::new(BTreeMap::new()),
+            newest_epoch: Mutex::new(None),
             key_check_recheck: KEY_CHECK_RECHECK,
             create_only: Mutex::new(None),
             synced_tip_revision: Mutex::new(None),
@@ -1729,7 +1745,8 @@ impl MemoryStore {
     /// Returns [`MemError::NearDuplicate`] if `input.summary` is a near-duplicate
     /// of an existing live note and `input.force` is false (the write-time dedup
     /// gate, checked first so nothing is persisted). Otherwise returns
-    /// [`MemError::Crypto`] if sealing fails, [`MemError::Storage`] if the object
+    /// [`MemError::EpochSuperseded`] if the founder provisioned an epoch newer
+    /// than the one this store seals under, [`MemError::Crypto`] if sealing fails, [`MemError::Storage`] if the object
     /// key is invalid or the blob/op write fails, [`MemError::Serialize`] if the
     /// op cannot be encoded, or any error the index reports while upserting.
     pub async fn remember(&self, input: RememberInput) -> Result<NoteId, MemError> {
@@ -1837,6 +1854,7 @@ impl MemoryStore {
         let seal_key = self.key_for_epoch(epoch)?;
         // Before the blob PUT, so a refused key never uploads ciphertext into
         // the team's namespace.
+        self.require_newest_epoch(epoch).await?;
         self.require_team_key(epoch).await?;
 
         // Mint this write's op id up front and key the blob under it: the object
@@ -2124,6 +2142,7 @@ impl MemoryStore {
         let seal_key = self.key_for_epoch(epoch)?;
         // Before the blob PUT, so a refused key never uploads ciphertext into
         // the team's namespace.
+        self.require_newest_epoch(epoch).await?;
         self.require_team_key(epoch).await?;
 
         // Key the new version under THIS edit's op id (a fresh ULID): every edit
@@ -3594,6 +3613,32 @@ impl MemoryStore {
         })
     }
 
+    /// Refuse to seal a note under `epoch` when the founder provisioned a
+    /// newer epoch, which a removed member holds no key for.
+    ///
+    /// Only note bodies are fenced: a checkpoint or an op about an older note
+    /// carries nothing this process could not already read, so nothing a
+    /// holder of the older key lacks. Uses the answer this process holds,
+    /// looked up again (one LIST of `_keys/`, see
+    /// [`newest_provisioned_epoch`](Self::newest_provisioned_epoch)) when older
+    /// than [`KEY_CHECK_RECHECK`]. A lookup that fails keeps the answer held;
+    /// only a first lookup that fails fails the write.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::EpochSuperseded`] when a newer epoch exists, or whatever a
+    /// first lookup reports.
+    async fn require_newest_epoch(&self, epoch: u64) -> Result<(), MemError> {
+        match self.newer_provisioned_epoch(epoch).await? {
+            Some(newest) => Err(MemError::EpochSuperseded {
+                team: self.team.clone(),
+                epoch,
+                newest,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Refuse a write sealed under `epoch` when the team's published key check
     /// is another key's.
     ///
@@ -3627,6 +3672,38 @@ impl MemoryStore {
             }),
             TeamKeyCheck::Matches | TeamKeyCheck::Unpublished { .. } => Ok(()),
         }
+    }
+
+    /// The newest epoch above `epoch` the founder provisioned, from the answer
+    /// this process holds when it is fresh, else looked up again and kept.
+    async fn newer_provisioned_epoch(&self, epoch: u64) -> Result<Option<u64>, MemError> {
+        let held = self
+            .newest_epoch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .filter(|held| held.sealing == epoch);
+        if let Some(held) = held
+            && held.at.elapsed() < self.key_check_recheck
+        {
+            return Ok(held.newer);
+        }
+        let newer = match (self.newest_provisioned_epoch(epoch).await, held) {
+            (Ok(newer), _) => newer,
+            (Err(err), Some(held)) => {
+                tracing::warn!(epoch, error = %err, "could not look for a newer team-key epoch; keeping the last answer");
+                held.newer
+            }
+            (Err(err), None) => return Err(err),
+        };
+        *self
+            .newest_epoch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(KnownNewestEpoch {
+            sealing: epoch,
+            newer,
+            at: Instant::now(),
+        });
+        Ok(newer)
     }
 
     /// Read `epoch`'s published check again and keep the result. With none
@@ -3755,26 +3832,32 @@ impl MemoryStore {
         &self.team
     }
 
-    /// The highest team-key epoch this store's bucket has actually published a
-    /// wrapped key at (`0` when none), against THIS store's own connection and
-    /// team — delegates to [`crate::highest_published_epoch`] over the private
-    /// `self.blob`/`self.team` rather than exposing either.
+    /// The newest epoch above `floor` at which the team's founder provisioned a
+    /// key, or `None` when there is none.
     ///
-    /// A caller with only an `&MemoryStore` (no separate blob handle in scope)
-    /// uses this to compare against a configured `max_epoch` bootstrap ceiling
-    /// — see [`MemoryStore::bootstrap_epoch_keys`]'s docs on why the on-bucket
-    /// epoch discovery this performs is not otherwise available. Deliberately
-    /// NOT a raw blob accessor: [`BlobStore`] carries unrestricted
-    /// put/get/delete/list over unencrypted-at-this-layer bytes, so handing one
-    /// out would let any holder of `&MemoryStore` (including the MCP server's
-    /// long-lived `Arc<MemoryStore>`) bypass the encryption boundary this crate
-    /// otherwise never lets a note's plaintext or an arbitrary write cross.
+    /// An epoch counts only when one of its wraps verifies under a provisioner
+    /// the current manifest authorizes (see [`crate::fetch_team_key`]), so an
+    /// object a bucket writer plants under `_keys/` moves nothing. One LIST of
+    /// the team's `_keys/` prefix; only when it names an epoch above `floor`,
+    /// a manifest read and one GET per candidate wrap, newest first, until one
+    /// counts.
     ///
     /// # Errors
     ///
-    /// Returns [`MemError::Storage`] if the backend listing fails.
-    pub async fn highest_published_epoch(&self) -> Result<u64, MemError> {
-        highest_published_epoch(self.blob.as_ref(), &self.team).await
+    /// Whatever the listing, the manifest read or a wrap GET reports.
+    pub async fn newest_provisioned_epoch(&self, floor: u64) -> Result<Option<u64>, MemError> {
+        let candidates = wrap_keys_above(self.blob.as_ref(), &self.team, floor).await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let manifest = self.current_manifest().await?;
+        first_provisioned_epoch(
+            self.blob.as_ref(),
+            candidates,
+            manifest.as_ref(),
+            self.founder.as_ref(),
+        )
+        .await
     }
 
     /// Whether recall runs the semantic (dense-vector) leg, not keyword-only.
@@ -7972,22 +8055,22 @@ impl MemoryStore {
     }
 
     /// The epoch a rotation mints: one past the highest of the local ring,
-    /// `known_max_epoch` and the bucket's highest published epoch, refused when
-    /// it already has a key check (see [`rotate_key`](Self::rotate_key)).
+    /// `known_max_epoch` and the newest epoch the founder provisioned on the
+    /// bucket, refused when it already has a key check (see
+    /// [`rotate_key`](Self::rotate_key)).
     async fn next_rotation_epoch(&self, known_max_epoch: u64) -> Result<u64, MemError> {
-        // The floor includes the bucket's highest published epoch: the local
-        // ring and `known_max_epoch` (the configured `max_epoch`) both lag a
-        // rotation this machine did not load after a restart, and minting one
-        // past them re-minted a live epoch with a new key. `highest_epoch`
-        // copies the max key out under the ring lock, so no guard is held
-        // across the awaits. `None` (empty ring) still floors at the other two,
-        // so a keyless store cannot re-mint epoch 0.
-        let published = highest_published_epoch(self.blob.as_ref(), &self.team).await?;
-        let floor = self
-            .highest_epoch()
-            .unwrap_or(0)
-            .max(known_max_epoch)
-            .max(published);
+        // The floor includes the newest provisioned epoch: the local ring and
+        // `known_max_epoch` (the configured `max_epoch`) both lag a rotation
+        // this machine did not load after a restart, and minting one past them
+        // re-minted a live epoch with a new key. Only a wrap the founder signed
+        // counts, because a member with bucket write could otherwise plant a key
+        // at `u64::MAX` and leave no epoch to rotate to, which keeps the key a
+        // member about to be removed holds live. `highest_epoch` copies the max
+        // key out under the ring lock, so no guard is held across the awaits.
+        // `None` (empty ring) still floors at the other two, so a keyless store
+        // cannot re-mint epoch 0.
+        let local = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
+        let floor = self.newest_provisioned_epoch(local).await?.unwrap_or(local);
         let new_epoch = floor.checked_add(1).ok_or_else(|| {
             MemError::Malformed(format!("team {} has no epoch left to rotate to", self.team))
         })?;
@@ -8593,8 +8676,7 @@ mod tests {
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::{IntegrityFailure, MemError};
     use crate::identity::{
-        ManifestMarker, MemberKey, TeamManifest, derive_identity, load_manifest,
-        provision_team_key, publish_manifest, signer_from_mnemonic,
+        ManifestMarker, MemberKey, TeamManifest, load_manifest, publish_manifest,
     };
     use crate::index::{
         Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query,
@@ -10609,6 +10691,38 @@ mod tests {
         Ok(())
     }
 
+    /// After the founder rotates, a machine that never loaded the new key
+    /// refuses to seal under the old one, which a removed member still holds,
+    /// instead of writing as if nothing happened.
+    #[tokio::test]
+    async fn a_write_under_an_epoch_the_founder_rotated_past_is_refused() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        let member =
+            store_over(Arc::clone(&blob), [21_u8; 32])?.with_key_check_recheck(Duration::ZERO);
+        member.remember(sample_input()).await?;
+
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+
+        let refused = member.remember(sample_input()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MemError::EpochSuperseded {
+                    epoch: 0,
+                    newest: 1,
+                    ..
+                })
+            ),
+            "got {refused:?}"
+        );
+        founder.remember(sample_input()).await?;
+        Ok(())
+    }
+
     /// An epoch that has a key check but no wrap is taken: a rotation to it is
     /// refused instead of minting a key the published check does not match.
     #[tokio::test]
@@ -11995,45 +12109,53 @@ mod tests {
         Ok(())
     }
 
+    /// Only a wrap the founder signed makes an epoch provisioned: junk under
+    /// `_keys/` (a key at `u64::MAX`, a key with an extra segment) and a wrap
+    /// that verifies under a stranger's signature move nothing.
     #[tokio::test]
-    async fn highest_published_epoch_reports_the_bucket_state() -> TestResult {
-        // `MemoryStore::highest_published_epoch` delegates to the free
-        // `teamkey::highest_published_epoch` over this store's OWN private
-        // blob/team, without exposing either — the seam this pins: a caller
-        // holding only `&MemoryStore` still learns what the bucket has
-        // published, with no raw blob handle ever leaving the store.
+    async fn only_a_founder_signed_wrap_counts_as_a_provisioned_epoch() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
 
-        assert_eq!(
-            store.highest_published_epoch().await?,
-            0,
-            "a fresh bucket has published no wrapped key"
-        );
+        let rotated = founder.rotate_key(0).await?;
+        assert_eq!(rotated.new_epoch, 1);
 
-        // Publish a wrapped key at epoch 1 directly on the SAME underlying
-        // blob store the store was built over, via the real teamkey publish
-        // path (`provision_team_key`) — exactly how a rotation populates it.
-        let phrase = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-        let signer = signer_from_mnemonic(phrase, NetworkPrefix::HIPPIUS)?;
-        let identity = derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
-        let member = MemberKey::create_signed(&signer, &identity);
-        provision_team_key(
-            blob.as_ref(),
+        let address = founder.author.as_str().to_owned();
+        blob.put(
+            &crate::wrapped_key_key(TEAM, u64::MAX, &address),
+            b"junk".to_vec(),
+        )
+        .await?;
+        blob.put(
+            &format!("{}/junk", crate::wrapped_key_key(TEAM, 1000, &address)),
+            b"junk".to_vec(),
+        )
+        .await?;
+        let stranger = Sr25519Signer::from_seed_with_prefix(&[77_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let forged = crate::wrap_team_key(
             TEAM,
-            &SecretKey::from_bytes([9u8; 32]),
-            1,
-            std::slice::from_ref(&member),
-            None,
-            &signer,
+            &SecretKey::from_bytes([9_u8; 32]),
+            &identity.x25519_public(),
+            7,
+            &stranger,
+        )?;
+        blob.put(
+            &crate::wrapped_key_key(TEAM, 7, &address),
+            serde_json::to_vec(&forged)?,
         )
         .await?;
 
-        assert_eq!(
-            store.highest_published_epoch().await?,
-            1,
-            "the store must report the epoch actually published on its own bucket"
-        );
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, Some(1));
+        assert_eq!(founder.newest_provisioned_epoch(1).await?, None);
+        let next = founder.rotate_key(0).await?;
+        assert_eq!(next.new_epoch, 2, "planted keys must not move the floor");
         Ok(())
     }
 
@@ -12302,7 +12424,8 @@ mod tests {
     /// All later lists pass straight through.
     struct GatedListBlob {
         inner: MemoryBlobStore,
-        /// Armed for exactly one list; the first `list` consumes it via swap.
+        /// Armed for exactly one op-log list; the first consumes it via swap.
+        /// Other prefixes pass: the write path lists `_keys/` too.
         armed: AtomicBool,
         /// Fired by the gated list once it has captured its (pre-write) snapshot.
         captured: tokio::sync::Notify,
@@ -12336,7 +12459,7 @@ mod tests {
             // log as it was when `sync` began reading — exactly the stale view the
             // bug re-seeds the clock from.
             let result = self.inner.list(prefix).await;
-            if self.armed.swap(false, Ordering::SeqCst) {
+            if prefix.ends_with("/_oplog/") && self.armed.swap(false, Ordering::SeqCst) {
                 self.captured.notify_one();
                 self.release.notified().await;
             }

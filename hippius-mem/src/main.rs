@@ -432,11 +432,9 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
         }
 
         // Best-effort, and independent of the mnemonic gate above (listing the
-        // `_keys/` prefix needs no identity): warn when the bucket has
-        // published a wrapped-key epoch newer than this machine's configured
-        // `max_epoch` (the recorded `bootstrap_epochs` gotcha's warning-side
-        // counterpart).
-        admin::warn_if_max_epoch_stale(&warmup_store, max_epoch).await;
+        // `_keys/` prefix needs no identity): warn when the founder provisioned
+        // an epoch this process holds no key for, whose writes are then refused.
+        admin::warn_if_epoch_superseded(&warmup_store).await;
 
         // Compare this machine's team key with the team's published key check.
         // Before `warm_tx`, so no write runs ahead of the verdict. A mismatch

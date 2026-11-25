@@ -986,6 +986,83 @@ pub async fn highest_published_epoch(blob: &dyn BlobStore, team: &str) -> Result
         .unwrap_or(0))
 }
 
+/// The wrap keys of `team` at epochs above `floor`, newest epoch first, from
+/// one LIST. Only keys of exactly the shape [`wrapped_key_key`] writes count
+/// (a 20-digit epoch, then one address segment).
+///
+/// The listing is unauthenticated: anyone with bucket write can add a key, so
+/// a caller decides nothing from these keys without
+/// [`first_provisioned_epoch`].
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::list`] reports.
+pub(crate) async fn wrap_keys_above(
+    blob: &dyn BlobStore,
+    team: &str,
+    floor: u64,
+) -> Result<Vec<(u64, String)>, MemError> {
+    let prefix = wrapped_keys_prefix(team);
+    let mut keys: Vec<(u64, String)> = blob
+        .list(&prefix)
+        .await?
+        .into_iter()
+        .filter_map(|key| {
+            let (epoch, address) = key.strip_prefix(&prefix)?.split_once('/')?;
+            let minted = epoch.len() == 20
+                && epoch.bytes().all(|byte| byte.is_ascii_digit())
+                && !address.is_empty()
+                && !address.contains('/');
+            let epoch: u64 = epoch.parse().ok().filter(|_| minted)?;
+            (epoch > floor).then_some((epoch, key))
+        })
+        .collect();
+    keys.sort_by_key(|(epoch, _)| std::cmp::Reverse(*epoch));
+    Ok(keys)
+}
+
+/// The first epoch in `candidates` (from [`wrap_keys_above`]) with a wrap the
+/// team's founder provisioned, or `None`.
+///
+/// A wrap counts when its provisioner signature verifies, it names the epoch
+/// its key does, and its provisioner is one `manifest` authorizes (its
+/// founder or trusted recovery key). With no manifest, any provisioner counts
+/// when `expected_founder` is `None` (an open team) and none when a founder is
+/// pinned. These are the rules [`fetch_team_key`] applies before installing a
+/// key, minus the decryption, which needs the recipient's secret.
+///
+/// One GET per candidate tried, in order, stopping at the first that counts. A
+/// candidate that is missing or does not decode is skipped.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::get`] reports, except a missing key.
+pub(crate) async fn first_provisioned_epoch(
+    blob: &dyn BlobStore,
+    candidates: Vec<(u64, String)>,
+    manifest: Option<&TeamManifest>,
+    expected_founder: Option<&Ss58>,
+) -> Result<Option<u64>, MemError> {
+    for (epoch, key) in candidates {
+        let bytes = match blob.get(&key).await {
+            Ok(bytes) => bytes,
+            Err(MemError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
+        };
+        let Ok(wrapped) = serde_json::from_slice::<WrappedKey>(&bytes) else {
+            continue;
+        };
+        let authorized = match manifest {
+            Some(manifest) => manifest.authorizes_provisioner(&wrapped.provisioner),
+            None => expected_founder.is_none(),
+        };
+        if wrapped.epoch == epoch && authorized && wrapped.verify() {
+            return Ok(Some(epoch));
+        }
+    }
+    Ok(None)
+}
+
 /// The object-key prefix under which `team`'s wrapped keys for `epoch`
 /// live — one path segment below [`wrapped_keys_prefix`], holding exactly the
 /// SS58 leaves [`wrapped_key_key`] writes members under.

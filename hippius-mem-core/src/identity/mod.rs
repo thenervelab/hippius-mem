@@ -67,7 +67,9 @@ pub use teamkey::{
     provision_team_key, publish_member_key, read_wrapped_key, rotate_team_key, unwrap_team_key,
     wrap_team_key, wrapped_key_key, wrapped_key_recipients,
 };
-pub(crate) use teamkey::{create_wraps, put_wraps, seal_wraps};
+pub(crate) use teamkey::{
+    create_wraps, first_provisioned_epoch, put_wraps, seal_wraps, wrap_keys_above,
+};
 
 use blake2::{Blake2b512, Digest};
 use zeroize::{Zeroize, Zeroizing};

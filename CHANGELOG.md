@@ -282,6 +282,25 @@ field.
   `shutdown` returns (closing stdin, then SIGTERM, then SIGKILL) even when
   a background refresh is waiting on a stuck child, and a failed boot
   reports the child's last stderr lines.
+- After a `rotate` or `remove`, a process that holds no key for the new
+  epoch refuses to write a note (`EpochSuperseded`, naming both epochs and
+  the fix) instead of sealing it under the older key, which a removed member
+  still holds. This includes the `serve` daemon the installer wires, which
+  runs without `HIPPIUS_MEM_MNEMONIC` and so cannot load rotated keys; its
+  writes stay refused until the member runs a server with the mnemonic. The
+  check costs one LIST of `{team}/_keys/` per minute on the write path.
+- Startup loads rotated keys up to the newest epoch the founder provisioned,
+  so a rotation reaches a member's server (one with the mnemonic) without
+  raising `max_epoch`. `max_epoch` is now only a lower bound, and the
+  "max_epoch is stale" warnings in `doctor`, `serve`, `brief`, `report` and
+  `garden` are replaced by a warning that the process holds no key for the
+  team's newest epoch. `rotate` and `remove` no longer ask members to edit
+  `max_epoch`.
+- An epoch counts as rotated (for the next rotation's epoch, for startup,
+  and for the write check above) only when a wrap at it is signed by the
+  founder or the recovery key the manifest names. An object planted under
+  `{team}/_keys/` used to set the next rotation's epoch: one at the highest
+  epoch made every later `rotate` and `remove` fail.
 
 ## [0.7.1] - 2026-11-19
 
