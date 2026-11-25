@@ -10822,6 +10822,115 @@ mod tests {
         Ok(())
     }
 
+    /// Plants one object the first time the key check of an epoch is read:
+    /// between a rotation choosing its epoch and writing the wraps.
+    struct PlantOnKeyCheckRead {
+        inner: MemoryBlobStore,
+        plant: Mutex<Option<(String, Vec<u8>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PlantOnKeyCheckRead {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.inner.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let found = self.inner.get(key).await;
+            let plant = if key.contains("/_keycheck/") {
+                self.plant
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+            } else {
+                None
+            };
+            if let Some((planted, bytes)) = plant {
+                self.inner.put(&planted, bytes).await?;
+            }
+            found
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A wrap that appears at the new epoch after the rotation chose it (a
+    /// second founder machine rotating at the same moment) is not overwritten:
+    /// the rotation fails with `EpochTaken` and leaves those bytes, so the
+    /// notes sealed under the other machine's key stay readable.
+    #[tokio::test]
+    async fn a_rotation_never_overwrites_a_wrap_that_appeared_at_its_epoch() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let planting = Arc::new(PlantOnKeyCheckRead {
+            inner: MemoryBlobStore::default(),
+            plant: Mutex::new(None),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&planting) as Arc<dyn BlobStore>;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        let wrap_key = crate::wrapped_key_key(TEAM, 1, founder.author.as_str());
+        *planting
+            .plant
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((wrap_key.clone(), b"the other machine's wrap".to_vec()));
+
+        let refused = founder.rotate_key(0).await;
+
+        assert!(
+            matches!(refused, Err(MemError::EpochTaken { epoch: 1, .. })),
+            "got {refused:?}"
+        );
+        assert_eq!(
+            blob.get(&wrap_key).await?,
+            b"the other machine's wrap".to_vec()
+        );
+        assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        Ok(())
+    }
+
+    /// A membership publish right after naming a recovery key carries that key
+    /// forward even when the bucket no longer serves the manifest naming it.
+    /// The recovery-key publish did not raise the rollback watermark, so the
+    /// next publish elected the manifest before it and dropped the key.
+    #[tokio::test]
+    async fn a_publish_after_naming_a_recovery_key_keeps_it() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[55_u8; 32], NetworkPrefix::HIPPIUS)?
+            .verifying_key();
+        founder.publish_recovery_key(recovery).await?;
+        garble_manifest(&blob, 1).await?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let current = load_manifest(blob.as_ref(), TEAM, None)
+            .await?
+            .ok_or("a manifest is published")?;
+        assert_eq!(current.trusted_recovery_key(), Some(&recovery));
+        Ok(())
+    }
+
     /// Publish member keys for M and C to `blob`, returning their addresses.
     async fn publish_m_and_c(
         blob: &Arc<dyn BlobStore>,
