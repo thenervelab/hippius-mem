@@ -169,6 +169,19 @@ pub enum MemError {
         /// The team whose rotation found no authorized wrap target.
         team: String,
     },
+    /// A rotation picked an epoch the bucket already holds a key for (a wrap or
+    /// a key check), so minting it again would replace that epoch's key and
+    /// strand the notes sealed under it.
+    #[error(
+        "team {team} already has a key for epoch {epoch}; refusing to mint it again (another \
+         rotation published it while this one ran)"
+    )]
+    EpochTaken {
+        /// The team whose epoch is taken.
+        team: String,
+        /// The epoch that already has a key.
+        epoch: u64,
+    },
     /// A pinned-founder team has no membership manifest signed by that founder,
     /// so a membership-shaped operation (e.g. key rotation) fails closed.
     //

@@ -198,6 +198,15 @@ field.
   machine kept sealing under the old one. `doctor` now fails when the team
   has rotated past epoch 0 and this machine has no wrap of the newest
   epoch it can open, and `join` logs the address the founder provisions to.
+- `rotate` and `remove` no longer mint an epoch the team already has when
+  this machine's `max_epoch` is stale (for example a founder who rotated,
+  restarted, and did not raise it). The new epoch was one past the local
+  key ring and `max_epoch` only, so a second rotation minted the same epoch
+  with a new key and overwrote its wraps, and notes sealed under the first
+  key could not be opened after a restart. The new epoch is now also past
+  the highest epoch with a wrap in the bucket, a rotation to an epoch that
+  already has a key check is refused (`MemError::EpochTaken`), and a
+  rotation's wraps are create-only writes where the gateway enforces them.
 
 ## [0.7.1] - 2026-11-19
 

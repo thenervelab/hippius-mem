@@ -63,7 +63,7 @@ use crate::domain::{NetworkPrefix, Ss58};
 use crate::error::MemError;
 use crate::identity::manifest::load_manifest;
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
-use crate::store::BlobStore;
+use crate::store::{BlobStore, CreateOutcome};
 
 use super::Identity;
 
@@ -490,6 +490,38 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
     expected_founder: Option<&Ss58>,
     provisioner: &S,
 ) -> Result<BTreeSet<Ss58>, MemError> {
+    let wraps = seal_wraps(
+        blob,
+        team,
+        team_key,
+        epoch,
+        member_keys,
+        expected_founder,
+        provisioner,
+    )
+    .await?;
+    let mut wrapped_to = BTreeSet::new();
+    for (ss58, key, bytes) in wraps {
+        blob.put(&key, bytes).await?;
+        wrapped_to.insert(ss58);
+    }
+    Ok(wrapped_to)
+}
+
+/// The wraps of `team_key` at `epoch` for every member of `member_keys` that
+/// verifies and that the manifest authorizes: each recipient's address, the
+/// wrap's object key, and its encoded bytes. Writes nothing; the two callers
+/// differ only in how they write ([`provision_team_key`] replaces,
+/// [`rotate_team_key`] creates only).
+async fn seal_wraps<S: Signer + ?Sized>(
+    blob: &dyn BlobStore,
+    team: &str,
+    team_key: &SecretKey,
+    epoch: u64,
+    member_keys: &[MemberKey],
+    expected_founder: Option<&Ss58>,
+    provisioner: &S,
+) -> Result<Vec<(Ss58, String, Vec<u8>)>, MemError> {
     // Loaded once, outside the loop: every member is checked against the SAME
     // manifest snapshot, so a manifest published mid-loop cannot admit one
     // member under an old view and another under a new one.
@@ -502,7 +534,7 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
     // read-seizure; `None` keeps the backward-compatible trust-on-genesis.
     let manifest = load_manifest(blob, team, expected_founder).await?;
 
-    let mut wrapped_to = BTreeSet::new();
+    let mut wraps = Vec::new();
     for member in member_keys {
         // Re-verify each member key before wrapping the team key TO it: an
         // unverified record's `x25519_public` is not bound to its `ss58`, so
@@ -541,10 +573,9 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
         }
         let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch, provisioner)?;
         let key = wrapped_key_key(team, epoch, member.ss58.as_str());
-        blob.put(&key, serde_json::to_vec(&wrapped)?).await?;
-        wrapped_to.insert(member.ss58.clone());
+        wraps.push((member.ss58.clone(), key, serde_json::to_vec(&wrapped)?));
     }
-    Ok(wrapped_to)
+    Ok(wraps)
 }
 
 /// Fetch and decode the raw [`WrappedKey`] record for `recipient_ss58` at
@@ -675,9 +706,17 @@ pub async fn fetch_team_key(
 /// signs every wrap of `new_team_key` with it — see that function's docs for
 /// what the signature does and does not (yet) prove.
 ///
+/// Unlike [`provision_team_key`], every wrap is a create-only write: a wrap
+/// already at `new_epoch` means that epoch was minted before, with another key,
+/// and overwriting it would strand the notes sealed under that key. On a
+/// gateway that does not enforce create-only writes (`doctor` reports it) the
+/// write replaces, and the caller's own check of the published epochs is the
+/// only guard.
+///
 /// # Errors
 ///
-/// Same as [`provision_team_key`].
+/// [`MemError::EpochTaken`] when a wrap already exists at `new_epoch` (the
+/// wraps written before it stay), otherwise the same as [`provision_team_key`].
 pub async fn rotate_team_key<S: Signer + ?Sized>(
     blob: &dyn BlobStore,
     team: &str,
@@ -687,7 +726,7 @@ pub async fn rotate_team_key<S: Signer + ?Sized>(
     expected_founder: Option<&Ss58>,
     provisioner: &S,
 ) -> Result<BTreeSet<Ss58>, MemError> {
-    provision_team_key(
+    let wraps = seal_wraps(
         blob,
         team,
         new_team_key,
@@ -696,7 +735,22 @@ pub async fn rotate_team_key<S: Signer + ?Sized>(
         expected_founder,
         provisioner,
     )
-    .await
+    .await?;
+    let mut wrapped_to = BTreeSet::new();
+    for (ss58, key, bytes) in wraps {
+        match blob.put_if_absent(&key, bytes).await? {
+            CreateOutcome::Created => {
+                wrapped_to.insert(ss58);
+            }
+            CreateOutcome::AlreadyExists => {
+                return Err(MemError::EpochTaken {
+                    team: team.to_owned(),
+                    epoch: new_epoch,
+                });
+            }
+        }
+    }
+    Ok(wrapped_to)
 }
 
 /// Publish a member's signed x25519 key, after verifying it.
@@ -1941,6 +1995,38 @@ mod tests {
         )
         .await?;
         assert_eq!(fetched.expose_bytes(), &[5u8; 32]);
+        Ok(())
+    }
+
+    /// A rotation never replaces a wrap: the second mint of one epoch is
+    /// refused and the first key's wrap stays. With a plain put it overwrote
+    /// the wrap, and the first key was lost to every member.
+    #[tokio::test]
+    async fn a_second_rotation_to_one_epoch_is_refused() -> Result<(), MemError> {
+        let blob = MemoryBlobStore::new();
+        let provisioner = test_provisioner();
+        let key_alice = member_key_for(PHRASE_A)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let members = std::slice::from_ref(&key_alice);
+        let first = SecretKey::from_bytes([2u8; 32]);
+        rotate_team_key(&blob, TEAM, &first, 1, members, None, &provisioner).await?;
+
+        let second = SecretKey::from_bytes([3u8; 32]);
+        let refused = rotate_team_key(&blob, TEAM, &second, 1, members, None, &provisioner).await;
+        assert!(
+            matches!(refused, Err(MemError::EpochTaken { epoch: 1, .. })),
+            "{refused:?}"
+        );
+        let kept = fetch_team_key(
+            &blob,
+            TEAM,
+            1,
+            &key_alice.ss58,
+            &alice.x25519_secret(),
+            None,
+        )
+        .await?;
+        assert_eq!(kept.expose_bytes(), first.expose_bytes());
         Ok(())
     }
 

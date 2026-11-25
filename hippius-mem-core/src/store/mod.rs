@@ -7599,17 +7599,14 @@ impl MemoryStore {
     ///
     /// `known_max_epoch` is the highest epoch the caller knows the team has
     /// rotated to out of band (the CLI passes its configured `max_epoch`). The
-    /// new epoch is `max(ring, known_max_epoch) + 1`. Both floors are LOCAL
-    /// inputs, so this guards only against re-minting an epoch at or below
-    /// them (a stale ring, a lagging config). An epoch that reached the bucket
-    /// ABOVE both — a prior rotation that crashed after wrapping, or a
-    /// concurrent rotation from another founder machine — is invisible here,
-    /// and a re-run WILL re-mint it, overwriting its wraps. Re-run semantics:
-    /// the minted key joins the local ring, so re-running on the same machine
-    /// floors on it and advances to the next epoch consistently; notes sealed
-    /// under a losing key inside such a race window stay unreadable to members
-    /// who bootstrap the re-minted wrap. Bucket-level epoch discovery is a
-    /// documented follow-up, not a promise of this method.
+    /// new epoch is one past the highest of the local ring, `known_max_epoch`,
+    /// and the highest epoch with a wrap in the bucket, and it is refused when
+    /// a key check already exists for it. The wraps are create-only writes, so
+    /// on a gateway that enforces them a concurrent rotation from another
+    /// founder machine that wins the race makes this one fail with
+    /// [`MemError::EpochTaken`] rather than overwrite it. On a gateway that does
+    /// not, two rotations racing at the same epoch can still both write; one
+    /// whose wraps reached the bucket before this one listed them cannot.
     ///
     /// Authorization mirrors [`publish_membership`](Self::publish_membership):
     /// rotation decides who can read future notes, which is membership-shaped
@@ -7630,6 +7627,8 @@ impl MemoryStore {
     ///   authorized to receive a wrap. Refused BEFORE the write epoch advances:
     ///   sealing future notes under a key wrapped to no one would make them
     ///   unreadable to the whole team once this process exits.
+    /// - [`MemError::EpochTaken`] when the chosen epoch already has a key check,
+    ///   or another rotation's wrap appears there while this one writes.
     /// - Whatever [`load_manifest`] / [`load_member_keys`] / `rotate_team_key`
     ///   report (storage, serialization, crypto).
     pub async fn rotate_key(&self, known_max_epoch: u64) -> Result<RotationOutcome, MemError> {
@@ -7668,11 +7667,7 @@ impl MemoryStore {
         }
 
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
-        // `highest_epoch` copies the max key out under the ring lock, so no guard
-        // is held across the awaits below. `None` (empty ring) still floors at
-        // `known_max_epoch`, so a keyless store cannot re-mint epoch 0.
-        let floor = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
-        let new_epoch = floor.saturating_add(1);
+        let new_epoch = self.next_rotation_epoch(known_max_epoch).await?;
         let new_key = SecretKey::generate();
         // This store's own signer is the provisioner for the rotation too.
         let wrapped = rotate_team_key(
@@ -7755,6 +7750,38 @@ impl MemoryStore {
             wrapped,
             key_check,
         })
+    }
+
+    /// The epoch a rotation mints: one past the highest of the local ring,
+    /// `known_max_epoch` and the bucket's highest published epoch, refused when
+    /// it already has a key check (see [`rotate_key`](Self::rotate_key)).
+    async fn next_rotation_epoch(&self, known_max_epoch: u64) -> Result<u64, MemError> {
+        // The floor includes the bucket's highest published epoch: the local
+        // ring and `known_max_epoch` (the configured `max_epoch`) both lag a
+        // rotation this machine did not load after a restart, and minting one
+        // past them re-minted a live epoch with a new key. `highest_epoch`
+        // copies the max key out under the ring lock, so no guard is held
+        // across the awaits. `None` (empty ring) still floors at the other two,
+        // so a keyless store cannot re-mint epoch 0.
+        let published = highest_published_epoch(self.blob.as_ref(), &self.team).await?;
+        let floor = self
+            .highest_epoch()
+            .unwrap_or(0)
+            .max(known_max_epoch)
+            .max(published);
+        let new_epoch = floor.checked_add(1).ok_or_else(|| {
+            MemError::Malformed(format!("team {} has no epoch left to rotate to", self.team))
+        })?;
+        // A key check names an epoch too, and it can exist without a wrap (a
+        // `keycheck publish` from a machine holding a key no wrap delivers).
+        match self.blob.get(&key_check_key(&self.team, new_epoch)).await {
+            Err(MemError::NotFound { .. }) => Ok(new_epoch),
+            Ok(_) => Err(MemError::EpochTaken {
+                team: self.team.clone(),
+                epoch: new_epoch,
+            }),
+            Err(err) => Err(err),
+        }
     }
 
     /// Member action: publish `identity`'s signed [`MemberKey`] so the founder's
@@ -10330,6 +10357,57 @@ mod tests {
         assert_eq!(added, 1, "the rotated epoch's wrap loads");
         restarted.sync().await?;
         assert_eq!(restarted.get(sealed_at_1).await?.summary, "numbered note 7");
+        Ok(())
+    }
+
+    /// A founder that rotated, restarted, and did not raise its `max_epoch`
+    /// rotates again to a NEW epoch, leaving the earlier epoch's wraps as they
+    /// were. The new epoch used to be one past the local ring and `max_epoch`
+    /// only, so the second rotation minted epoch 1 again with a new key and
+    /// overwrote its wraps: notes sealed under the first epoch-1 key could not
+    /// be opened after a restart.
+    #[tokio::test]
+    async fn a_rotation_with_a_stale_max_epoch_mints_a_new_epoch() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+
+        let first = founder.rotate_key(0).await?;
+        let wrap_key = crate::wrapped_key_key(TEAM, first.new_epoch, founder.author.as_str());
+        let first_wrap = blob.get(&wrap_key).await?;
+
+        let restarted = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let second = restarted.rotate_key(0).await?;
+
+        assert_eq!(second.new_epoch, first.new_epoch + 1);
+        assert_eq!(
+            blob.get(&wrap_key).await?,
+            first_wrap,
+            "epoch 1's wrap is untouched"
+        );
+        Ok(())
+    }
+
+    /// An epoch that has a key check but no wrap is taken: a rotation to it is
+    /// refused instead of minting a key the published check does not match.
+    #[tokio::test]
+    async fn a_rotation_refuses_an_epoch_that_has_a_key_check() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        blob.put(&key_check_key(TEAM, 1), b"a check".to_vec())
+            .await?;
+
+        let refused = founder.rotate_key(0).await;
+        assert!(
+            matches!(refused, Err(MemError::EpochTaken { epoch: 1, .. })),
+            "got {refused:?}"
+        );
+        assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
         Ok(())
     }
 
