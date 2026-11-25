@@ -329,7 +329,8 @@ fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
     if let Some(link) = symlink_on_path(path) {
         bail!(
             "{} is a symlink; hippius-mem does not rewrite {} through a link, because the \
-             write would replace the link with a regular file. Remove the \
+             write would replace the link with a regular file or edit the file the link \
+             points into. Remove the \
              `[mcp_servers.{SERVER_NAME}]` entry from the link's target by hand",
             link.display(),
             path.display()

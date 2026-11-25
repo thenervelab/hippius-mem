@@ -282,10 +282,10 @@ pub(crate) fn get_in_order<'b, T: 'b>(
 ) -> impl Stream<Item = (T, Result<Vec<u8>, MemError>)> + 'b {
     let get = move |(tag, key): (T, String)| async move { (tag, blob.get(&key).await) };
     let mut keys = keys.into_iter();
-    let first: Vec<(T, String)> = keys.next().into_iter().collect();
-    stream::iter(first.into_iter().map(get))
-        .buffered(1)
-        .chain(stream::iter(keys.map(get)).buffered(ORDERED_FETCH_AHEAD))
+    let first = keys.next();
+    stream::iter(first)
+        .then(get)
+        .chain(stream::iter(keys).map(get).buffered(ORDERED_FETCH_AHEAD))
 }
 
 /// Whether a blob store enforces create-only writes, as [`probe_create_only`]

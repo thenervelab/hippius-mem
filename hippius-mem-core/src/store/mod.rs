@@ -7748,21 +7748,25 @@ impl MemoryStore {
             next_version,
             recovery_key,
         );
-        publish_manifest(self.blob.as_ref(), &manifest).await?;
-        self.record_published_manifest(&manifest).await;
+        self.publish_and_record_manifest(&manifest).await?;
         Ok(())
     }
 
-    /// Raise the rollback watermark and the durable marker to `manifest`, which
-    /// this store just published.
+    /// Publish `manifest`, then raise the rollback watermark and the durable
+    /// marker to it. Every manifest this store publishes goes through here.
     ///
-    /// Without this the next manifest consumer in the same process (the
+    /// Without the second step the next manifest consumer in the same process (the
     /// rotation `remove` runs right after publishing the shrunk roster) reads
     /// the bucket again, and a bucket that lost or garbled the new object hands
     /// it the previous version: the removed member would be wrapped the new key.
     /// The marker write is best-effort, as in
     /// [`current_manifest`](Self::current_manifest).
-    async fn record_published_manifest(&self, manifest: &TeamManifest) {
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`publish_manifest`] reports; the watermark is then unchanged.
+    async fn publish_and_record_manifest(&self, manifest: &TeamManifest) -> Result<(), MemError> {
+        publish_manifest(self.blob.as_ref(), manifest).await?;
         self.monotonic_manifest(Some(manifest.clone()));
         if let Some(marker) = &self.manifest_marker
             && let Err(err) = marker.store(manifest).await
@@ -7773,6 +7777,7 @@ impl MemoryStore {
                 "failed to persist the durable manifest marker; cross-restart rollback protection may lag"
             );
         }
+        Ok(())
     }
 
     /// Founder action: publish a manifest naming `recovery_key`, at
@@ -7902,8 +7907,7 @@ impl MemoryStore {
             version,
             Some(recovery_key),
         );
-        publish_manifest(self.blob.as_ref(), &manifest).await?;
-        self.record_published_manifest(&manifest).await;
+        self.publish_and_record_manifest(&manifest).await?;
         Ok((manifest, previous_recovery_key))
     }
 
@@ -7975,8 +7979,7 @@ impl MemoryStore {
             version,
             Some(fresh_recovery_key),
         );
-        publish_manifest(self.blob.as_ref(), &manifest).await?;
-        self.record_published_manifest(&manifest).await;
+        self.publish_and_record_manifest(&manifest).await?;
         Ok(manifest)
     }
 
