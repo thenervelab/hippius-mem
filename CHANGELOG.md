@@ -335,6 +335,12 @@ field.
   probe's cleanup delete fails (credentials without delete rights, a
   transient error, an earlier run stopped between write and delete). The
   check named that object as data from another vault.
+- Ops a session left below the 16-op batch threshold when it ended without
+  anchoring them (a crash, a SIGKILL) are anchored again by the next session
+  under the same identity even when that session fills a batch before it
+  ends. That batch's record moved the author's anchor watermark past them,
+  and the requeue that runs when a session ends then skipped them for good.
+  The first full batch of a session now queues them first.
 
 ## [0.7.1] - 2026-11-19
 

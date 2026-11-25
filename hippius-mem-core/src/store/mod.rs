@@ -424,10 +424,6 @@ struct AnchorState {
     /// which would cost a second on-chain fee and orphan the first anchor.
     /// Lost, like `pending`, when the process exits.
     anchored: Vec<AnchorRecord>,
-    /// Whether this process has queued this author's ops that no own anchor
-    /// record covers ([`MemoryStore::requeue_uncovered_own_ops`]). Set before
-    /// the attempt, so it runs at most once per process, also when it fails.
-    requeued_uncovered: bool,
 }
 
 impl AnchorState {
@@ -1148,6 +1144,12 @@ pub struct MemoryStore {
     // `clock` (never both held at once — distinct critical sections, no lock
     // ordering hazard); its guard, like `clock`'s, never spans an `.await`.
     anchor_state: Mutex<AnchorState>,
+    // Set once this process has queued this author's ops that no own anchor
+    // record covers (`requeue_uncovered_own_ops`): at most once per process, also
+    // when it fails. A `OnceCell` rather than a flag, so a second caller waits
+    // for the first to finish queueing instead of committing a batch whose
+    // record would raise the watermark past ops not yet queued.
+    requeued_uncovered: tokio::sync::OnceCell<()>,
     // The team founder's identity, pinned out of band (operator config) so the
     // untrusted bucket cannot elect a founder. `Some` makes `load_manifest` honour
     // ONLY this founder's manifests, so a malicious gateway overwriting the genesis
@@ -1404,8 +1406,8 @@ impl MemoryStore {
                 pending: Vec::new(),
                 next_seq: 0,
                 anchored: Vec::new(),
-                requeued_uncovered: false,
             }),
+            requeued_uncovered: tokio::sync::OnceCell::new(),
             // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
             founder: None,
             // No manifest applied yet; the first `read_and_filter` seeds the watermark.
@@ -4971,15 +4973,6 @@ impl MemoryStore {
         .await
     }
 
-    /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
-    /// the threshold.
-    ///
-    /// Best-effort by contract: the op is already durable in the op-log (the
-    /// source of truth), so a failed anchor is logged and its leaves retained for
-    /// the next attempt — it never fails the caller's write. The guard over
-    /// [`MemoryStore::anchor_state`] is dropped before every `.await` (axiom
-    /// `rust_quality_74`): push and drain happen under one lock hold with no
-    /// intervening `.await` between them, then the batch commits without it.
     /// Buffer `leaf` for the next anchor batch without committing one, for a
     /// caller that holds the writer locks a batch commit would take.
     fn queue_anchor_leaf(&self, leaf: Blake3Hash, lamport: u64) {
@@ -4993,8 +4986,22 @@ impl MemoryStore {
             });
     }
 
+    /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
+    /// the threshold.
+    ///
+    /// Best-effort by contract: the op is already durable in the op-log (the
+    /// source of truth), so a failed anchor is logged and its leaves retained for
+    /// the next attempt — it never fails the caller's write. The guard over
+    /// [`MemoryStore::anchor_state`] is dropped before every `.await` (axiom
+    /// `rust_quality_74`), and the batch commits without it.
+    ///
+    /// The first full batch in a process first queues this author's ops that no
+    /// own record covers ([`requeue_uncovered_own_ops`](Self::requeue_uncovered_own_ops)),
+    /// as [`flush_anchors`](Self::flush_anchors) does: the record this batch
+    /// persists raises the author's watermark past every op it lists, so ops an
+    /// earlier process left unanchored below it would never be queued again.
     async fn schedule_anchor(&self, leaf: Blake3Hash, lamport: u64) {
-        let batch = {
+        let full = {
             let mut state = self
                 .anchor_state
                 .lock()
@@ -5003,10 +5010,22 @@ impl MemoryStore {
                 hash: leaf,
                 lamport,
             });
-            if state.pending.len() >= self.anchor_threshold {
-                Some(state.drain_batch())
-            } else {
+            state.pending.len() >= self.anchor_threshold
+        };
+        if !full {
+            return;
+        }
+        self.requeue_uncovered_own_ops().await;
+        let batch = {
+            let mut state = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // A concurrent write may have drained the batch during the requeue.
+            if state.pending.is_empty() {
                 None
+            } else {
+                Some(state.drain_batch())
             }
         };
         let Some(batch) = batch else { return };
@@ -5025,8 +5044,9 @@ impl MemoryStore {
     /// the batch threshold were lost: a stdio session that wrote fewer than a
     /// threshold's worth of ops anchored nothing, ever. Run from
     /// [`flush_anchors`](Self::flush_anchors), which the binary calls when a
-    /// session ends, so an ending session also anchors what an earlier one
-    /// that crashed left behind.
+    /// session ends, and before this process's first full batch
+    /// ([`schedule_anchor`](Self::schedule_anchor)), so a later session also
+    /// anchors what an earlier one that crashed left behind.
     ///
     /// Coverage is a watermark, not a set: an op counts as covered when its
     /// Lamport value is at or below the newest op this author's newest signed
@@ -5042,18 +5062,16 @@ impl MemoryStore {
     /// op, and one still buffering an op queues it too; the op is then in two
     /// records, which `history` and `reconcile` read as two records of one
     /// batch. Best-effort: a failed read is warned and not retried in this
-    /// process.
+    /// process. A caller that arrives while another is queueing waits for it.
     async fn requeue_uncovered_own_ops(&self) {
-        let first = {
-            let mut state = self
-                .anchor_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            !std::mem::replace(&mut state.requeued_uncovered, true)
-        };
-        if !first {
-            return;
-        }
+        self.requeued_uncovered
+            .get_or_init(|| self.queue_uncovered_own_ops())
+            .await;
+    }
+
+    /// The body of [`requeue_uncovered_own_ops`](Self::requeue_uncovered_own_ops),
+    /// without its once-per-process guard.
+    async fn queue_uncovered_own_ops(&self) {
         let uncovered = match self.uncovered_own_ops().await {
             Ok(uncovered) => uncovered,
             Err(err) => {
@@ -15661,6 +15679,34 @@ mod tests {
         assert_eq!(one, forty, "GETs per exit flush");
         assert_eq!(one_leaves, Some(1), "only the new op is anchored");
         assert_eq!(forty_leaves, Some(1), "only the new op is anchored");
+        Ok(())
+    }
+
+    /// Ops a session left below the batch threshold when it ended without a
+    /// flush (a crash) are anchored by the next session's first full batch.
+    /// That batch's record raises the watermark past them, so a requeue only
+    /// at the next session's exit no longer saw them.
+    #[tokio::test]
+    async fn a_crashed_sessions_ops_join_the_next_sessions_first_batch() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let crashed = store_with(Arc::clone(&bucket), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 0..3 {
+            crashed.remember(numbered_input(n)).await?;
+        }
+        drop(crashed);
+
+        let next = store_with(Arc::clone(&bucket), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 100..116 {
+            next.remember(numbered_input(n)).await?;
+        }
+
+        let anchored: usize = read_anchor_records(&bucket, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(bucket.list(&format!("{TEAM}/_oplog/")).await?.len(), 19);
+        assert_eq!(anchored, 19, "every op of both sessions is anchored");
         Ok(())
     }
 
