@@ -231,6 +231,11 @@ field.
   anchors this author's earlier ops that no batch record covers, such as
   those of a session that crashed. A code comment and `docs/SECURITY.md`
   said this already happened.
+- Docs: `docs/SECURITY.md` and `docs/AGENTS-SUPPORT.md` now state the full
+  cost of one identity writing from two machines: after a fork the losing
+  machine's later writes are dropped too until its process restarts, each
+  still returning an id, and the team view can flip to the longer branch.
+  Behaviour is unchanged.
 
 ## [0.7.1] - 2026-11-19
 

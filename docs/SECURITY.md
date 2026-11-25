@@ -188,6 +188,13 @@ read. What that does and does not buy you, stated plainly.
   (`invite` → `join --bundle`, see [Add a teammate](TEAMS.md#add-a-teammate-runbook))
   removes the shared chain entirely. Each race that does happen costs the losing
   branch's ops, which are dropped from convergence for good and must be re-issued.
+  The loss is larger than the race itself. The losing process keeps chaining to its
+  own branch, so its later writes are dropped too, sequential ones included, until
+  that process restarts and syncs onto the kept branch. Every one of those writes
+  returns an id and no error or warning. Readers keep the longer branch, so once the
+  losing branch outgrows the other the team view flips to it wholesale, and notes
+  every machine could read before disappear. A successful write under one identity on
+  two machines is therefore not a promise that the note stays visible.
   A mid-chain drop ALSO populates `suppressed_tails` for the same author whenever that
   author's head survives and is current, because the post-gap run it quarantines includes
   that author's tip — but a dropped, rolled-back or merely lagging head leaves the same

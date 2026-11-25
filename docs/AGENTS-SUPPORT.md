@@ -154,8 +154,12 @@ backend), so their writes are ordered and chain correctly, under one identity or
 several. A write that waits more than 30 s for another process to release the
 lock fails with a "writer lock ... stayed held" error and writes nothing: retry it. Two
 machines under one identity remain unserialized, and concurrent writes there can
-fork the op chain and permanently drop the losing branch. Give each machine its
-own identity (console sub-key onboarding) or accept possible branch loss.
+fork the op chain and permanently drop the losing branch. The losing machine's
+later writes are dropped as well, sequential ones included, until its process
+restarts; each still returns an id with no error. Readers keep the longer
+branch, so the team view can flip to the other branch wholesale. Give each
+machine its own identity (console sub-key onboarding) or accept that a
+successful write may not stay visible.
 
 ## Wiring the server into a generic MCP client
 
