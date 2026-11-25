@@ -11,9 +11,8 @@ use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
     BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyProbe, MemError, MemoryStore,
     OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail, derive_identity,
-    find_suppressed_tails, highest_published_epoch, load_manifest, matches_published_key_check,
-    open, probe_create_only, read_heads, read_wrapped_key, seal, unwrap_team_key,
-    wrapped_key_recipients,
+    find_suppressed_tails, load_manifest, matches_published_key_check, open, probe_create_only,
+    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -294,25 +293,37 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         .build_blob_store(cfg, &key)
         .context("building the blob store for the resolved profile failed")?;
 
+    let store = key_probe_store(cfg, profile).await?;
+    // The team's current epoch: the newest one a wrap the founder or the
+    // recovery key signed names, as the server counts it, so an object anyone
+    // with bucket write can put under `_keys/` does not choose which epoch the
+    // checks below look at. `None` when the lookup fails: the checks that need
+    // it are then skipped, and the storage probe reports the fault.
+    let epoch = store
+        .newest_provisioned_epoch(0)
+        .await
+        .ok()
+        .map(|newest| newest.unwrap_or(0));
+
     // Checked ahead of the encryption probe, and independently of its outcome:
     // no team key needed, only manifest/bucket reads, so it is still reported
     // when the probe below fails.
     let founder = profile.founder().ok().flatten();
-    for line in
-        removed_member_still_holds_key_lines(blob.as_ref(), &profile.name, founder.as_ref()).await
-    {
-        tracing::warn!("{line}");
-    }
-
-    // Same best-effort placement and reasoning again: this check never
-    // decrypts a wrap (no team key needed), only checks its provisioner
-    // signature and, against the live manifest, its authorization -- so it
-    // runs and reports independently of the encryption probe's outcome below.
-    for line in
-        unsigned_or_unauthorized_wrapped_key_lines(blob.as_ref(), &profile.name, founder.as_ref())
-            .await
-    {
-        tracing::warn!("{line}");
+    if let Some(epoch) = epoch {
+        let (blob, team) = (blob.as_ref(), profile.name.as_str());
+        let removed = removed_member_still_holds_key_lines(blob, team, founder.as_ref(), epoch);
+        for line in removed.await {
+            tracing::warn!("{line}");
+        }
+        // Same best-effort placement and reasoning again: this check never
+        // decrypts a wrap (no team key needed), only checks its provisioner
+        // signature and, against the live manifest, its authorization -- so it
+        // runs and reports independently of the encryption probe's outcome below.
+        let unsigned =
+            unsigned_or_unauthorized_wrapped_key_lines(blob, team, founder.as_ref(), epoch);
+        for line in unsigned.await {
+            tracing::warn!("{line}");
+        }
     }
 
     // Same best-effort placement and reasoning again: the op-log read needs no
@@ -337,68 +348,76 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         .context("deriving the author identity from author_seed_hex failed")?
         .author_ss58();
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").ok();
-    let newest_epoch =
-        newest_epoch_unopenable_line(blob.as_ref(), &profile.name, &author, mnemonic.as_deref())
-            .await;
+    let newest_epoch = match epoch {
+        Some(epoch) if epoch > 0 => {
+            newest_epoch_unopenable_line(&store, epoch, &author, mnemonic.as_deref()).await
+        }
+        Some(_) | None => None,
+    };
 
-    let store = key_probe_store(cfg, profile).await?;
-    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store).await?;
+    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store, epoch).await?;
     if let Some(line) = newest_epoch {
         bail!("{line}");
     }
     Ok(())
 }
 
-/// The failure line when `team` has rotated past epoch 0 and this machine
-/// cannot open the newest epoch's key, or `None` when it can (or the team never
-/// rotated).
+/// The failure line when the team has rotated to `epoch` (above 0, the newest
+/// epoch the founder provisioned) and this machine cannot load that epoch's
+/// key, or `None` when it can.
 ///
 /// A machine loads a rotated epoch's key only from the wrap under its author
-/// address `author`, opened with the x25519 key of `mnemonic`
-/// (`HIPPIUS_MEM_MNEMONIC`). Without it the machine reads no note sealed under
-/// that epoch, and its own writes stay on an older key a removed member may
-/// hold, while `rotate` and `remove` report success. Epoch 0 is skipped: its
-/// key is `team_key_hex`. A listing or fetch fault other than a missing wrap
-/// yields `None`, like the other best-effort checks here; the storage probe
-/// reports those.
+/// address `author`, signed by a provisioner the manifest in force authorizes,
+/// and opened with the x25519 key of `mnemonic` (`HIPPIUS_MEM_MNEMONIC`), as
+/// [`MemoryStore::open_epoch_key`] checks. Without it the machine reads no note
+/// sealed under that epoch, and its note writes are refused
+/// (`EpochSuperseded`). A listing or fetch fault yields `None`, like the other
+/// best-effort checks here; the storage probe reports those.
 async fn newest_epoch_unopenable_line(
-    blob: &dyn BlobStore,
-    team: &str,
+    store: &MemoryStore,
+    epoch: u64,
     author: &Ss58,
     mnemonic: Option<&str>,
 ) -> Option<String> {
-    let epoch = highest_published_epoch(blob, team).await.ok()?;
-    if epoch == 0 {
-        return None;
-    }
-    let wrapped = match read_wrapped_key(blob, team, epoch, author.as_str()).await {
-        Ok(wrapped) => wrapped,
-        Err(MemError::NotFound { .. }) => {
-            return Some(format!(
-                "FAIL: team {team:?} rotated to epoch {epoch}, and no wrap of its key is \
-                 addressed to this machine ({author}); run `hippius-mem join` here, then ask \
-                 the founder to run `hippius-mem provision`",
-                author = author.as_str(),
-            ));
-        }
-        Err(_) => return None,
-    };
+    let team = store.team();
+    let author = author.as_str();
     let Some(mnemonic) = mnemonic else {
         return Some(format!(
             "FAIL: team {team:?} rotated to epoch {epoch}, and HIPPIUS_MEM_MNEMONIC is not set, \
              so this machine cannot open that epoch's key; set it to this member's mnemonic"
         ));
     };
-    let opened = derive_identity(mnemonic, crate::admin::HIPPIUS_SS58_PREFIX)
-        .and_then(|identity| unwrap_team_key(team, &wrapped, &identity.x25519_secret(), epoch));
-    match opened {
-        Ok(_) => None,
-        Err(err) => Some(format!(
-            "FAIL: team {team:?} epoch {epoch}: the wrap addressed to this machine does not \
-             open with HIPPIUS_MEM_MNEMONIC ({err}); check that it is the mnemonic this \
-             machine joined with"
-        )),
-    }
+    let identity = match derive_identity(mnemonic, crate::admin::HIPPIUS_SS58_PREFIX) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return Some(format!(
+                "FAIL: team {team:?} epoch {epoch}: HIPPIUS_MEM_MNEMONIC is not a valid mnemonic \
+                 ({err})"
+            ));
+        }
+    };
+    let cause = match store.open_epoch_key(&identity, epoch).await {
+        Err(MemError::NotFound { .. }) => {
+            return Some(format!(
+                "FAIL: team {team:?} rotated to epoch {epoch}, and no wrap of its key is \
+                 addressed to this machine ({author}); run `hippius-mem join` here, then ask \
+                 the founder to run `hippius-mem provision`"
+            ));
+        }
+        Err(err @ (MemError::Unauthorized(_) | MemError::Serialize(_))) => format!(
+            "is not a wrap the founder or the manifest's recovery key provisioned ({err}), so \
+             this machine's server refuses it; ask the founder to run `hippius-mem provision`"
+        ),
+        Err(err @ MemError::Crypto) => format!(
+            "does not open with HIPPIUS_MEM_MNEMONIC ({err}); check that it is the mnemonic \
+             this machine joined with"
+        ),
+        // Loadable, or a storage fault the storage probe reports.
+        Ok(_) | Err(_) => return None,
+    };
+    Some(format!(
+        "FAIL: team {team:?} epoch {epoch}: the wrap addressed to this machine ({author}) {cause}"
+    ))
 }
 
 /// Config used to build the store `doctor` probes with: never load an
@@ -453,6 +472,7 @@ async fn probe_storage_then_team_key(
     team: &str,
     key: &SecretKey,
     store: &MemoryStore,
+    epoch: Option<u64>,
 ) -> anyhow::Result<()> {
     let report = probe_encryption_boundary(blob, key).await?;
 
@@ -469,7 +489,7 @@ async fn probe_storage_then_team_key(
         .probe_team_key(0)
         .await
         .context("trying the team key on the team's oldest notes failed")?;
-    check_team_key(blob, team, key, probe).await
+    check_team_key(blob, team, key, probe, epoch).await
 }
 
 /// The warning line for a store that does not enforce create-only writes, or
@@ -506,8 +526,8 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 /// and takes `probe`, the result of trying the key on epoch 0's oldest notes.
 /// A published check of another key fails. With no usable check published, a
 /// key that fails to open most of the notes tried ([`KeyProbe::FailsToOpen`])
-/// fails too, unless the team has rotated past epoch 0 (one LIST of the
-/// published key epochs). A check that matches decides, and a failing probe
+/// fails too, unless the team has rotated past epoch 0 (`epoch`, the newest
+/// epoch the founder provisioned; `None` when that lookup failed). A check that matches decides, and a failing probe
 /// beside it is warned: when epoch 0's oldest notes were sealed under another
 /// key, the right key fails the probe too. Keys for rotated epochs come from
 /// founder-signed wraps, not from this configuration, and the server checks
@@ -524,6 +544,7 @@ async fn check_team_key(
     team: &str,
     key: &SecretKey,
     probe: KeyProbe,
+    epoch: Option<u64>,
 ) -> anyhow::Result<()> {
     let published = matches_published_key_check(blob, team, 0, key)
         .await
@@ -553,9 +574,7 @@ async fn check_team_key(
              before replacing anything; `hippius-mem rotate` moves the team to a new epoch"
         ),
         KeyProbe::FailsToOpen => {
-            let current = highest_published_epoch(blob, team)
-                .await
-                .context("reading the team's published key epochs failed")?;
+            let current = epoch.context("reading the team's newest key epoch failed")?;
             if current == 0 {
                 bail!(
                     "the configured team key opens fewer than half of team {team}'s oldest notes \
@@ -601,9 +620,12 @@ async fn check_team_key(
 }
 
 /// The "removed member still holds the current epoch key" report lines for
-/// `team`: every SS58 the CURRENT epoch's team key is wrapped to (per
-/// [`wrapped_key_recipients`] at [`highest_published_epoch`]) that the live
-/// membership manifest (per [`load_manifest`]) no longer lists.
+/// `team`: every SS58 the current `epoch`'s team key is wrapped to (per
+/// [`wrapped_key_recipients`]) that the live membership manifest (per
+/// [`load_manifest`]) no longer lists. The caller passes the newest epoch the
+/// founder provisioned, and skips the check when that lookup fails: falling
+/// back to epoch 0, whose recipients rotations superseded, would flag
+/// long-removed members on a healthy team.
 ///
 /// This is the read-side detector for the recorded `rotate --members`
 /// non-atomicity gotcha: `publish_membership` can land while `rotate_key`
@@ -645,16 +667,9 @@ async fn removed_member_still_holds_key_lines(
     blob: &dyn BlobStore,
     team: &str,
     founder: Option<&Ss58>,
+    epoch: u64,
 ) -> Vec<String> {
     let Ok(Some(manifest)) = load_manifest(blob, team, founder).await else {
-        return Vec::new();
-    };
-    // A listing failure here must NOT fall back to epoch 0: epoch 0's
-    // recipients are almost certainly stale (superseded by real rotations),
-    // so comparing them against the live manifest would flag long-since-
-    // removed members as a false "still holds the current epoch key"
-    // warning on an otherwise healthy team hitting a storage hiccup.
-    let Ok(epoch) = highest_published_epoch(blob, team).await else {
         return Vec::new();
     };
     let Ok(recipients) = wrapped_key_recipients(blob, team, epoch).await else {
@@ -676,8 +691,8 @@ async fn removed_member_still_holds_key_lines(
 
 /// The "wrap fails signature verification, or was sealed by an unauthorized
 /// provisioner" report lines for `team`: every `WrappedKey` published at the
-/// CURRENT (highest published) epoch that either fails `WrappedKey::verify`
-/// or whose `WrappedKey::provisioner` the live manifest does not authorize.
+/// current `epoch` (the newest the founder provisioned) that either fails
+/// `WrappedKey::verify` or whose `WrappedKey::provisioner` the live manifest does not authorize.
 ///
 /// This is the PROACTIVE, doctor-side counterpart of the authorization gate
 /// `fetch_team_key` enforces on the READ path: that gate only fires the
@@ -719,8 +734,8 @@ async fn removed_member_still_holds_key_lines(
 /// design — so only a wrap failing `WrappedKey::verify` is reported.
 ///
 /// Best-effort, mirroring [`removed_member_still_holds_key_lines`]: a
-/// listing/fetch failure at any stage (the epoch lookup, the recipient
-/// listing, an individual wrap fetch or decode, or the manifest load) is
+/// listing/fetch failure at any stage (the recipient listing, an individual
+/// wrap fetch or decode, or the manifest load) is
 /// swallowed for that item rather than
 /// becoming a new doctor failure mode — a bad wrap this run could not even
 /// read is a missed detection, the lesser fault, never a false accusation.
@@ -728,10 +743,8 @@ async fn unsigned_or_unauthorized_wrapped_key_lines(
     blob: &dyn BlobStore,
     team: &str,
     founder: Option<&Ss58>,
+    epoch: u64,
 ) -> Vec<String> {
-    let Ok(epoch) = highest_published_epoch(blob, team).await else {
-        return Vec::new();
-    };
     let Ok(recipients) = wrapped_key_recipients(blob, team, epoch).await else {
         return Vec::new();
     };
@@ -1830,7 +1843,8 @@ mod tests {
                 blob.as_ref(),
                 TEAM,
                 &wrong,
-                wrong_store.probe_team_key(0).await?
+                wrong_store.probe_team_key(0).await?,
+                Some(0),
             )
             .await
             .is_ok(),
@@ -1854,6 +1868,7 @@ mod tests {
             TEAM,
             &wrong,
             wrong_store.probe_team_key(0).await?,
+            Some(0),
         )
         .await
         .err()
@@ -1868,6 +1883,7 @@ mod tests {
             TEAM,
             &right,
             right_store.probe_team_key(0).await?,
+            Some(0),
         )
         .await?;
 
@@ -1879,6 +1895,7 @@ mod tests {
             TEAM,
             &right,
             right_store.probe_team_key(0).await?,
+            Some(0),
         )
         .await?;
         let err = check_team_key(
@@ -1886,6 +1903,7 @@ mod tests {
             TEAM,
             &wrong,
             wrong_store.probe_team_key(0).await?,
+            Some(0),
         )
         .await
         .err()
@@ -1912,26 +1930,36 @@ mod tests {
         let key = SecretKey::from_bytes([8u8; 32]);
 
         let unrotated: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let err = check_team_key(unrotated.as_ref(), TEAM, &key, KeyProbe::FailsToOpen)
-            .await
-            .err()
-            .ok_or("no check and no rotation: the probe decides")?;
+        let err = check_team_key(
+            unrotated.as_ref(),
+            TEAM,
+            &key,
+            KeyProbe::FailsToOpen,
+            Some(0),
+        )
+        .await
+        .err()
+        .ok_or("no check and no rotation: the probe decides")?;
         assert!(
             err.to_string().contains("opens fewer than half"),
             "unexpected message: {err}"
         );
 
         let rotated: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        rotated
-            .put(&wrapped_key_key(TEAM, 1, "member"), b"wrap".to_vec())
-            .await?;
-        check_team_key(rotated.as_ref(), TEAM, &key, KeyProbe::FailsToOpen).await?;
+        check_team_key(rotated.as_ref(), TEAM, &key, KeyProbe::FailsToOpen, Some(1)).await?;
 
         let published: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         key_store(&published, TEAM, [10u8; 32], [8u8; 32])?
             .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
             .await?;
-        check_team_key(published.as_ref(), TEAM, &key, KeyProbe::FailsToOpen).await?;
+        check_team_key(
+            published.as_ref(),
+            TEAM,
+            &key,
+            KeyProbe::FailsToOpen,
+            Some(0),
+        )
+        .await?;
         Ok(())
     }
 
@@ -2000,7 +2028,7 @@ mod tests {
         let key = SecretKey::from_bytes([7u8; 32]);
         let refusing: Arc<dyn BlobStore> = Arc::new(RefusingStore);
         let store = key_store(&refusing, "clientx", [9u8; 32], [7u8; 32])?;
-        let err = probe_storage_then_team_key(&RefusingStore, "clientx", &key, &store)
+        let err = probe_storage_then_team_key(&RefusingStore, "clientx", &key, &store, None)
             .await
             .err()
             .ok_or("a refusing store must fail doctor")?;
@@ -2527,6 +2555,29 @@ mod tests {
         Ok(())
     }
 
+    /// An object anyone with bucket write can put under `_keys/` does not make
+    /// `doctor` report a rotation: only a wrap the founder signed moves the
+    /// team's epoch. It used to take the highest key's epoch and fail, naming
+    /// an epoch the team never rotated to.
+    #[tokio::test]
+    async fn a_planted_key_object_does_not_fail_doctor_as_a_rotation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg = Config {
+            team: "trial".to_owned(),
+            team_key_hex: "ab".repeat(32),
+            author_seed_hex: "cd".repeat(32),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let epoch_dir = dir.path().join("trial/_keys/00000000000000009999");
+        std::fs::create_dir_all(&epoch_dir)?;
+        std::fs::write(epoch_dir.join("planted"), b"not a wrap")?;
+
+        probe_live(&cfg, &cfg.primary_profile()).await?;
+        Ok(())
+    }
+
     /// `probe_live`'s S3 blob store must carry the SAME local encrypted cache
     /// [`crate::config::TeamProfile::build_store`] wraps every S3 profile in by
     /// default — the divergence this pins, once the hand-rolled S3-vs-local
@@ -2588,49 +2639,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
-    /// `doctor` fails on a team rotated past epoch 0 whose newest wrap this
-    /// machine cannot open: none under its author address, or no mnemonic to
-    /// open it with. It used to exit 0 while the machine read none of the
-    /// rotated epoch's notes.
+    /// `doctor` fails on a team rotated past epoch 0 when this machine cannot
+    /// load the newest epoch's key: no wrap under its author address, no
+    /// mnemonic, or a wrap the server refuses (one the founder did not
+    /// provision, or one that does not decode). It used to exit 0 while the
+    /// machine read none of the rotated epoch's notes, and then passed a
+    /// planted or corrupt wrap that the server's bootstrap refuses.
     #[tokio::test]
-    async fn newest_epoch_unopenable_line_fails_without_an_openable_wrap() -> Result<(), MemError> {
+    async fn newest_epoch_unopenable_line_fails_without_a_loadable_wrap()
+    -> Result<(), Box<dyn std::error::Error>> {
         const TEAM: &str = "clientx";
         const PHRASE: &str =
             "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
         let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
         let author = Sr25519Signer::from_seed_with_prefix(&[4_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let founder = Sr25519Signer::from_seed_with_prefix(&[5_u8; 32], NetworkPrefix::HIPPIUS)?;
         let team_key = SecretKey::from_bytes([1u8; 32]);
-
-        let blob = MemoryBlobStore::default();
-        let at_epoch_0 = MemberKey::create_signed(&author, &identity);
-        provision_team_key(&blob, TEAM, &team_key, 0, &[at_epoch_0], None, &author).await?;
         let author_ss58 = author.author_ss58();
-        assert_eq!(
-            newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, None).await,
-            None,
-            "epoch 0 is team_key_hex, never a failure"
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let manifest = TeamManifest::create_signed(
+            &founder,
+            TEAM.to_owned(),
+            BTreeSet::from([author_ss58.clone()]),
+            0,
         );
+        publish_manifest(blob.as_ref(), &manifest).await?;
+        let store = key_store(&blob, TEAM, [4u8; 32], [1u8; 32])?;
+        let line = |mnemonic: Option<&'static str>| {
+            newest_epoch_unopenable_line(&store, 1, &author_ss58, mnemonic)
+        };
 
-        // Rotated, with the wrap under the mnemonic's own address, not the
-        // machine's author address.
+        // The wrap sits under the mnemonic's own address, not the machine's
+        // author address.
         let mnemonic_signer = signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
         let elsewhere = MemberKey::create_signed(&mnemonic_signer, &identity);
-        provision_team_key(&blob, TEAM, &team_key, 1, &[elsewhere], None, &author).await?;
-        let line = newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, Some(PHRASE))
+        provision_team_key(
+            blob.as_ref(),
+            TEAM,
+            &team_key,
+            1,
+            &[elsewhere],
+            None,
+            &founder,
+        )
+        .await?;
+        let no_wrap = line(Some(PHRASE))
             .await
-            .expect("no wrap under the author address must fail");
-        assert!(line.contains("no wrap"), "{line}");
+            .ok_or("no wrap under the author address")?;
+        assert!(no_wrap.contains("no wrap"), "{no_wrap}");
 
-        let here = MemberKey::create_signed(&author, &identity);
-        provision_team_key(&blob, TEAM, &team_key, 1, &[here], None, &author).await?;
-        assert_eq!(
-            newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, Some(PHRASE)).await,
-            None
-        );
-        let line = newest_epoch_unopenable_line(&blob, TEAM, &author_ss58, None)
+        let here = wrapped_key_key(TEAM, 1, author_ss58.as_str());
+        let wrapped_by = |provisioner: &Sr25519Signer| {
+            hippius_mem_core::wrap_team_key(
+                TEAM,
+                &team_key,
+                &identity.x25519_public(),
+                1,
+                provisioner,
+            )
+        };
+        blob.put(&here, serde_json::to_vec(&wrapped_by(&author)?)?)
+            .await?;
+        let planted = line(Some(PHRASE)).await.ok_or("a self-provisioned wrap")?;
+        assert!(planted.contains("is not a wrap the founder"), "{planted}");
+        blob.put(&here, b"not a wrap".to_vec()).await?;
+        let corrupt = line(Some(PHRASE))
             .await
-            .expect("no mnemonic must fail");
-        assert!(line.contains("HIPPIUS_MEM_MNEMONIC"), "{line}");
+            .ok_or("a wrap that does not decode")?;
+        assert!(corrupt.contains("is not a wrap the founder"), "{corrupt}");
+
+        blob.put(&here, serde_json::to_vec(&wrapped_by(&founder)?)?)
+            .await?;
+        assert_eq!(line(Some(PHRASE)).await, None);
+        let unset = line(None).await.ok_or("no mnemonic")?;
+        assert!(unset.contains("HIPPIUS_MEM_MNEMONIC"), "{unset}");
         Ok(())
     }
 
@@ -2685,7 +2767,7 @@ mod tests {
             TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 1);
         publish_manifest(&blob, &manifest_v1).await?;
 
-        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None).await;
+        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None, 0).await;
         assert_eq!(
             lines.len(),
             1,
@@ -2754,7 +2836,7 @@ mod tests {
             TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 1);
         publish_manifest(&blob, &manifest_v1).await?;
 
-        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None).await;
+        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None, 0).await;
         assert!(
             lines.is_empty(),
             "a bundle-provisioned member is invisible to this _keys/-only check by \
@@ -2772,118 +2854,10 @@ mod tests {
     {
         let blob = MemoryBlobStore::default();
         assert!(
-            removed_member_still_holds_key_lines(&blob, "clientx", None)
+            removed_member_still_holds_key_lines(&blob, "clientx", None, 0)
                 .await
                 .is_empty(),
             "an open team (no manifest) must never be flagged"
-        );
-        Ok(())
-    }
-
-    /// A [`BlobStore`] wrapper whose `list` fails for exactly the TOP-LEVEL
-    /// `_keys/` prefix — what `highest_published_epoch` reads — while a
-    /// per-epoch `_keys/{epoch}/` listing (what `wrapped_key_recipients`
-    /// reads) and everything else delegate untouched. Deliberately does NOT
-    /// fail every `_keys/`-containing prefix: that would make
-    /// `wrapped_key_recipients` fail too, which would ALSO yield an empty
-    /// result via the function's second short-circuit regardless of whether
-    /// the first one (I1's fix) is present — masking the exact bug this
-    /// pins. Failing only the top-level listing isolates the one behavior
-    /// under test: does a failed EPOCH lookup fall back to a hardcoded `0`?
-    struct FailingTopLevelKeysListStore {
-        inner: MemoryBlobStore,
-        /// The exact prefix `highest_published_epoch` lists (`{team}/_keys/`);
-        /// only this one fails.
-        failing_prefix: String,
-    }
-
-    #[async_trait::async_trait]
-    impl BlobStore for FailingTopLevelKeysListStore {
-        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
-            self.inner.put(key, bytes).await
-        }
-
-        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-            self.inner.get(key).await
-        }
-
-        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
-            if prefix == self.failing_prefix {
-                return Err(MemError::Storage("simulated listing failure".to_owned()));
-            }
-            self.inner.list(prefix).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), MemError> {
-            self.inner.delete(key).await
-        }
-    }
-
-    /// I1 regression: a listing failure on the EPOCH lookup must not fall
-    /// back to comparing the manifest against epoch 0's recipients. This is
-    /// the precise reason that fallback is dangerous, not merely a
-    /// hypothetical: epoch 0 here holds a genuinely STALE member — one a
-    /// REAL prior rotation already excluded from epoch 1, the true current
-    /// epoch, which matches the live manifest exactly (a healthy team). If
-    /// the epoch lookup's failure were papered over with `0`, this stale,
-    /// properly-rotated-away member would be wrongly flagged as still
-    /// holding the CURRENT epoch key.
-    #[tokio::test]
-    async fn removed_member_still_holds_key_lines_is_silent_on_an_epoch_lookup_failure()
-    -> Result<(), MemError> {
-        const TEAM: &str = "clientx";
-        const FOUNDER_PHRASE: &str =
-            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-        const STALE_PHRASE: &str = "letter advice cage absurd amount doctor acoustic avoid \
-                                     letter advice cage above";
-
-        let blob = FailingTopLevelKeysListStore {
-            inner: MemoryBlobStore::default(),
-            failing_prefix: format!("{TEAM}/_keys/"),
-        };
-        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let founder_identity = derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let founder_key = MemberKey::create_signed(&founder_signer, &founder_identity);
-        let stale_signer = signer_from_mnemonic(STALE_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let stale_identity = derive_identity(STALE_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let stale_key = MemberKey::create_signed(&stale_signer, &stale_identity);
-
-        // Epoch 0 (stale history): both wrapped. Epoch 1 (the TRUE current
-        // epoch, after a real prior rotation): the founder only.
-        provision_team_key(
-            &blob,
-            TEAM,
-            &SecretKey::from_bytes([1u8; 32]),
-            0,
-            &[founder_key.clone(), stale_key],
-            None,
-            &founder_signer,
-        )
-        .await?;
-        provision_team_key(
-            &blob,
-            TEAM,
-            &SecretKey::from_bytes([2u8; 32]),
-            1,
-            std::slice::from_ref(&founder_key),
-            None,
-            &founder_signer,
-        )
-        .await?;
-
-        // The live manifest matches epoch 1 exactly: a healthy team with
-        // nothing to flag, IF the epoch lookup succeeds.
-        let manifest =
-            TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 0);
-        publish_manifest(&blob, &manifest).await?;
-
-        assert!(
-            removed_member_still_holds_key_lines(&blob, TEAM, None)
-                .await
-                .is_empty(),
-            "an epoch-lookup failure must yield no lines -- falling back to epoch 0 would \
-             wrongly flag the STALE (properly-rotated-away) member as still holding the \
-             CURRENT epoch's key"
         );
         Ok(())
     }
@@ -2983,7 +2957,7 @@ mod tests {
         )
         .await?;
 
-        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None).await;
+        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0).await;
 
         assert_eq!(
             lines.len(),
@@ -3062,7 +3036,7 @@ mod tests {
         .await?;
 
         assert!(
-            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None)
+            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0)
                 .await
                 .is_empty(),
             "a wrap provisioned by the manifest's trusted recovery key must never be flagged"
@@ -3115,7 +3089,7 @@ mod tests {
         )
         .await?;
 
-        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None).await;
+        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0).await;
         assert_eq!(
             lines.len(),
             1,
@@ -3196,7 +3170,7 @@ mod tests {
         let blob = FailingGetStore { inner, failing_key };
 
         assert!(
-            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None)
+            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0)
                 .await
                 .is_empty(),
             "a wrap this run could not fetch must not be flagged"

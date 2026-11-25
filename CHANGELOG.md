@@ -361,6 +361,15 @@ field.
   notes, and it wrote its checkpoint, sealed under its older key, at the
   same key as the team's complete one, so every up-to-date teammate fell
   back to a full replay on each sync.
+- `doctor` takes the team's current epoch from the newest wrap the founder
+  or the recovery key signed, as the server does, for its rotation failure,
+  its "removed member still holds the current epoch key" and unsigned-wrap
+  warnings, and its wrong-key check. One object anyone with bucket write
+  can put under `{team}/_keys/` made it fail naming an epoch the team never
+  rotated to, hid those warnings for the real epoch, and could turn a
+  wrong-key failure into a warning. Its rotation check now also fails when
+  the wrap addressed to this machine is not one the founder provisioned or
+  does not decode, which the server refuses; it used to pass both.
 
 ## [0.7.1] - 2026-11-19
 

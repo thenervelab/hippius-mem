@@ -1718,38 +1718,17 @@ impl MemoryStore {
         identity: &Identity,
         epochs: &[u64],
     ) -> Result<usize, MemError> {
-        let team = self.team.as_str();
-        let secret = identity.x25519_secret();
-        // The wrap sits under the address the member key was signed with, which
-        // is this store's author (`join_as_member`), not `identity.ss58`: the two
-        // differ whenever `author_seed_hex` is not the mnemonic's seed, which is
-        // the per-machine setup `join --bundle` and the installer create.
-        let recipient = self.signer.author_ss58();
         let manifest = self.current_manifest().await?;
         let mut added = 0_usize;
         for &epoch in epochs {
             // Refused BEFORE `add_epoch_key` ever installs the key into the ring.
-            let fetched =
-                match read_wrapped_key(self.blob.as_ref(), team, epoch, recipient.as_str()).await {
-                    Ok(wrapped)
-                        if !provisioner_authorized(
-                            &wrapped,
-                            manifest.as_ref(),
-                            self.founder.as_ref(),
-                        ) =>
-                    {
-                        Err(unauthorized_wrap(team, epoch, &recipient))
-                    }
-                    Ok(wrapped) => unwrap_team_key(team, &wrapped, &secret, epoch),
-                    Err(err) => Err(err),
-                };
-            match fetched {
+            match self.open_wrap(identity, epoch, manifest.as_ref()).await {
                 Ok(key) => {
                     self.add_epoch_key(epoch, key);
                     added += 1;
                 }
                 Err(err) => tracing::warn!(
-                    team = %team,
+                    team = %self.team,
                     epoch,
                     error = %err,
                     "skipping an epoch this member cannot bootstrap (no wrap, unwrap failed, or \
@@ -1758,6 +1737,48 @@ impl MemoryStore {
             }
         }
         Ok(added)
+    }
+
+    /// The key of `epoch`, from the wrap addressed to this store's author,
+    /// under the rules [`bootstrap_epoch_keys`](Self::bootstrap_epoch_keys)
+    /// applies, without adding it to the ring. For a diagnosis (`doctor`) that
+    /// must name why a member's server would not load the key.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] when no wrap is addressed to this author at
+    /// `epoch`, [`MemError::Serialize`] when it does not decode,
+    /// [`MemError::Unauthorized`] when the manifest in force does not authorize
+    /// its provisioner, [`MemError::Crypto`] when `identity` does not open it, or
+    /// whatever resolving the manifest or the GET reports.
+    pub async fn open_epoch_key(
+        &self,
+        identity: &Identity,
+        epoch: u64,
+    ) -> Result<SecretKey, MemError> {
+        let manifest = self.current_manifest().await?;
+        self.open_wrap(identity, epoch, manifest.as_ref()).await
+    }
+
+    /// Read, authorize against `manifest`, and open this author's wrap of
+    /// `epoch` with `identity`'s x25519 secret.
+    async fn open_wrap(
+        &self,
+        identity: &Identity,
+        epoch: u64,
+        manifest: Option<&TeamManifest>,
+    ) -> Result<SecretKey, MemError> {
+        // The wrap sits under the address the member key was signed with, which
+        // is this store's author (`join_as_member`), not `identity.ss58`: the two
+        // differ whenever `author_seed_hex` is not the mnemonic's seed, which is
+        // the per-machine setup `join --bundle` and the installer create.
+        let recipient = self.signer.author_ss58();
+        let wrapped =
+            read_wrapped_key(self.blob.as_ref(), &self.team, epoch, recipient.as_str()).await?;
+        if !provisioner_authorized(&wrapped, manifest, self.founder.as_ref()) {
+            return Err(unauthorized_wrap(&self.team, epoch, &recipient));
+        }
+        unwrap_team_key(&self.team, &wrapped, &identity.x25519_secret(), epoch)
     }
 
     /// The epochs at which the bucket holds a wrap addressed to this store's
