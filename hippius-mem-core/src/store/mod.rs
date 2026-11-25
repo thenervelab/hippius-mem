@@ -1297,6 +1297,13 @@ pub struct MemoryStore {
     // Kept so `get` reports an integrity failure for them instead of "not found";
     // an entry is removed when the note later decodes.
     undecodable: Mutex<BTreeMap<NoteId, IntegrityFailure>>,
+    // Notes a decode left out of the index because this process holds no key
+    // for their epoch (a rotation it did not load, or an epoch from before it
+    // joined). While any is here the index is incomplete, so no checkpoint is
+    // written from it. An entry is removed when the note later decodes; one
+    // whose note is forgotten first stays until the process exits, which only
+    // costs this process its checkpoint writes.
+    keyless: Mutex<BTreeSet<NoteId>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -1452,6 +1459,7 @@ impl MemoryStore {
             create_only: Mutex::new(None),
             synced_tip_revision: Mutex::new(None),
             undecodable: Mutex::new(BTreeMap::new()),
+            keyless: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -3680,9 +3688,10 @@ impl MemoryStore {
     /// Refuse to seal a note under `epoch` when the founder provisioned a
     /// newer epoch, which a removed member holds no key for.
     ///
-    /// Only note bodies are fenced: a checkpoint or an op about an older note
-    /// carries nothing this process could not already read, so nothing a
-    /// holder of the older key lacks. Uses the answer this process holds,
+    /// Only note bodies are fenced: an op about an older note carries nothing a
+    /// holder of the older key lacks. A checkpoint of an index that lacks the
+    /// newer epoch's notes is not written at all (see
+    /// [`maybe_persist_checkpoint`](Self::maybe_persist_checkpoint)). Uses the answer this process holds,
     /// looked up again (one LIST of `_keys/`, see
     /// [`newest_provisioned_epoch`](Self::newest_provisioned_epoch)) when older
     /// than [`KEY_CHECK_RECHECK`]. A lookup that fails keeps the answer held;
@@ -5909,10 +5918,21 @@ impl MemoryStore {
     /// checkpoint-write failure only costs the next sync its fast path.
     ///
     /// Returns `false` only when a write was attempted and failed.
+    ///
+    /// Writes nothing while the index lacks a note for want of its epoch key
+    /// (`keyless`): checkpoint keys name only the Lamport tip, which such a
+    /// process shares with the team, so its checkpoint would replace the team's
+    /// complete one at the same key, sealed under a key the team may not use
+    /// any more.
     async fn maybe_persist_checkpoint(&self, baseline: Option<u64>, last_lamport: u64) -> bool {
         let checkpoint_stale = baseline
             .is_none_or(|base| last_lamport.saturating_sub(base) >= SNAPSHOT_REFRESH_LAMPORT_GAP);
-        if !checkpoint_stale {
+        let incomplete = !self
+            .keyless
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty();
+        if !checkpoint_stale || incomplete {
             return true;
         }
         match self.index.all_records() {
@@ -7541,8 +7561,17 @@ impl MemoryStore {
 
     /// Remember whether `note_id` decoded, for `get` and [`MemoryStore::undecodable_notes`]. Only
     /// integrity and decryption failures are kept: a missing epoch key or a
-    /// failed GET is not a fault of the stored note.
+    /// failed GET is not a fault of the stored note. A missing epoch key is kept
+    /// apart, in `keyless`, which stops checkpoint writes.
     fn record_decode_outcome(&self, note_id: NoteId, decoded: &Result<IndexRecord, MemError>) {
+        {
+            let mut keyless = self.keyless.lock().unwrap_or_else(PoisonError::into_inner);
+            if matches!(decoded, Err(MemError::KeyUnavailable { .. })) {
+                keyless.insert(note_id);
+            } else {
+                keyless.remove(&note_id);
+            }
+        }
         let mut undecodable = self
             .undecodable
             .lock()
@@ -7575,6 +7604,9 @@ impl MemoryStore {
     /// [`save_snapshot`] reports (serialize / crypto / storage). A note whose blob
     /// cannot be decoded is logged + skipped exactly as in `sync`, so it is simply
     /// absent from the snapshot and will be decoded on a later tail if still live.
+    /// [`MemError::KeyUnavailable`] when this process holds no key for a live
+    /// note's epoch: that snapshot would lack the note and replace the team's
+    /// checkpoint (see [`maybe_persist_checkpoint`](Self::maybe_persist_checkpoint)).
     pub async fn snapshot(&self) -> Result<u64, MemError> {
         // `snapshot` builds a checkpoint from the member-filtered view alone; it
         // never calls `retain`, so it has no use for `read_and_filter`'s raw-tip
@@ -7601,6 +7633,7 @@ impl MemoryStore {
                     record.last_reinforced = state.last_reinforced;
                     records.push(record);
                 }
+                Err(err @ MemError::KeyUnavailable { .. }) => return Err(err),
                 Err(err) => tracing::warn!(
                     note_id = %note_id,
                     object_key = %pointer.object_key,
@@ -10855,6 +10888,39 @@ mod tests {
             "got {refused:?}"
         );
         founder.remember(sample_input()).await?;
+        Ok(())
+    }
+
+    /// A process the founder rotated past syncs without replacing the team's
+    /// checkpoint. It used to seal its index, which lacks every note under the
+    /// newer key, under the older key at the same checkpoint key (the shared
+    /// Lamport tip), so every up-to-date teammate fell back to a full replay.
+    #[tokio::test]
+    async fn a_process_the_founder_rotated_past_keeps_the_teams_checkpoint() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        founder.remember(numbered_input(1)).await?;
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        founder.remember(numbered_input(2)).await?;
+        founder.sync().await?;
+        let checkpoints = blob.list(&snapshot_prefix(TEAM)).await?;
+        let [checkpoint] = checkpoints.as_slice() else {
+            return Err(format!("one checkpoint expected: {checkpoints:?}").into());
+        };
+        let written = blob.get(checkpoint).await?;
+
+        let lagging = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        lagging.sync().await?;
+
+        assert_eq!(blob.list(&snapshot_prefix(TEAM)).await?, checkpoints);
+        assert_eq!(
+            blob.get(checkpoint).await?,
+            written,
+            "the team's checkpoint is kept"
+        );
         Ok(())
     }
 

@@ -355,6 +355,12 @@ field.
   ends. That batch's record moved the author's anchor watermark past them,
   and the requeue that runs when a session ends then skipped them for good.
   The first full batch of a session now queues them first.
+- A process that skipped a note because it holds no key for the note's
+  epoch (the `serve` daemon after a `rotate` or `remove`, or a removed
+  member) no longer publishes index checkpoints. Its index lacked those
+  notes, and it wrote its checkpoint, sealed under its older key, at the
+  same key as the team's complete one, so every up-to-date teammate fell
+  back to a full replay on each sync.
 
 ## [0.7.1] - 2026-11-19
 
