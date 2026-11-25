@@ -229,6 +229,20 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    /// Only keys in the shape `key_check_key` writes count as epochs: an
+    /// object at `_keycheck/1` is not epoch 1's check.
+    #[tokio::test]
+    async fn only_check_keys_in_the_written_shape_name_an_epoch() -> TestResult {
+        let blob = MemoryBlobStore::default();
+        blob.put(&key_check_key("team", 2), b"{}".to_vec()).await?;
+        blob.put("team/_keycheck/1", b"{}".to_vec()).await?;
+        blob.put("team/_keycheck/+0000000000000000004", b"{}".to_vec())
+            .await?;
+
+        assert_eq!(key_check_epochs(&blob, "team").await?, [2]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_published_check_reads_back_as_the_keys_value() -> TestResult {
         let blob = MemoryBlobStore::default();

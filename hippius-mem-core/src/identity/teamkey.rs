@@ -1200,6 +1200,25 @@ mod tests {
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
     const TEAM: &str = "team";
 
+    /// Only the key shape `wrapped_key_key` writes parses: a 20-digit epoch,
+    /// then one non-empty address segment. Each refused key below breaks one
+    /// part of that shape and still parses as a number and an address.
+    #[test]
+    fn a_wrap_key_parses_only_in_the_shape_it_is_written_in() {
+        let prefix = wrapped_keys_prefix(TEAM);
+        let written = wrapped_key_key(TEAM, 3, "5Addr");
+        assert_eq!(parse_wrap_key(&prefix, &written), Some((3, "5Addr")));
+
+        for refused in [
+            format!("{prefix}3/5Addr"),
+            format!("{prefix}00000000000000000003/"),
+            format!("{prefix}00000000000000000003/5Addr/extra"),
+            format!("{prefix}+0000000000000000003/5Addr"),
+        ] {
+            assert_eq!(parse_wrap_key(&prefix, &refused), None, "{refused}");
+        }
+    }
+
     fn member_key_for(phrase: &str) -> Result<MemberKey, MemError> {
         let identity = derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
         let signer = signer_from_mnemonic(phrase, NetworkPrefix::HIPPIUS)?;
