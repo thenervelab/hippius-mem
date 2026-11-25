@@ -982,6 +982,28 @@ impl MemoryServer {
     /// Sync on purpose: the `std::sync::Mutex` guard never crosses an
     /// `.await` (the whole contest is synchronous), so the deny-walled
     /// `await_holding_lock` hazard cannot arise.
+    /// Anchor what this session buffered below the batch threshold, and this
+    /// author's ops an earlier session left unanchored, when the session ends.
+    ///
+    /// Skipped for a read-only session, which writes nothing to the bucket.
+    /// Best-effort: a failure is logged, since every op stays in the op-log
+    /// either way.
+    pub async fn flush_on_exit(&self) {
+        let writable = matches!(
+            *self
+                .write_role
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            VaultWriteRole::Writable { .. }
+        );
+        if !writable {
+            return;
+        }
+        if let Err(err) = self.store.flush_anchors().await {
+            tracing::warn!(error = %err, "could not anchor the session's last ops at exit");
+        }
+    }
+
     fn require_writable(&self) -> Result<(), HandlerError> {
         let mut role = self
             .write_role

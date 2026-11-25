@@ -223,6 +223,14 @@ field.
   is ahead of what the process already holds, the writer now checks with
   one GET that the bucket holds that op and ignores the entry when it does
   not.
+- A session anchors the ops it buffered below the 16-op batch threshold when
+  it ends: when the client closes a stdio server's stdin, or on SIGTERM or
+  Ctrl-C (stdio and `serve`). The buffer lived only in memory, so a stdio
+  session, one process per agent session, anchored nothing unless it wrote
+  16 ops, and `reconcile` checked almost no batches. An ending session also
+  anchors this author's earlier ops that no batch record covers, such as
+  those of a session that crashed. A code comment and `docs/SECURITY.md`
+  said this already happened.
 
 ## [0.7.1] - 2026-11-19
 

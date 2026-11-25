@@ -52,8 +52,8 @@ use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::{
     AnchorRecord, AnchorResignReport, AnchorSignatureState, UnsignedAnchorPolicy,
-    anchor_record_exists, next_anchor_seq, persist_anchor_record, read_anchor_records_with_policy,
-    scan_anchor_records,
+    anchor_record_exists, next_anchor_seq, own_anchored_leaves, persist_anchor_record,
+    read_anchor_records_with_policy, scan_anchor_records,
 };
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
@@ -409,6 +409,10 @@ struct AnchorState {
     /// which would cost a second on-chain fee and orphan the first anchor.
     /// Lost, like `pending`, when the process exits.
     anchored: Vec<AnchorRecord>,
+    /// Whether this process has queued this author's ops that no own anchor
+    /// record covers ([`MemoryStore::requeue_uncovered_own_ops`]). Set before
+    /// the attempt, so it runs at most once per process, also when it fails.
+    requeued_uncovered: bool,
 }
 
 impl AnchorState {
@@ -1354,6 +1358,7 @@ impl MemoryStore {
                 pending: Vec::new(),
                 next_seq: 0,
                 anchored: Vec::new(),
+                requeued_uncovered: false,
             }),
             // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
             founder: None,
@@ -4862,6 +4867,89 @@ impl MemoryStore {
         }
     }
 
+    /// Queue this author's ops that none of its own anchor records cover, once
+    /// per process, ahead of the leaves this process buffered.
+    ///
+    /// `pending` lives in memory, so the leaves of a process that exits below
+    /// the batch threshold were lost: a stdio session that wrote fewer than a
+    /// threshold's worth of ops anchored nothing, ever. Run from
+    /// [`flush_anchors`](Self::flush_anchors), which the binary calls when a
+    /// session ends, so an ending session also anchors what an earlier one
+    /// that crashed left behind. Costs a full verified op-log read (op objects
+    /// come from the local cache when one is configured) and one GET per own
+    /// anchor record.
+    ///
+    /// Two live processes under one identity can both queue the same uncovered
+    /// op, and one still buffering an op queues it too; the op is then in two
+    /// records, which `history` and `reconcile` read as two records of one
+    /// batch. Best-effort: a failed read is warned and not retried in this
+    /// process.
+    async fn requeue_uncovered_own_ops(&self) {
+        let first = {
+            let mut state = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            !std::mem::replace(&mut state.requeued_uncovered, true)
+        };
+        if !first {
+            return;
+        }
+        let uncovered = match self.uncovered_own_ops().await {
+            Ok(uncovered) => uncovered,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not look for this author's unanchored ops; ops an earlier process \
+                     left below the batch threshold stay unanchored"
+                );
+                return;
+            }
+        };
+        let mut state = self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Leaves this process holds already: buffered, or in a batch anchored
+        // but not yet persisted.
+        let buffered: HashSet<Blake3Hash> = state
+            .pending
+            .iter()
+            .map(|leaf| leaf.hash)
+            .chain(
+                state
+                    .anchored
+                    .iter()
+                    .flat_map(|record| record.leaves.iter().copied()),
+            )
+            .collect();
+        let mut leaves: Vec<PendingLeaf> = uncovered
+            .into_iter()
+            .filter(|leaf| !buffered.contains(&leaf.hash))
+            .collect();
+        leaves.append(&mut state.pending);
+        state.pending = leaves;
+    }
+
+    /// This author's verified ops that no own anchor record covers, in Lamport
+    /// order.
+    async fn uncovered_own_ops(&self) -> Result<Vec<PendingLeaf>, MemError> {
+        let author = self.author_key();
+        let covered = own_anchored_leaves(&self.blob, &self.team, &author).await?;
+        let ops = self.oplog.read_all(&self.team).await?;
+        let mut uncovered: Vec<PendingLeaf> = ops
+            .iter()
+            .filter(|op| op.author_key == author)
+            .map(|op| PendingLeaf {
+                hash: op.hash(),
+                lamport: op.lamport,
+            })
+            .filter(|leaf| !covered.contains(&leaf.hash))
+            .collect();
+        uncovered.sort_by_key(|leaf| leaf.lamport);
+        Ok(uncovered)
+    }
+
     /// This store's sr25519 public key — the identity its ops and anchor records
     /// are attributed to (and the namespace its `_anchors/` keys live under).
     fn author_key(&self) -> VerifyingKey {
@@ -4882,6 +4970,7 @@ impl MemoryStore {
     /// pending leaves are restored before the error returns, so nothing is lost.
     pub async fn flush_anchors(&self) -> Result<Option<AnchorReceipt>, MemError> {
         self.persist_anchored().await?;
+        self.requeue_uncovered_own_ops().await;
         let batch = {
             let mut state = self
                 .anchor_state
@@ -15044,6 +15133,37 @@ mod tests {
 
         assert_fresh_reader_sees_all(&blob, &[acked]).await?;
         assert_eq!(store.oplog.read_all(TEAM).await?.len(), 2);
+        Ok(())
+    }
+
+    /// Ops an earlier process left below the batch threshold, and did not flush
+    /// (it crashed), are anchored by the next process's flush. Pending leaves
+    /// lived only in memory, so the flush anchored only the two ops of its own
+    /// process.
+    #[tokio::test]
+    async fn ops_an_earlier_process_left_unanchored_are_anchored_later() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let earlier = store_with(Arc::clone(&blob), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 0..3 {
+            earlier.remember(numbered_input(n)).await?;
+        }
+        drop(earlier);
+
+        let later = store_with(Arc::clone(&blob), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 3..5 {
+            later.remember(numbered_input(n)).await?;
+        }
+        later.flush_anchors().await?;
+
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(
+            leaves, 5,
+            "the earlier process's three ops are in the batch too"
+        );
         Ok(())
     }
 

@@ -112,10 +112,16 @@ pub(crate) async fn bind(args: &[String]) -> anyhow::Result<Option<BoundListener
 /// ONNX / op-log). The caller's vault lock must stay alive for the listen
 /// lifetime — this function does not hold it.
 ///
+/// Returns once `shutdown` resolves and the open connections have finished.
+///
 /// # Errors
 ///
 /// Returns an error if the HTTP server itself fails.
-pub(crate) async fn serve(bound: BoundListener, server: MemoryServer) -> anyhow::Result<()> {
+pub(crate) async fn serve(
+    bound: BoundListener,
+    server: MemoryServer,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let BoundListener {
         listener,
         token,
@@ -124,6 +130,7 @@ pub(crate) async fn serve(bound: BoundListener, server: MemoryServer) -> anyhow:
 
     let router = router(server, token, port);
     axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
         .await
         .context("MCP HTTP server error")?;
     Ok(())

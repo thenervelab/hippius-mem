@@ -433,10 +433,13 @@ also take the writer lock and advance the Lamport clock:
    reflects the change immediately on this machine.
 
 **Anchoring — in batches, not per op.** Each op's hash is a Merkle leaf, buffered as
-the op is written. Once a batch reaches the anchor threshold (16 ops in production) —
-or on graceful shutdown — it is sealed into a Merkle root and committed, with the
+the op is written. Once a batch reaches the anchor threshold (16 ops in production),
+or when the session ends (the client closes a stdio server's stdin, or the process gets
+SIGTERM or Ctrl-C), it is sealed into a Merkle root and committed, with the
 batch record (root + leaves + receipt) persisted to the bucket so any teammate can
-build inclusion proofs. Anchoring is local by default, or on-chain with the `chain`
+build inclusion proofs. The buffer is in memory: a session killed with SIGKILL, or
+that crashes, leaves its last ops unanchored until a later session of the same author
+ends and anchors every op of that author no own batch record covers. Anchoring is local by default, or on-chain with the `chain`
 feature, and it is best-effort: the op is already durable in the log, so a failed
 anchor is retried on the next batch, never surfaced as a write error.
 

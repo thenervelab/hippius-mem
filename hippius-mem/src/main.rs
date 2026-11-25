@@ -286,16 +286,41 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let runtime = boot_serve(ServeKind::Stdio).await?;
-    let service = runtime.server.serve(stdio()).await?;
-    service.waiting().await?;
-
-    // A `store.flush_anchors().await` here would seal any below-threshold batch on
-    // a clean exit. It is deliberately omitted: a stdio server has no orderly
-    // shutdown signal to hang it off (the transport just ends), and the op-log
-    // keeps every op regardless, so the next run re-buffers and anchors the
-    // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
-    // be an optimization, not a correctness fix.
+    let service = runtime.server.clone().serve(stdio()).await?;
+    // The transport ending (the client closed stdin) or SIGTERM ends the
+    // session. Either way, anchor the ops still buffered below the batch
+    // threshold: they live only in this process, and nothing else anchors them
+    // until a later session's own exit picks them up. A SIGKILL skips this.
+    tokio::select! {
+        waited = service.waiting() => {
+            waited?;
+        }
+        () = terminated() => {}
+    }
+    runtime.server.flush_on_exit().await;
     Ok(())
+}
+
+/// Resolves when the process receives SIGTERM (or Ctrl-C), the signals a
+/// supervisor or a client sends to end a session.
+async fn terminated() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            // No SIGTERM handler could be installed: wait for Ctrl-C alone.
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// How [`boot_serve`] binds a profile and the MCP `default_repo`.
@@ -507,7 +532,9 @@ async fn run_http_serve(args: &[String]) -> anyhow::Result<()> {
     };
 
     let runtime = boot_serve(ServeKind::Daemon).await?;
-    http_mcp::serve(bound, runtime.server).await
+    http_mcp::serve(bound, runtime.server.clone(), terminated()).await?;
+    runtime.server.flush_on_exit().await;
+    Ok(())
 }
 
 /// Run boot-time launch-repo provisioning and thread its outcome into the

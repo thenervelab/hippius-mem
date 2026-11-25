@@ -442,6 +442,16 @@ impl StdioSession {
         self.stderr.snapshot_after_grace()
     }
 
+    /// Close the child's stdin, the way a client ends a session, and wait for
+    /// the child to exit on its own.
+    fn close_stdin_and_wait(self) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
+        let Self {
+            mut child, stdin, ..
+        } = self;
+        drop(stdin);
+        Ok(child.0.wait()?)
+    }
+
     fn recv_json(&mut self, what: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let line = recv_line_or_fail(&self.stdout, &mut self.child, &self.stderr, what)?;
         serde_json::from_str(line.trim()).map_err(|err| {
@@ -611,6 +621,57 @@ fn the_binary_remembers_recalls_and_gets_over_stdio() -> Result<(), Box<dyn std:
         "stdio get must return the stored body, got {got_text}"
     );
     Ok(())
+}
+
+/// A session that ends with fewer writes than an anchor batch holds anchors
+/// them when its client closes stdin. They were buffered in memory only, so a
+/// stdio session (one process per agent session) anchored nothing unless it
+/// wrote a full batch.
+#[test]
+fn a_session_anchors_its_writes_when_the_client_closes_stdin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut session = StdioSession::spawn()?;
+    for (id, summary) in [(3, "kestrel cache warmup"), (4, "ibis queue drain")] {
+        session.call_tool(
+            id,
+            "remember",
+            &json!({ "note_type": "gotcha", "summary": summary, "body": "body", "repo": "global" }),
+        )?;
+    }
+    let dir = Arc::clone(&session.dir);
+    let status = session.close_stdin_and_wait()?;
+    assert!(
+        status.success(),
+        "the server exits cleanly on EOF: {status}"
+    );
+
+    let anchors = dir.path().join("vault").join("trial").join("_anchors");
+    let records = walk_files(&anchors);
+    assert_eq!(records.len(), 1, "one batch record: {records:?}");
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&records[0])?)?;
+    assert_eq!(
+        record["leaves"].as_array().map(Vec::len),
+        Some(2),
+        "{record}"
+    );
+    Ok(())
+}
+
+/// Every regular file under `dir`, recursively; empty when it does not exist.
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk_files(&path));
+        } else if !entry.file_name().to_string_lossy().starts_with('.') {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// A temporary directory holding a seeded trial config and vault, made a git

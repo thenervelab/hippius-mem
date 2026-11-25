@@ -300,6 +300,47 @@ pub(crate) async fn next_anchor_seq(
     }
 }
 
+/// Every leaf of `author_key`'s own anchor records: the ops this author has
+/// already anchored.
+///
+/// One LIST of the author's prefix and one GET per own record. Only keys of the
+/// minted shape whose body parses and names `author_key` count; the body's
+/// signature is not checked, because a planted record here can only make this
+/// author skip re-anchoring ops, which is what happens with no records at all.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::list`] or [`BlobStore::get`] report, except a key that
+/// vanished between the two.
+pub(crate) async fn own_anchored_leaves(
+    blob: &Arc<dyn BlobStore>,
+    team: &str,
+    author_key: &VerifyingKey,
+) -> Result<HashSet<Blake3Hash>, MemError> {
+    let prefix = format!("{team}/_anchors/{}/", author_key.to_hex());
+    let mut leaves = HashSet::new();
+    for key in blob.list(&prefix).await? {
+        let minted = key
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+            .is_some_and(|seq| anchor_record_key(team, author_key, seq) == key);
+        if !minted {
+            continue;
+        }
+        let bytes = match blob.get(&key).await {
+            Ok(bytes) => bytes,
+            Err(MemError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
+        };
+        if let Ok(record) = serde_json::from_slice::<AnchorRecord>(&bytes)
+            && record.author_key == *author_key
+        {
+            leaves.extend(record.leaves);
+        }
+    }
+    Ok(leaves)
+}
+
 /// Whether `author_key` already has a persisted anchor record at `seq`.
 ///
 /// `BlobStore` has no conditional/if-absent put, so this GET-before-PUT is what
