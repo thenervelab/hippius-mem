@@ -36,7 +36,8 @@
 )]
 
 use std::collections::BTreeSet;
-use std::process::Command;
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -236,7 +237,7 @@ fn run_gc(dir: &std::path::Path, toml: &str) -> anyhow::Result<std::process::Out
     let config_path = dir.join("hippius-mem.toml");
     std::fs::write(&config_path, toml)?;
 
-    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    support::binary()
         .arg("gc")
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir)

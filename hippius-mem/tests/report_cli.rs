@@ -16,6 +16,8 @@
 )]
 
 use std::collections::BTreeSet;
+mod support;
+
 use std::process::Command;
 use std::sync::Arc;
 
@@ -48,7 +50,7 @@ fn quickstart_trial_identity(
     config_path: &std::path::Path,
     home: &std::path::Path,
 ) -> anyhow::Result<TrialIdentity> {
-    let quickstart = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let quickstart = support::binary()
         .args(["quickstart", "--no-wire"])
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
@@ -169,7 +171,7 @@ fn run_report(
     home: &std::path::Path,
     extra: &[&str],
 ) -> anyhow::Result<std::process::Output> {
-    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    support::binary()
         .arg("report")
         .args(extra)
         .env("HIPPIUS_MEM_CONFIG", config_path)
@@ -208,7 +210,7 @@ async fn brief_prints_the_vaults_team_wide_rules() -> anyhow::Result<()> {
     )?;
     seed_known_activity(&store).await?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .arg("brief")
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())
@@ -281,7 +283,7 @@ async fn brief_covers_the_launch_repository_and_no_other() -> anyhow::Result<()>
         assert!(status.success(), "git {args:?} failed");
     }
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .arg("brief")
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())
@@ -368,7 +370,7 @@ async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<(
     store.forget(forgotten).await?;
 
     let objects_before = files_under(&vault_root)?;
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .arg("garden")
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())
@@ -397,7 +399,7 @@ async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<(
     assert!(!stdout.contains("will be forgotten"), "{stdout}");
 
     let run = |flag: &str| {
-        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        support::binary()
             .args(["garden", flag])
             .env("HIPPIUS_MEM_CONFIG", &config_path)
             .env("HOME", dir.path())
@@ -602,7 +604,7 @@ fn report_supports_since() -> anyhow::Result<()> {
     // names the accepted forms.
     let bad_dir = tempfile::tempdir()?;
     let bad_config = bad_dir.path().join("hippius-mem.toml");
-    let bogus = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let bogus = support::binary()
         .args(["report", "--since", "bogus"])
         .env("HIPPIUS_MEM_CONFIG", &bad_config)
         .env("HOME", bad_dir.path())

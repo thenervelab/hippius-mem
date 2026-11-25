@@ -20,7 +20,7 @@
 )]
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::process::Command;
+mod support;
 
 /// Run `hippius-mem quickstart --no-wire` against an isolated `HOME` and
 /// `HIPPIUS_MEM_CONFIG`, returning the process output.
@@ -28,7 +28,7 @@ fn run_quickstart(
     config_path: &std::path::Path,
     home: &std::path::Path,
 ) -> anyhow::Result<std::process::Output> {
-    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    support::binary()
         .args(["quickstart", "--no-wire"])
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
@@ -172,7 +172,7 @@ fn quickstart_succeeds_with_no_env_preconfigured() -> anyhow::Result<()> {
     let xdg_config_home = home.path().join("xdg-config");
     let cwd = tempfile::tempdir()?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["quickstart", "--no-wire"])
         .env_remove("HIPPIUS_MEM_CONFIG")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
@@ -227,7 +227,7 @@ fn eval_reports_on_an_empty_trial_vault() -> anyhow::Result<()> {
         String::from_utf8_lossy(&quickstart.stderr)
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["eval", "--sample", "5"])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())
@@ -295,7 +295,7 @@ fn run_team_command(
     home: &std::path::Path,
     args: &[&str],
 ) -> anyhow::Result<std::process::Output> {
-    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    support::binary()
         .args(args)
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
@@ -424,7 +424,7 @@ fn mint_token_without_ca_certificates_fails_with_an_error() -> anyhow::Result<()
     let empty_dir = dir.path().join("certs");
     std::fs::create_dir(&empty_dir)?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["mint-token", "--bucket", "team-bucket"])
         .arg("--out")
         .arg(dir.path().join("subtoken.toml"))

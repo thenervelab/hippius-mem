@@ -29,7 +29,8 @@
 )]
 
 use std::collections::BTreeSet;
-use std::process::Command;
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -141,7 +142,7 @@ fn run_binary(
     let config_path = dir.join("hippius-mem.toml");
     std::fs::write(&config_path, toml)?;
 
-    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    support::binary()
         .args(args)
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir)

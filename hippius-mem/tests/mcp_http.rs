@@ -15,6 +15,8 @@
 )]
 
 use std::io::BufRead as _;
+mod support;
+
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -60,7 +62,7 @@ impl HttpDaemon {
         seed_trial_config(&config_path, &vault_root)?;
         std::fs::write(&token_path, format!("{TOKEN}\n"))?;
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
+        let mut command = support::binary();
         for (name, _) in std::env::vars_os() {
             if name
                 .to_str()
@@ -150,7 +152,7 @@ fn run_serve_to_exit(
     std::fs::write(&config_path, config)?;
     std::fs::write(&token_path, format!("{TOKEN}\n"))?;
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
+    let mut command = support::binary();
     for (name, _) in std::env::vars_os() {
         if name
             .to_str()
@@ -525,7 +527,7 @@ fn path_notes_stdout(
         .strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["path-notes", "--port", port, "--repo-root"])
         .arg(checkout)
         .arg("--file")
@@ -610,7 +612,7 @@ fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::erro
         .port();
 
     let run = |file: &std::path::Path| {
-        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        support::binary()
             .args(["path-notes", "--port", &port.to_string(), "--repo-root"])
             .arg(&checkout)
             .arg("--file")
@@ -649,7 +651,7 @@ fn path_notes_reports_a_refused_token() -> Result<(), Box<dyn std::error::Error>
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["path-notes", "--port", port, "--repo-root"])
         .arg(&checkout)
         .arg("--file")
@@ -695,7 +697,7 @@ fn path_notes_does_not_send_the_token_to_a_foreign_listener()
         }
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["path-notes", "--port", &port.to_string(), "--repo-root"])
         .arg(&checkout)
         .arg("--file")
@@ -808,7 +810,7 @@ fn cli(
         .strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
-    Ok(Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    Ok(support::binary()
         .args(args)
         .args(["--port", port])
         .current_dir(daemon.dir.path())
@@ -943,7 +945,7 @@ fn a_saved_history_verifies_offline_until_it_is_tampered_with()
     std::fs::write(&saved, &history.stdout)?;
 
     let verify = |path: &std::path::Path| {
-        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        support::binary()
             .arg("verify-history")
             .arg(path)
             // No config and an empty home: the check reads only its input.
@@ -988,7 +990,7 @@ fn cli_with_stdin(
         .strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let mut child = support::binary()
         .args(args)
         .args(["--port", port])
         .current_dir(cwd)
@@ -1085,7 +1087,7 @@ fn the_cli_says_so_when_there_is_no_daemon() -> Result<(), Box<dyn std::error::E
     let port = std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
         .port();
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["recall", "anything", "--port", &port.to_string()])
         .current_dir(dir.path())
         .env("HIPPIUS_MEM_CONFIG", dir.path().join("hippius-mem.toml"))

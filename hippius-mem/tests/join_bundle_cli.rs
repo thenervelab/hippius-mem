@@ -14,7 +14,9 @@
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::process::{Command, Stdio};
+mod support;
+
+use std::process::Stdio;
 
 /// 64 hex chars decoding to 32 bytes — valid team-key material.
 fn hex64(byte: &str) -> String {
@@ -36,7 +38,7 @@ fn stdin_bundle_writes_a_fresh_0600_config() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let mut child = support::binary()
         .args(["join", "--bundle", "-"])
         // Pin the write target and keep the flow offline (no member-key publish).
         .env("HIPPIUS_MEM_CONFIG", &config_path)
@@ -91,7 +93,7 @@ fn parse_failure_stderr_never_echoes_the_secret() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let mut child = support::binary()
         .args(["join", "--bundle", "-"])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
@@ -121,7 +123,7 @@ fn malformed_bundle_fails_naming_the_missing_field() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let mut child = support::binary()
         .args(["join", "--bundle", "-"])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env_remove("HIPPIUS_MEM_MNEMONIC")

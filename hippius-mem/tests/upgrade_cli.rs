@@ -18,7 +18,9 @@
 )]
 
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+mod support;
+
+use std::process::Stdio;
 
 use anyhow::Context as _;
 
@@ -35,7 +37,7 @@ fn run_upgrade(
     extra: &[&str],
     secret: &str,
 ) -> anyhow::Result<std::process::Output> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let mut child = support::binary()
         .arg("upgrade")
         .args(extra)
         .env("HIPPIUS_MEM_CONFIG", config_path)
@@ -188,7 +190,7 @@ fn upgrade_reads_secret_from_stdin_not_argv() -> anyhow::Result<()> {
     // argv parsing alone is enough, so stdin is deliberately closed (Stdio::
     // null) rather than piped: a bug that tried to read from stdin here
     // would hang instead of silently passing.
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args([
             "upgrade",
             "--bucket",
@@ -250,7 +252,7 @@ fn upgrade_rejects_the_secret_equals_form_without_leaking_the_value() -> anyhow:
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args([
             "upgrade",
             "--bucket",
@@ -398,7 +400,7 @@ fn quickstart_trial_identity(
     home: &std::path::Path,
     team: &str,
 ) -> anyhow::Result<TrialIdentity> {
-    let quickstart = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let quickstart = support::binary()
         .args(["quickstart", "--no-wire", "--team", team])
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
