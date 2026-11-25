@@ -28,8 +28,10 @@ use std::sync::Arc;
 
 use futures_util::StreamExt as _;
 use hippius_mem_core::{
-    BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, FsBlobStore, MemError, MemoryBlobStore,
-    S3BlobStore, SecretKey, probe_create_only,
+    BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, FsBlobStore, HashEmbedder,
+    InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteType,
+    OpLogStore, RememberInput, RepoScope, S3BlobStore, SecretKey, Signer, Sr25519Signer,
+    probe_create_only,
 };
 
 /// The keys one contract run uses: two under a shared prefix, where `first`
@@ -405,4 +407,93 @@ async fn caching_store_over_s3_honors_the_contract() {
     exercise_contract(store, &keys).await;
 
     clear_prefix(backend.as_ref(), &keys.prefix).await;
+}
+
+/// The team the live two-writer run owns in the bucket.
+const TWO_WRITERS_TEAM: &str = "hippius-mem-two-writers-live";
+
+/// A store for `team` over `blob` signing as `seed`, sealing with one fixed
+/// team key.
+fn live_store(blob: Arc<dyn BlobStore>, seed: u8) -> MemoryStore {
+    let signer: Arc<dyn Signer> = Arc::new(
+        Sr25519Signer::from_seed_with_prefix(&[seed; 32], NetworkPrefix::HIPPIUS)
+            .expect("a fixed seed is a valid key"),
+    );
+    MemoryStore::new(
+        Arc::clone(&blob),
+        Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+        OpLogStore::new(blob),
+        Arc::new(NoopAnchor),
+        signer,
+        std::collections::BTreeMap::from([(0, SecretKey::from_bytes([5; 32]))]),
+        0,
+        TWO_WRITERS_TEAM.to_owned(),
+        4,
+    )
+}
+
+/// Two writers under different seeds write at the same time against the real
+/// gateway; a fresh reader then sees every acknowledged note and `reconcile`
+/// reports a clean log. Every other multi-writer test in this crate runs over
+/// the in-memory store, whose operations are linearizable, so an interleaving
+/// only a real gateway produces (a listing that lags a PUT, concurrent PUTs to
+/// one prefix) never reached them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn two_writers_with_their_own_seeds_converge_on_the_live_gateway() {
+    let bucket: Arc<dyn BlobStore> = Arc::new(s3_store_from_env());
+    let prefix = format!("{TWO_WRITERS_TEAM}/");
+    clear_prefix(bucket.as_ref(), &prefix).await;
+
+    let writers = [11_u8, 12].map(|seed| Arc::new(live_store(Arc::clone(&bucket), seed)));
+    let tasks = writers.iter().enumerate().map(|(w, store)| {
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            let mut ids = Vec::new();
+            for n in 0..6 {
+                let id = store
+                    .remember(RememberInput {
+                        note_type: NoteType::Context,
+                        repo: RepoScope::Global,
+                        tags: std::collections::BTreeSet::new(),
+                        summary: format!("writer {w} note {n}"),
+                        body: "body".to_owned(),
+                        force: true,
+                    })
+                    .await
+                    .expect("a write against the live gateway succeeds");
+                ids.push(id);
+            }
+            ids
+        })
+    });
+    let mut acknowledged = Vec::new();
+    for task in tasks.collect::<Vec<_>>() {
+        acknowledged.extend(task.await.expect("a writer task does not panic"));
+    }
+    for writer in &writers {
+        writer
+            .flush_anchors()
+            .await
+            .expect("the last batch anchors");
+    }
+
+    let reader = live_store(Arc::clone(&bucket), 13);
+    reader.sync().await.expect("a fresh reader syncs");
+    let mut missing = Vec::new();
+    for id in &acknowledged {
+        if reader.get(*id).await.is_err() {
+            missing.push(*id);
+        }
+    }
+    let report = reader.reconcile().await.expect("reconcile runs");
+    clear_prefix(bucket.as_ref(), &prefix).await;
+
+    assert!(missing.is_empty(), "acknowledged writes lost: {missing:?}");
+    assert!(report.ok, "reconcile reports a clean log: {report:?}");
+    assert_eq!(
+        report.total_anchored_ops,
+        acknowledged.len(),
+        "every write is in an anchored batch: {report:?}"
+    );
 }
