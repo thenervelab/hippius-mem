@@ -22665,4 +22665,76 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A blob store that counts LISTs of the wrapped-key prefix.
+    #[derive(Default)]
+    struct KeyListCountingBlob {
+        inner: MemoryBlobStore,
+        key_lists: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for KeyListCountingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix.starts_with(&format!("{TEAM}/_keys/")) {
+                self.key_lists.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Writes within `KEY_CHECK_RECHECK` of each other look for a newer epoch
+    /// once, not once per write: the lookup is a LIST of every wrapped key.
+    #[tokio::test]
+    async fn writes_close_together_look_for_a_newer_epoch_once() -> TestResult {
+        let bucket = Arc::new(KeyListCountingBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        let after_first = bucket.key_lists.load(Ordering::SeqCst);
+        assert!(after_first > 0, "the first write looks");
+
+        store.remember(numbered_input(1)).await?;
+        store.remember(numbered_input(2)).await?;
+        assert_eq!(bucket.key_lists.load(Ordering::SeqCst), after_first);
+        Ok(())
+    }
+
+    /// A process refused under epoch 0 because the founder rotated writes as
+    /// soon as it loads the rotated key: the refusal it holds is about sealing
+    /// under epoch 0, not about the epoch it now seals under.
+    #[tokio::test]
+    async fn loading_the_rotated_key_lifts_the_refusal_at_once() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        member.join_as_member(&identity).await?;
+        let rotation = founder.rotate_key(0).await?;
+
+        let refused = member.remember(numbered_input(1)).await;
+        assert!(
+            matches!(refused, Err(MemError::EpochSuperseded { epoch: 0, .. })),
+            "got {refused:?}"
+        );
+        // As the binary's epoch bootstrap does once a newer epoch's wrap loads.
+        let added = member
+            .bootstrap_epoch_keys(&identity, &[0, rotation.new_epoch])
+            .await?;
+        assert_eq!(added, 1, "the rotated epoch's wrap loads");
+        member.set_current_epoch(rotation.new_epoch);
+
+        member.remember(numbered_input(2)).await?;
+        Ok(())
+    }
 }
