@@ -1979,6 +1979,15 @@ mod tests {
         }
     }
 
+    /// A second note distinct from [`sample_remember`], for tests that need two
+    /// writes past the dedup gate.
+    fn second_remember() -> RememberParams {
+        RememberParams {
+            summary: "index the widgets table on its owner column".to_owned(),
+            ..sample_remember()
+        }
+    }
+
     #[tokio::test]
     async fn remember_returns_mem_id() {
         let server = test_server();
@@ -3516,7 +3525,7 @@ mod tests {
         // fully-covered, clean log and reports ok with the anchored-op count.
         let server = anchoring_server();
         server.logic_remember(sample_remember()).await.unwrap();
-        server.logic_remember(sample_remember()).await.unwrap();
+        server.logic_remember(second_remember()).await.unwrap();
 
         let report = server.logic_reconcile().await.unwrap();
         assert!(report.ok, "a clean anchored log reconciles ok: {report:?}");
@@ -3577,7 +3586,7 @@ mod tests {
             .last()
             .cloned()
             .expect("the first write publishes a head");
-        server.logic_remember(sample_remember()).await.unwrap();
+        server.logic_remember(second_remember()).await.unwrap();
 
         // The write path already recorded the higher head (publish succeeded), so
         // this machine is a returning one without needing a prior audit.
