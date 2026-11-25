@@ -295,6 +295,7 @@ fn the_binary_remembers_recalls_and_gets_over_http() -> Result<(), Box<dyn std::
                 "name": "remember",
                 "arguments": {
                     "note_type": "gotcha",
+                    "repo": "global",
                     "summary": "quokka-http eviction storm",
                     "body": "pin the group instance id"
                 }
@@ -336,6 +337,35 @@ fn the_binary_remembers_recalls_and_gets_over_http() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// The shared daemon refuses a `remember` that omits `repo`, as the CLI does.
+/// It used to write the note team-global, into the pool every repository's
+/// recall and brief read, while the docs said an omitted `repo` means the
+/// repository the server was launched in.
+#[test]
+fn the_daemon_refuses_a_remember_without_repo() -> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let session = handshake(&daemon)?;
+    let (_, reply) = daemon.rpc(
+        Some(&session),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remember",
+                "arguments": {
+                    "note_type": "gotcha",
+                    "summary": "lynx-http unscoped note",
+                    "body": "body"
+                }
+            }
+        }),
+    )?;
+    assert_eq!(reply["result"]["isError"].as_bool(), Some(true), "{reply}");
+    assert!(call_text(&reply).contains("invalid repo"), "{reply}");
+    Ok(())
+}
+
 #[test]
 fn two_http_sessions_share_one_process_and_see_each_others_writes()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -354,6 +384,7 @@ fn two_http_sessions_share_one_process_and_see_each_others_writes()
                 "name": "remember",
                 "arguments": {
                     "note_type": "decision",
+                    "repo": "global",
                     "summary": "shared-daemon session B can recall A's note",
                     "body": "one ONNX load"
                 }

@@ -236,6 +236,10 @@ field.
   machine's later writes are dropped too until its process restarts, each
   still returning an id, and the team view can flip to the longer branch.
   Behaviour is unchanged.
+- On the shared `serve` daemon, `remember` without `repo` is refused with
+  "invalid repo", naming the two valid forms (a repository name, or
+  `"global"`), as the CLI already refuses it. It used to write the note
+  team-global, into the pool every repository's recall and brief read.
 
 ## [0.7.1] - 2026-11-19
 

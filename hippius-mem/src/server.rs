@@ -1034,6 +1034,21 @@ impl MemoryServer {
     async fn logic_remember(&self, params: RememberParams) -> Result<RememberOutput, HandlerError> {
         self.require_writable()?;
         let note_type = parse_note_type(&params.note_type)?;
+        // The shared daemon has no launch repository, so an omitted `repo`
+        // would land in team-global, which every repository's recall reads.
+        // The CLI refuses the same call; so does the daemon, naming both forms.
+        let omitted = params
+            .repo
+            .as_deref()
+            .is_none_or(|repo| repo.trim().is_empty());
+        if self.shared_http && omitted {
+            return Err(HandlerError::BadInput {
+                field: "repo",
+                detail: "this shared daemon has no launch repository: pass the repository's \
+                         name, or \"global\" for a note every repository should see"
+                    .to_owned(),
+            });
+        }
         let input = RememberInput {
             note_type,
             // An omitted `repo` falls back to the launch repository, as it
@@ -1481,8 +1496,8 @@ impl ServerHandler for MemoryServer {
         if self.shared_http {
             instructions.push_str(
                 " This process is a shared loopback daemon (not bound to the client's cwd): \
-                 omitted `repo` on recall/brief is team-global only, and on remember \
-                 writes a team-global note — pass `repo` or `\"global\"` explicitly.",
+                 omitted `repo` on recall/brief is team-global only, and remember \
+                 refuses it — pass `repo` or `\"global\"` explicitly.",
             );
         }
         info.instructions = Some(instructions);
