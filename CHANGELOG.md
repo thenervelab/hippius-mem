@@ -210,9 +210,12 @@ field.
   key ring and `max_epoch` only, so a second rotation minted the same epoch
   with a new key and overwrote its wraps, and notes sealed under the first
   key could not be opened after a restart. The new epoch is now also past
-  the highest epoch with a wrap in the bucket, a rotation to an epoch that
-  already has a key check is refused (`MemError::EpochTaken`), and a
-  rotation's wraps are create-only writes where the gateway enforces them.
+  the newest epoch the founder provisioned in the bucket, and it steps over
+  any epoch a wrap or a key check object already holds. A rotation's wraps
+  are create-only writes where the gateway enforces them; one that loses a
+  wrap slot to a concurrent rotation fails (`MemError::EpochTaken`) and
+  deletes the wraps it had written, so no member receives the key it
+  discards.
 - The founder's `rotate`, `remove`, `provision`, `members` and recovery
   commands use the same manifest rollback protection as `sync`. They read
   the bucket's manifest directly, so when the newest manifest object was
@@ -308,9 +311,15 @@ field.
   runs without `HIPPIUS_MEM_MNEMONIC` and so cannot load rotated keys; its
   writes stay refused until the member runs a server with the mnemonic. The
   check costs one LIST of `{team}/_keys/` per minute on the write path.
-- Startup loads rotated keys up to the newest epoch the founder provisioned,
-  so a rotation reaches a member's server (one with the mnemonic) without
-  raising `max_epoch`. `max_epoch` is now only a lower bound, and the
+- Startup loads the key of every epoch with a wrap addressed to this member
+  (one listing of `{team}/_keys/`; a wrap the founder or the recovery key of
+  the manifest in force did not sign is refused), so a rotation reaches a
+  member's server (one with the mnemonic) without raising `max_epoch`.
+  `max_epoch` is now a floor for the next rotation and the range tried when
+  the listing fails. The manifest that authorizes a wrap is the one `sync`
+  applies, with its rollback protection, not the bucket's newest readable
+  one, so a garbled newest manifest cannot bring back a recovery key it
+  retired. The
   "max_epoch is stale" warnings in `doctor`, `serve`, `brief`, `report` and
   `garden` are replaced by a warning that the process holds no key for the
   team's newest epoch. `rotate` and `remove` no longer ask members to edit
@@ -319,7 +328,9 @@ field.
   and for the write check above) only when a wrap at it is signed by the
   founder or the recovery key the manifest names. An object planted under
   `{team}/_keys/` used to set the next rotation's epoch: one at the highest
-  epoch made every later `rotate` and `remove` fail.
+  epoch made every later `rotate` and `remove` fail. An object at the next
+  epoch (a wrap the founder did not sign, or a key check) no longer blocks
+  them either: the rotation steps over that epoch.
 - A membership publish (`publish-membership`, `remove`, `rotate --members`),
   naming a recovery key and `recover` take the first manifest version above
   the applied one that no object under `{team}/_manifest/` holds. A founder

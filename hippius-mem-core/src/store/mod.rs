@@ -29,7 +29,9 @@ use decoded::DecodedLedger;
 pub use fs::FsBlobStore;
 pub use instrumented::{BlobStats, InstrumentedBlobStore, OpStats};
 pub use keycheck::matches_published_key_check;
-use keycheck::{PublishedCheck, WriteMode, key_check_key, read_key_check, write_key_check};
+use keycheck::{
+    PublishedCheck, WriteMode, key_check_epochs, key_check_key, read_key_check, write_key_check,
+};
 use snapshot::{
     FetchedSnapshot, fetch_newest_snapshot, open_record, prune_old_snapshots, seal_record,
     seal_snapshot, snapshot_prefix,
@@ -60,9 +62,10 @@ use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
-    Identity, ManifestMarker, MemberKey, TeamManifest, create_wraps, fetch_team_key,
-    first_provisioned_epoch, load_manifest, load_member_keys, next_free_manifest_version,
-    publish_manifest, publish_member_key, put_wraps, seal_wraps, wrap_keys_above,
+    Identity, ManifestMarker, MemberKey, TeamManifest, create_wraps, first_provisioned_epoch,
+    load_manifest, load_member_keys, next_free_manifest_version, provisioner_authorized,
+    publish_manifest, publish_member_key, put_wraps, read_wrapped_key, seal_wraps,
+    unauthorized_wrap, unwrap_team_key, wrap_epochs_addressed_to, wrap_keys_above,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -1683,22 +1686,25 @@ impl MemoryStore {
     /// key joins the ring (via [`MemoryStore::add_epoch_key`]). Epochs this member
     /// cannot unwrap — no wrap addressed to them (a non-member, or one removed
     /// before that epoch), a tampered wrap, a backend miss, or a wrap whose
-    /// provisioner the live manifest does not authorize (a bucket-planted wrap
+    /// provisioner the manifest does not authorize (a bucket-planted wrap
     /// that verifies under its own signature but was never sealed by the
-    /// founder or its named recovery key — see [`fetch_team_key`]'s "Provisioner
-    /// authorization" docs) — are skipped, so a removed member still bootstraps
-    /// the older epochs they retain, and an unauthorized wrap never reaches
-    /// [`MemoryStore::add_epoch_key`]. Returns how many keys were added. Does not
-    /// change the active write epoch.
+    /// founder or its named recovery key — see [`crate::fetch_team_key`]'s
+    /// "Provisioner authorization" docs) — are skipped, so a removed member
+    /// still bootstraps the older epochs they retain, and an unauthorized wrap
+    /// never reaches [`MemoryStore::add_epoch_key`]. Returns how many keys were
+    /// added. Does not change the active write epoch.
     ///
-    /// Discovering *which* epochs exist is left to the caller (a documented
-    /// follow-up): pass the epoch range you know about.
+    /// The manifest that authorizes provisioners is resolved once, through the
+    /// same rollback watermark and durable marker as `sync`
+    /// ([`current_manifest`](Self::current_manifest)), not read raw from the
+    /// bucket: a garbled or deleted newest manifest must not bring back a
+    /// recovery key it retired. [`wrapped_epochs`](Self::wrapped_epochs) lists
+    /// the epochs to pass.
     ///
     /// # Errors
     ///
-    /// Never returns an error for an un-unwrappable epoch (those are skipped); it
-    /// is infallible in practice and returns `Result` only to keep the async
-    /// signature uniform with the rest of the store API.
+    /// Whatever resolving the manifest reports. An epoch that does not unwrap
+    /// is skipped, not an error.
     pub async fn bootstrap_epoch_keys(
         &self,
         identity: &Identity,
@@ -1711,23 +1717,25 @@ impl MemoryStore {
         // differ whenever `author_seed_hex` is not the mnemonic's seed, which is
         // the per-machine setup `join --bundle` and the installer create.
         let recipient = self.signer.author_ss58();
+        let manifest = self.current_manifest().await?;
         let mut added = 0_usize;
         for &epoch in epochs {
-            // `self.founder` is the same operator pin `sync`/`provision_members` load
-            // the manifest under, so a wrap this member's own store would refuse to
-            // trust as authorized (Task 3's provisioner check, inside
-            // `fetch_team_key`) is refused here too, BEFORE `add_epoch_key` ever
-            // installs it into the ring.
-            match fetch_team_key(
-                self.blob.as_ref(),
-                team,
-                epoch,
-                &recipient,
-                &secret,
-                self.founder.as_ref(),
-            )
-            .await
-            {
+            // Refused BEFORE `add_epoch_key` ever installs the key into the ring.
+            let fetched =
+                match read_wrapped_key(self.blob.as_ref(), team, epoch, recipient.as_str()).await {
+                    Ok(wrapped)
+                        if !provisioner_authorized(
+                            &wrapped,
+                            manifest.as_ref(),
+                            self.founder.as_ref(),
+                        ) =>
+                    {
+                        Err(unauthorized_wrap(team, epoch, &recipient))
+                    }
+                    Ok(wrapped) => unwrap_team_key(team, &wrapped, &secret, epoch),
+                    Err(err) => Err(err),
+                };
+            match fetched {
                 Ok(key) => {
                     self.add_epoch_key(epoch, key);
                     added += 1;
@@ -1742,6 +1750,22 @@ impl MemoryStore {
             }
         }
         Ok(added)
+    }
+
+    /// The epochs at which the bucket holds a wrap addressed to this store's
+    /// author, ascending: what [`bootstrap_epoch_keys`](Self::bootstrap_epoch_keys)
+    /// tries. One LIST of `{team}/_keys/`. Unauthenticated: an epoch listed here
+    /// may hold a planted wrap, which the bootstrap refuses.
+    ///
+    /// Listing beats walking `0..=newest`: rotations may skip epochs another
+    /// object holds, and a GET per epoch would follow an epoch number anyone
+    /// with bucket write can raise.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`BlobStore::list`] reports.
+    pub async fn wrapped_epochs(&self) -> Result<Vec<u64>, MemError> {
+        wrap_epochs_addressed_to(self.blob.as_ref(), &self.team, &self.signer.author_ss58()).await
     }
 
     /// Record a new note: build it, seal it, persist the blob, log a signed
@@ -7986,12 +8010,13 @@ impl MemoryStore {
     ///
     /// `known_max_epoch` is the highest epoch the caller knows the team has
     /// rotated to out of band (the CLI passes its configured `max_epoch`). The
-    /// new epoch is one past the highest of the local ring, `known_max_epoch`,
-    /// and the highest epoch with a wrap in the bucket, and it is refused when
-    /// a key check already exists for it. The wraps are create-only writes, so
-    /// on a gateway that enforces them a concurrent rotation from another
-    /// founder machine that wins the race makes this one fail with
-    /// [`MemError::EpochTaken`] rather than overwrite it. On a gateway that does
+    /// new epoch is the first above the highest of the local ring,
+    /// `known_max_epoch`, and the newest epoch the founder provisioned in the
+    /// bucket, that no wrap or key check object holds. The wraps are
+    /// create-only writes, so on a gateway that enforces them a concurrent
+    /// rotation from another founder machine that wins the race makes this one
+    /// fail with [`MemError::EpochTaken`] rather than overwrite it, after
+    /// deleting the wraps it had written. On a gateway that does
     /// not, two rotations racing at the same epoch can still both write; one
     /// whose wraps reached the bucket before this one listed them cannot.
     ///
@@ -8014,8 +8039,8 @@ impl MemoryStore {
     ///   authorized to receive a wrap. Refused BEFORE the write epoch advances:
     ///   sealing future notes under a key wrapped to no one would make them
     ///   unreadable to the whole team once this process exits.
-    /// - [`MemError::EpochTaken`] when the chosen epoch already has a key check,
-    ///   or another rotation's wrap appears there while this one writes.
+    /// - [`MemError::EpochTaken`] when another rotation's wrap appears at the
+    ///   chosen epoch while this one writes.
     /// - Whatever [`load_manifest`] / [`load_member_keys`] / the wrap writes
     ///   report (storage, serialization, crypto).
     pub async fn rotate_key(&self, known_max_epoch: u64) -> Result<RotationOutcome, MemError> {
@@ -8054,7 +8079,9 @@ impl MemoryStore {
         }
 
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
-        let new_epoch = self.next_rotation_epoch(known_max_epoch).await?;
+        let new_epoch = self
+            .next_rotation_epoch(known_max_epoch, manifest.as_ref())
+            .await?;
         let new_key = SecretKey::generate();
         // This store's own signer is the provisioner for the rotation too.
         // The manifest resolved above, through the rollback watermark, decides
@@ -8142,11 +8169,24 @@ impl MemoryStore {
         })
     }
 
-    /// The epoch a rotation mints: one past the highest of the local ring,
-    /// `known_max_epoch` and the newest epoch the founder provisioned on the
-    /// bucket, refused when it already has a key check (see
-    /// [`rotate_key`](Self::rotate_key)).
-    async fn next_rotation_epoch(&self, known_max_epoch: u64) -> Result<u64, MemError> {
+    /// The epoch a rotation mints: the first epoch above the highest of the
+    /// local ring, `known_max_epoch` and the newest epoch the founder
+    /// provisioned on the bucket that no object under `{team}/_keys/{epoch}/`
+    /// or at `{team}/_keycheck/{epoch}` holds (see [`rotate_key`](Self::rotate_key)).
+    ///
+    /// Stepping over a held epoch, rather than refusing it, is what keeps one
+    /// object anyone with bucket write can put at the next epoch (a stray key
+    /// check, a wrap no founder signed) from blocking every later `rotate` and
+    /// `remove` for good, which would keep the key a removed member holds
+    /// live. Members load rotated keys by listing their own wraps
+    /// ([`wrapped_epochs`](Self::wrapped_epochs)), so a skipped epoch costs
+    /// them nothing. One LIST of `_keys/` and one of `_keycheck/`, and a GET
+    /// per listed wrap above the local floor until one is the founder's.
+    async fn next_rotation_epoch(
+        &self,
+        known_max_epoch: u64,
+        manifest: Option<&TeamManifest>,
+    ) -> Result<u64, MemError> {
         // The floor includes the newest provisioned epoch: the local ring and
         // `known_max_epoch` (the configured `max_epoch`) both lag a rotation
         // this machine did not load after a restart, and minting one past them
@@ -8158,19 +8198,26 @@ impl MemoryStore {
         // `None` (empty ring) still floors at the other two, so a keyless store
         // cannot re-mint epoch 0.
         let local = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
-        let floor = self.newest_provisioned_epoch(local).await?.unwrap_or(local);
-        let new_epoch = floor.checked_add(1).ok_or_else(|| {
-            MemError::Malformed(format!("team {} has no epoch left to rotate to", self.team))
-        })?;
+        let wraps = wrap_keys_above(self.blob.as_ref(), &self.team, local).await?;
         // A key check names an epoch too, and it can exist without a wrap (a
         // `keycheck publish` from a machine holding a key no wrap delivers).
-        match self.blob.get(&key_check_key(&self.team, new_epoch)).await {
-            Err(MemError::NotFound { .. }) => Ok(new_epoch),
-            Ok(_) => Err(MemError::EpochTaken {
-                team: self.team.clone(),
-                epoch: new_epoch,
-            }),
-            Err(err) => Err(err),
+        let held: BTreeSet<u64> = wraps
+            .iter()
+            .map(|(epoch, _)| *epoch)
+            .chain(key_check_epochs(self.blob.as_ref(), &self.team).await?)
+            .collect();
+        let floor =
+            first_provisioned_epoch(self.blob.as_ref(), wraps, manifest, self.founder.as_ref())
+                .await?
+                .unwrap_or(local);
+        let mut new_epoch = floor;
+        loop {
+            new_epoch = new_epoch.checked_add(1).ok_or_else(|| {
+                MemError::Malformed(format!("team {} has no epoch left to rotate to", self.team))
+            })?;
+            if !held.contains(&new_epoch) {
+                return Ok(new_epoch);
+            }
         }
     }
 
@@ -10811,24 +10858,84 @@ mod tests {
         Ok(())
     }
 
-    /// An epoch that has a key check but no wrap is taken: a rotation to it is
-    /// refused instead of minting a key the published check does not match.
+    /// A rotation steps over an epoch that a key check or a wrap the founder did
+    /// not sign already holds, and leaves those objects alone. It used to
+    /// refuse with `EpochTaken`, so one such object at the next epoch blocked
+    /// every later `rotate` and `remove`. The founder's restarted server still
+    /// loads the new epoch: it lists its own wraps and skips the planted one.
     #[tokio::test]
-    async fn a_rotation_refuses_an_epoch_that_has_a_key_check() -> TestResult {
+    async fn a_rotation_steps_over_epochs_other_objects_hold() -> TestResult {
         const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
         let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
         founder.join_as_member(&identity).await?;
-        blob.put(&key_check_key(TEAM, 1), b"a check".to_vec())
-            .await?;
+        let check = key_check_key(TEAM, 1);
+        let planted = crate::wrapped_key_key(TEAM, 2, founder.author.as_str());
+        blob.put(&check, b"a check".to_vec()).await?;
+        blob.put(&planted, b"not a wrap".to_vec()).await?;
 
-        let refused = founder.rotate_key(0).await;
-        assert!(
-            matches!(refused, Err(MemError::EpochTaken { epoch: 1, .. })),
-            "got {refused:?}"
-        );
-        assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        let rotation = founder.rotate_key(0).await?;
+
+        assert_eq!(rotation.new_epoch, 3);
+        assert_eq!(blob.get(&check).await?, b"a check".to_vec());
+        assert_eq!(blob.get(&planted).await?, b"not a wrap".to_vec());
+        let restarted = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let epochs = restarted.wrapped_epochs().await?;
+        assert_eq!(epochs, [2, 3]);
+        assert_eq!(restarted.bootstrap_epoch_keys(&identity, &epochs).await?, 1);
+        assert_eq!(restarted.highest_epoch(), Some(3));
+        Ok(())
+    }
+
+    /// A member's server bootstraps a rotated key only when a provisioner the
+    /// manifest in force authorizes signed its wrap. With the newest manifest
+    /// object garbled, the bucket's newest readable manifest still names a
+    /// recovery key the newest one retired; a wrap that key signed is refused,
+    /// because the bootstrap resolves the manifest through the rollback
+    /// watermark. It used to read the bucket's manifest raw.
+    #[tokio::test]
+    async fn a_bootstrap_refuses_a_wrap_only_a_rolled_back_manifest_authorizes() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        member.join_as_member(&identity).await?;
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                member.author.clone(),
+            ]))
+            .await?;
+        let retired = Sr25519Signer::from_seed_with_prefix(&[55_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let (named, _) = founder
+            .publish_recovery_key(retired.verifying_key())
+            .await?;
+        let replacement =
+            Sr25519Signer::from_seed_with_prefix(&[56_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let (newest, _) = founder
+            .publish_recovery_key(replacement.verifying_key())
+            .await?;
+        assert_eq!(newest.version, named.version + 1);
+        member.sync().await?;
+        garble_manifest(&blob, newest.version).await?;
+
+        let forged = crate::wrap_team_key(
+            TEAM,
+            &SecretKey::generate(),
+            &identity.x25519_public(),
+            5,
+            &retired,
+        )?;
+        blob.put(
+            &crate::wrapped_key_key(TEAM, 5, member.author.as_str()),
+            serde_json::to_vec(&forged)?,
+        )
+        .await?;
+
+        assert_eq!(member.bootstrap_epoch_keys(&identity, &[5]).await?, 0);
+        assert_eq!(member.highest_epoch(), Some(0));
         Ok(())
     }
 
@@ -10860,15 +10967,16 @@ mod tests {
         Ok(())
     }
 
-    /// Plants one object the first time the key check of an epoch is read:
-    /// between a rotation choosing its epoch and writing the wraps.
-    struct PlantOnKeyCheckRead {
+    /// Plants an object at the key of the second create-only wrap write, just
+    /// before it: another rotation at the same epoch winning that slot while
+    /// this one writes its wraps.
+    struct SecondWrapTaken {
         inner: MemoryBlobStore,
-        plant: Mutex<Option<(String, Vec<u8>)>>,
+        wraps_written: AtomicUsize,
     }
 
     #[async_trait::async_trait]
-    impl BlobStore for PlantOnKeyCheckRead {
+    impl BlobStore for SecondWrapTaken {
         async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
             self.inner.put(key, bytes).await
         }
@@ -10878,23 +10986,16 @@ mod tests {
             key: &str,
             bytes: Vec<u8>,
         ) -> Result<CreateOutcome, MemError> {
+            if key.contains("/_keys/") && self.wraps_written.fetch_add(1, Ordering::Relaxed) == 1 {
+                self.inner
+                    .put(key, b"the other machine's wrap".to_vec())
+                    .await?;
+            }
             self.inner.put_if_absent(key, bytes).await
         }
 
         async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-            let found = self.inner.get(key).await;
-            let plant = if key.contains("/_keycheck/") {
-                self.plant
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-            } else {
-                None
-            };
-            if let Some((planted, bytes)) = plant {
-                self.inner.put(&planted, bytes).await?;
-            }
-            found
+            self.inner.get(key).await
         }
 
         async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
@@ -10906,27 +11007,24 @@ mod tests {
         }
     }
 
-    /// A wrap that appears at the new epoch after the rotation chose it (a
-    /// second founder machine rotating at the same moment) is not overwritten:
-    /// the rotation fails with `EpochTaken` and leaves those bytes, so the
-    /// notes sealed under the other machine's key stay readable.
+    /// A rotation that loses one wrap slot to another rotation at the same
+    /// epoch fails with `EpochTaken`, leaves the other machine's wrap as it
+    /// was, and deletes the wraps it had already written. Those were
+    /// founder-signed wraps of the key this rotation discards: left behind,
+    /// they marked the epoch provisioned, so the founder's writes were refused
+    /// while the members they reached sealed notes under that key.
     #[tokio::test]
-    async fn a_rotation_never_overwrites_a_wrap_that_appeared_at_its_epoch() -> TestResult {
+    async fn a_rotation_that_loses_a_wrap_slot_leaves_no_wrap_of_its_own() -> TestResult {
         const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let planting = Arc::new(PlantOnKeyCheckRead {
+        let blob: Arc<dyn BlobStore> = Arc::new(SecondWrapTaken {
             inner: MemoryBlobStore::default(),
-            plant: Mutex::new(None),
+            wraps_written: AtomicUsize::new(0),
         });
-        let blob: Arc<dyn BlobStore> = Arc::clone(&planting) as Arc<dyn BlobStore>;
         let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
         let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
         founder.join_as_member(&identity).await?;
-        let wrap_key = crate::wrapped_key_key(TEAM, 1, founder.author.as_str());
-        *planting
-            .plant
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) =
-            Some((wrap_key.clone(), b"the other machine's wrap".to_vec()));
+        member.join_as_member(&identity).await?;
 
         let refused = founder.rotate_key(0).await;
 
@@ -10934,10 +11032,13 @@ mod tests {
             matches!(refused, Err(MemError::EpochTaken { epoch: 1, .. })),
             "got {refused:?}"
         );
+        let left = blob.list(&format!("{TEAM}/_keys/{:020}/", 1)).await?;
+        assert_eq!(left.len(), 1, "only the other machine's wrap: {left:?}");
         assert_eq!(
-            blob.get(&wrap_key).await?,
+            blob.get(&left[0]).await?,
             b"the other machine's wrap".to_vec()
         );
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
         assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
         Ok(())
     }

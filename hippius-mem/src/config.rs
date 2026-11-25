@@ -736,15 +736,15 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_MAX_EPOCH") {
             // A malformed override leaves the file/default value in place, matching
-            // the lenient `anchor_threshold` overlay above — and WARNS, because a
-            // silent fallback to 0 caps epoch-key bootstrap and makes every note
-            // under a rotated epoch undecryptable with no diagnostic.
+            // the lenient `anchor_threshold` overlay above — and WARNS, because the
+            // value was meant to change which epochs startup tries when it cannot
+            // list this member's wraps, and where a rotation's epoch starts.
             match v.parse::<u64>() {
                 Ok(parsed) => self.max_epoch = parsed,
                 Err(err) => tracing::warn!(
                     value = %v,
                     error = %err,
-                    "ignoring malformed HIPPIUS_MEM_MAX_EPOCH; keeping the file/default value (this caps epoch-key bootstrap)"
+                    "ignoring malformed HIPPIUS_MEM_MAX_EPOCH; keeping the file/default value"
                 ),
             }
         }
@@ -833,8 +833,9 @@ impl Config {
             });
         }
         // A 0 threshold would anchor every op as its own batch; an unbounded
-        // max_epoch makes startup load one wrapped key per epoch (one S3 GET each),
-        // turning a config typo into a startup denial of service. Bound both.
+        // max_epoch makes a startup that cannot list the member's wraps try one
+        // wrapped key per epoch (one S3 GET each), turning a config typo into a
+        // startup denial of service. Bound both.
         if self.anchor_threshold == 0 {
             return Err(ConfigError::OutOfRange {
                 field: "anchor_threshold",
@@ -845,7 +846,7 @@ impl Config {
             return Err(ConfigError::OutOfRange {
                 field: "max_epoch",
                 detail: format!(
-                    "must be <= {MAX_BOOTSTRAP_EPOCH}; startup loads one wrapped key per epoch 0..=max_epoch"
+                    "must be <= {MAX_BOOTSTRAP_EPOCH}; startup tries one wrapped key per epoch 0..=max_epoch when it cannot list the bucket"
                 ),
             });
         }
@@ -2278,9 +2279,9 @@ fn canonical_org_hint(pattern: &str) -> String {
     }
 }
 
-/// Upper bound on `max_epoch`: startup loads one wrapped team key per epoch in
-/// `0..=max_epoch` (one S3 GET each), so an unbounded value is a startup denial
-/// of service via a config typo. 1024 epochs is far beyond any realistic
+/// Upper bound on `max_epoch`: when it cannot list the member's wraps, startup
+/// tries one wrapped team key per epoch in `0..=max_epoch` (one S3 GET each), so
+/// an unbounded value is a startup denial of service via a config typo. 1024 epochs is far beyond any realistic
 /// key-rotation count while keeping the bootstrap bounded.
 pub(crate) const MAX_BOOTSTRAP_EPOCH: u64 = 1024;
 

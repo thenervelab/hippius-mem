@@ -1099,26 +1099,21 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             return;
         }
     };
-    // Up to the newest epoch the founder provisioned, so a rotation reaches
-    // this machine without anyone raising `max_epoch` first; `max_epoch` still
-    // widens the range when the lookup fails. Only a founder-signed wrap
-    // counts, so a key planted at a huge epoch cannot make this walk it.
-    // Capped like `max_epoch` itself (one GET per epoch tried): on an open team
-    // any provisioner counts, so a wrap planted at a huge epoch must not make
-    // this walk, or allocate, past the cap.
-    let newest = match store.newest_provisioned_epoch(max_epoch).await {
-        Ok(newest) => newest
-            .unwrap_or(max_epoch)
-            .min(crate::config::MAX_BOOTSTRAP_EPOCH.max(max_epoch)),
+    // Every epoch with a wrap addressed to this member, so a rotation reaches
+    // this machine without anyone raising `max_epoch` first. Listed, not
+    // walked as a range: rotations step over epochs another object holds, and
+    // a planted wrap at a huge epoch then costs one GET instead of a walk.
+    // `max_epoch` is the range tried when the listing fails.
+    let epochs = match store.wrapped_epochs().await {
+        Ok(epochs) => epochs,
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "could not look up the team's newest key epoch; trying epochs up to max_epoch"
+                "could not list this member's wrapped keys; trying epochs up to max_epoch"
             );
-            max_epoch
+            (0..=max_epoch).collect()
         }
     };
-    let epochs: Vec<u64> = (0..=newest).collect();
     match store.bootstrap_epoch_keys(&identity, &epochs).await {
         Ok(added) => {
             // Seal future writes under the newest epoch this member holds. Only
@@ -1135,7 +1130,7 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             }
             tracing::info!(
                 added,
-                newest,
+                tried = epochs.len(),
                 "bootstrapped accessible epoch keys from the bucket"
             );
         }

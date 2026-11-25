@@ -100,6 +100,30 @@ pub(crate) fn key_check_key(team: &str, epoch: u64) -> String {
     format!("{team}/_keycheck/{epoch:020}")
 }
 
+/// The epochs at which an object sits at `team`'s check key, from one LIST.
+/// Only keys of exactly the shape [`key_check_key`] writes count; the objects
+/// are not read.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::list`] reports.
+pub(crate) async fn key_check_epochs(
+    blob: &dyn BlobStore,
+    team: &str,
+) -> Result<Vec<u64>, MemError> {
+    let prefix = format!("{team}/_keycheck/");
+    Ok(blob
+        .list(&prefix)
+        .await?
+        .iter()
+        .filter_map(|key| {
+            let epoch = key.strip_prefix(&prefix)?;
+            let minted = epoch.len() == 20 && epoch.bytes().all(|byte| byte.is_ascii_digit());
+            epoch.parse().ok().filter(|_| minted)
+        })
+        .collect())
+}
+
 /// What is published at `team`'s check key for `epoch`.
 ///
 /// # Errors

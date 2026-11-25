@@ -524,7 +524,11 @@ pub(crate) async fn put_wraps(
 ///
 /// # Errors
 ///
-/// [`MemError::EpochTaken`] at the first wrap that already exists.
+/// [`MemError::EpochTaken`] at the first wrap that already exists, or whatever
+/// the store reports. Either way the wraps this call created are deleted first
+/// (best effort): they are founder-signed wraps of a key the caller is about
+/// to discard, and left behind they would mark the epoch provisioned and hand
+/// part of the team that key.
 pub(crate) async fn create_wraps(
     blob: &dyn BlobStore,
     team: &str,
@@ -532,18 +536,30 @@ pub(crate) async fn create_wraps(
     wraps: Vec<SealedWrap>,
 ) -> Result<BTreeSet<Ss58>, MemError> {
     let mut wrapped_to = BTreeSet::new();
+    let mut created = Vec::new();
     for wrap in wraps {
-        match blob.put_if_absent(&wrap.object_key, wrap.bytes).await? {
-            CreateOutcome::Created => {
+        let failure = match blob.put_if_absent(&wrap.object_key, wrap.bytes).await {
+            Ok(CreateOutcome::Created) => {
                 wrapped_to.insert(wrap.recipient);
+                created.push(wrap.object_key);
+                continue;
             }
-            CreateOutcome::AlreadyExists => {
-                return Err(MemError::EpochTaken {
-                    team: team.to_owned(),
-                    epoch,
-                });
+            Ok(CreateOutcome::AlreadyExists) => MemError::EpochTaken {
+                team: team.to_owned(),
+                epoch,
+            },
+            Err(err) => err,
+        };
+        for key in &created {
+            if let Err(err) = blob.delete(key).await {
+                tracing::warn!(
+                    key = %key,
+                    error = %err,
+                    "could not delete a wrap of an abandoned rotation; delete it by hand"
+                );
             }
         }
+        return Err(failure);
     }
     Ok(wrapped_to)
 }
@@ -716,23 +732,38 @@ pub async fn fetch_team_key(
     // rejected on the cheaper crypto check first, and the manifest fetch below
     // is spent only on a wrap that already proved SOME key sealed it.
     let manifest = load_manifest(blob, team, expected_founder).await?;
-    let authorized = match &manifest {
+    if !provisioner_authorized(&wrapped, manifest.as_ref(), expected_founder) {
+        return Err(unauthorized_wrap(team, epoch, recipient_ss58));
+    }
+    Ok(secret)
+}
+
+/// Whether `manifest` authorizes the provisioner of `wrapped`, by
+/// [`fetch_team_key`]'s rules: the manifest's founder or trusted recovery key;
+/// with no manifest, any provisioner on an open team (`expected_founder` is
+/// `None`) and none on a pinned one. Checks no signature.
+pub(crate) fn provisioner_authorized(
+    wrapped: &WrappedKey,
+    manifest: Option<&TeamManifest>,
+    expected_founder: Option<&Ss58>,
+) -> bool {
+    match manifest {
         Some(manifest) => manifest.authorizes_provisioner(&wrapped.provisioner),
         // Pinned + no founder-signed manifest is fail-closed, matching
         // `provision_team_key`. Unpinned + no manifest is the open-team
         // fallback: any wrap that already unwrapped is accepted.
         None => expected_founder.is_none(),
-    };
-    if !authorized {
-        return Err(MemError::Unauthorized(format!(
-            "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner \
-             the current manifest does not authorize (neither its founder nor its named \
-             recovery key)",
-            recipient_ss58.as_str(),
-        )));
     }
+}
 
-    Ok(secret)
+/// The error for a wrap of `team`'s `epoch` to `recipient` that
+/// [`provisioner_authorized`] refuses.
+pub(crate) fn unauthorized_wrap(team: &str, epoch: u64, recipient: &Ss58) -> MemError {
+    MemError::Unauthorized(format!(
+        "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner the \
+         current manifest does not authorize (neither its founder nor its named recovery key)",
+        recipient.as_str(),
+    ))
 }
 
 /// Rotate the team key: provision `new_team_key` at `new_epoch` for the current
@@ -1008,17 +1039,52 @@ pub(crate) async fn wrap_keys_above(
         .await?
         .into_iter()
         .filter_map(|key| {
-            let (epoch, address) = key.strip_prefix(&prefix)?.split_once('/')?;
-            let minted = epoch.len() == 20
-                && epoch.bytes().all(|byte| byte.is_ascii_digit())
-                && !address.is_empty()
-                && !address.contains('/');
-            let epoch: u64 = epoch.parse().ok().filter(|_| minted)?;
+            let (epoch, _) = parse_wrap_key(&prefix, &key)?;
             (epoch > floor).then_some((epoch, key))
         })
         .collect();
     keys.sort_by_key(|(epoch, _)| std::cmp::Reverse(*epoch));
     Ok(keys)
+}
+
+/// The epochs at which `team` holds a wrap key addressed to `recipient`,
+/// ascending, from one LIST. Unauthenticated like [`wrap_keys_above`]: a
+/// caller trusts a key only after [`fetch_team_key`]'s checks.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::list`] reports.
+pub(crate) async fn wrap_epochs_addressed_to(
+    blob: &dyn BlobStore,
+    team: &str,
+    recipient: &Ss58,
+) -> Result<Vec<u64>, MemError> {
+    let prefix = wrapped_keys_prefix(team);
+    let mut epochs: Vec<u64> = blob
+        .list(&prefix)
+        .await?
+        .iter()
+        .filter_map(|key| {
+            let (epoch, address) = parse_wrap_key(&prefix, key)?;
+            (address == recipient.as_str()).then_some(epoch)
+        })
+        .collect();
+    epochs.sort_unstable();
+    epochs.dedup();
+    Ok(epochs)
+}
+
+/// The epoch and address of `key` when it has exactly the shape
+/// [`wrapped_key_key`] writes under `prefix` (a 20-digit epoch, then one
+/// address segment).
+fn parse_wrap_key<'k>(prefix: &str, key: &'k str) -> Option<(u64, &'k str)> {
+    let (epoch, address) = key.strip_prefix(prefix)?.split_once('/')?;
+    let minted = epoch.len() == 20
+        && epoch.bytes().all(|byte| byte.is_ascii_digit())
+        && !address.is_empty()
+        && !address.contains('/');
+    let epoch: u64 = epoch.parse().ok().filter(|_| minted)?;
+    Some((epoch, address))
 }
 
 /// The first epoch in `candidates` (from [`wrap_keys_above`]) with a wrap the
@@ -1052,11 +1118,10 @@ pub(crate) async fn first_provisioned_epoch(
         let Ok(wrapped) = serde_json::from_slice::<WrappedKey>(&bytes) else {
             continue;
         };
-        let authorized = match manifest {
-            Some(manifest) => manifest.authorizes_provisioner(&wrapped.provisioner),
-            None => expected_founder.is_none(),
-        };
-        if wrapped.epoch == epoch && authorized && wrapped.verify() {
+        if wrapped.epoch == epoch
+            && provisioner_authorized(&wrapped, manifest, expected_founder)
+            && wrapped.verify()
+        {
             return Ok(Some(epoch));
         }
     }

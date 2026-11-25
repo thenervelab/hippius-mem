@@ -191,9 +191,9 @@ pub enum MemError {
         /// The team whose rotation found no authorized wrap target.
         team: String,
     },
-    /// A rotation picked an epoch the bucket already holds a key for (a wrap or
-    /// a key check), so minting it again would replace that epoch's key and
-    /// strand the notes sealed under it.
+    /// A wrap slot of the epoch a rotation picked was taken while it wrote (a
+    /// concurrent rotation), so finishing would split that epoch between two
+    /// keys. The rotation deleted the wraps it had written.
     #[error(
         "team {team} already has a key for epoch {epoch}; refusing to mint it again (another \
          rotation published it while this one ran)"
