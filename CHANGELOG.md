@@ -245,6 +245,11 @@ field.
   the op and head PUTs); the server appends it in the background. A
   read-only session, such as a second session on a trial vault, appends
   none, and `edit` no longer appends a `Reinforce` ahead of its own `Edit`.
+- The session brief no longer lists a note another live note supersedes or
+  duplicates, frames its notes as reference data teammates wrote rather
+  than instructions, and keeps every summary on one line, so a note synced
+  from another machine with a newline in its summary cannot add a heading
+  or line of its own. A note dated in the future still sorts first.
 
 ## [0.7.1] - 2026-11-19
 

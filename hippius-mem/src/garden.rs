@@ -65,22 +65,11 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One list line for `note`. A summary synced from a teammate's machine is
-/// only length-checked, so control characters and line separators become
-/// spaces: a newline in one would otherwise start a heading of its own in
-/// this report.
+/// One list line for `note`, its summary on one line
+/// ([`hippius_mem_core::single_line`]) so it cannot start a heading of its own
+/// in this report.
 fn note_line(note: &GardenNote) -> String {
-    let summary: String = note
-        .summary
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
+    let summary = hippius_mem_core::single_line(&note.summary);
     format!("`{}` ({}) {summary}", note.id, note.repo)
 }
 

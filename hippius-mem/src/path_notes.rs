@@ -150,11 +150,9 @@ fn relative_to(root: &Path, file: &Path) -> Option<String> {
 /// The block an edit hook injects, or `None` for no notes.
 ///
 /// The framing sentence matters: summaries are text a teammate wrote, and an
-/// agent must weigh them, not obey them. For the same reason every control
-/// character and line separator in a summary becomes a space. A local write
-/// refuses control characters (not the separators), but a note synced from a
-/// teammate's machine is only length-checked, and a newline would let its
-/// text start a line of its own, outside the list this frames.
+/// agent must weigh them, not obey them. For the same reason each summary is
+/// put on one line ([`hippius_mem_core::single_line`]), so it cannot start a
+/// line outside the list this frames.
 fn render(file: &str, notes: &[PathNoteDto]) -> Option<String> {
     if notes.is_empty() {
         return None;
@@ -164,19 +162,7 @@ fn render(file: &str, notes: &[PathNoteDto]) -> Option<String> {
          open one with `get`):\n"
     );
     for note in notes {
-        let summary: String = note
-            .summary
-            .chars()
-            .map(|c| {
-                // U+2028 and U+2029 are line and paragraph separators outside
-                // the control category.
-                if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
+        let summary = hippius_mem_core::single_line(&note.summary);
         let _ = writeln!(out, "- [{}] {} ({})", note.note_type, summary, note.id);
     }
     Some(out)
