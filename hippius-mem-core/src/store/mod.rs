@@ -16965,6 +16965,24 @@ mod tests {
         Ok(())
     }
 
+    /// A store whose anchor is not the on-chain one does not report anchoring
+    /// on chain, so the binary keeps its exit flush bounded in time; reported
+    /// for every store, a stalled gateway would hold a closed session's
+    /// process. (The on-chain case needs a `SubxtAnchor`, which only a
+    /// connection to a live node builds.)
+    #[test]
+    fn only_the_chain_anchor_anchors_on_chain() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        for anchor in [
+            Arc::new(NoopAnchor) as Arc<dyn AuditAnchor>,
+            Arc::new(RecordingAnchor::new()),
+        ] {
+            let store = store_with(Arc::clone(&blob), SOLO_SEED, anchor, 16)?;
+            assert!(!store.anchors_on_chain());
+        }
+        Ok(())
+    }
+
     /// An edit that completes another author's pending op (two seeds sharing
     /// one state directory) keeps that op out of its own anchor batch. It used
     /// to queue it, so this author signed a record covering an op it did not
