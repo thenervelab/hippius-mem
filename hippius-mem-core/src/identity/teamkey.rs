@@ -438,10 +438,11 @@ pub fn unwrap_team_key(
 /// member in `member_keys`.
 ///
 /// Wraps the key to each member's x25519 public key and publishes the
-/// [`WrappedKey`] under that member's per-epoch object key. A member key that
-/// fails [`MemberKey::verify`] is skipped with a warning (never wrapped to), so
-/// the team key is never handed to an x25519 key not cryptographically bound to
-/// its claimed ss58.
+/// [`WrappedKey`] under that member's per-epoch object key, through
+/// [`provision_wraps`]: a slot that already holds a wrap a reader accepts is
+/// kept, never overwritten. A member key that fails [`MemberKey::verify`] is
+/// skipped with a warning (never wrapped to), so the team key is never handed
+/// to an x25519 key not cryptographically bound to its claimed ss58.
 ///
 /// # Membership authorization
 ///
@@ -452,36 +453,28 @@ pub fn unwrap_team_key(
 /// address, so `verify()` alone would let a bucket writer get the team key
 /// wrapped to them without ever appearing in the founder-signed roster.
 /// Authorization instead comes from the [`crate::TeamManifest`]: this function loads
-/// the current one ([`load_manifest`], trust-on-genesis — no founder pinned,
-/// matching this crate's default when `HIPPIUS_MEM_FOUNDER_SS58`-style pinning
-/// is not threaded through) and skips any verified member whose `ss58` is not
-/// in `manifest.members`. When no manifest has been published yet, the load
-/// returns `None` and every verified member is still provisioned — matching
-/// the documented "a team is open until a founder publishes a signed
-/// `crate::TeamManifest`" model.
-///
-/// Returns the addresses that actually RECEIVED a wrap. Skipped members
-/// (unverifiable or unauthorized) are absent, so a caller can distinguish "the
-/// call succeeded" from "anyone was actually provisioned" — the seam the
-/// rotation flow's nothing-to-rotate guard hangs off.
+/// the current one ([`load_manifest`], honouring `expected_founder`) and skips
+/// any verified member whose `ss58` is not in `manifest.members`. When no
+/// manifest has been published yet, the load returns `None` and every verified
+/// member is still provisioned on an unpinned team — matching the documented
+/// "a team is open until a founder publishes a signed `crate::TeamManifest`"
+/// model.
 ///
 /// # Provisioner signature
 ///
 /// `provisioner` signs every wrap this call produces (recorded as
 /// [`WrappedKey::provisioner`]/[`WrappedKey::sig`]) — it is the identity
-/// PERFORMING the provision (the founder, or whoever the caller trusts to act),
-/// never the recipient. This is orthogonal to `expected_founder`: that gates WHO
-/// receives a wrap (manifest membership), while `provisioner` proves WHO sealed
-/// it. This call signs unconditionally and does not itself check that
-/// `provisioner` is authorized — [`fetch_team_key`] is where that cross-check
-/// against the live manifest's founder/recovery key happens, on the READ side,
-/// once the manifest a bucket-planted wrap must be checked against is knowable.
+/// PERFORMING the provision, never the recipient. This free function does not
+/// check that `provisioner` is authorized: a reader ([`fetch_team_key`])
+/// refuses a wrap whose provisioner is not the live manifest's founder or
+/// recovery key, and [`crate::MemoryStore::provision_members`] refuses an
+/// unauthorized signer before it writes anything.
 ///
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] if a wrap fails, [`MemError::Serialize`] if a
 /// wrap cannot be encoded, or [`MemError::Storage`] if the manifest listing or
-/// a wrap write fails.
+/// a wrap read or write fails.
 pub async fn provision_team_key<S: Signer + ?Sized>(
     blob: &dyn BlobStore,
     team: &str,
@@ -490,7 +483,7 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
     member_keys: &[MemberKey],
     expected_founder: Option<&Ss58>,
     provisioner: &S,
-) -> Result<BTreeSet<Ss58>, MemError> {
+) -> Result<Provisioned, MemError> {
     // `expected_founder` must be the SAME operator pin `MemoryStore::sync` threads
     // into its own `load_manifest`; see `seal_wraps`.
     let manifest = load_manifest(blob, team, expected_founder).await?;
@@ -503,21 +496,95 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
         expected_founder,
         provisioner,
     )?;
-    put_wraps(blob, wraps).await
+    provision_wraps(blob, wraps, manifest.as_ref(), expected_founder).await
 }
 
-/// Write `wraps`, replacing any wrap already at a key, and return the
-/// recipients. The write [`provision_team_key`] does.
-pub(crate) async fn put_wraps(
+/// What a provisioning write did: the wrap slots it wrote and how many it
+/// left alone because they already held a wrap a reader accepts.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Provisioned {
+    /// The `(epoch, member)` slots this call wrote a wrap to.
+    pub written: BTreeSet<(u64, Ss58)>,
+    /// Slots that already held a wrap a reader accepts, kept as they were.
+    pub kept: usize,
+}
+
+/// Write `wraps` without ever replacing a wrap a reader accepts.
+///
+/// Each slot is read first, because a gateway that ignores `If-None-Match`
+/// overwrites on a create-only write. A slot holding a wrap that names the
+/// slot's epoch, carries a valid provisioner signature and comes from a
+/// provisioner `manifest` authorizes (the rules [`fetch_team_key`] applies) is
+/// kept. An empty slot is written create-only. Anything else in the slot (a
+/// wrap another member signed, or bytes that are no wrap) is replaced, with a
+/// warning: no reader would load it, and the member it is addressed to needs a
+/// wrap that loads.
+///
+/// Keeping an accepted wrap is the point: a wrap sealed earlier may hold the
+/// only copy of an epoch key some member can open, and replacing it with a
+/// wrap of another key would strand every note sealed under the first. The
+/// cost is that a member who re-joined with another mnemonic keeps the wrap to
+/// the old x25519 key until the next rotation.
+///
+/// # Errors
+///
+/// Whatever a slot read or write reports, except a missing slot.
+pub(crate) async fn provision_wraps(
     blob: &dyn BlobStore,
     wraps: Vec<SealedWrap>,
-) -> Result<BTreeSet<Ss58>, MemError> {
-    let mut wrapped_to = BTreeSet::new();
+    manifest: Option<&TeamManifest>,
+    expected_founder: Option<&Ss58>,
+) -> Result<Provisioned, MemError> {
+    let mut provisioned = Provisioned::default();
     for wrap in wraps {
+        let accepted = |stored: &[u8]| {
+            serde_json::from_slice::<WrappedKey>(stored).is_ok_and(|stored| {
+                stored.epoch == wrap.epoch
+                    && provisioner_authorized(&stored, manifest, expected_founder)
+                    && stored.verify()
+            })
+        };
+        let mut stored = read_slot(blob, &wrap.object_key).await?;
+        if stored.is_none() {
+            match blob
+                .put_if_absent(&wrap.object_key, wrap.bytes.clone())
+                .await?
+            {
+                CreateOutcome::Created => {
+                    provisioned.written.insert((wrap.epoch, wrap.recipient));
+                    continue;
+                }
+                // Another writer, or a retry of this write, filled the slot
+                // after the read above: judge what it holds.
+                CreateOutcome::AlreadyExists => {
+                    stored = read_slot(blob, &wrap.object_key).await?;
+                }
+            }
+        }
+        if stored.as_deref().is_some_and(accepted) {
+            provisioned.kept += 1;
+            continue;
+        }
+        if stored.is_some() {
+            tracing::warn!(
+                key = %wrap.object_key,
+                "replacing an object in a wrap slot that no reader accepts (not a wrap the \
+                 founder or the recovery key signed for this epoch)"
+            );
+        }
         blob.put(&wrap.object_key, wrap.bytes).await?;
-        wrapped_to.insert(wrap.recipient);
+        provisioned.written.insert((wrap.epoch, wrap.recipient));
     }
-    Ok(wrapped_to)
+    Ok(provisioned)
+}
+
+/// The bytes at `key`, or `None` when no object is there.
+async fn read_slot(blob: &dyn BlobStore, key: &str) -> Result<Option<Vec<u8>>, MemError> {
+    match blob.get(key).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(MemError::NotFound { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Write `wraps` of `team`'s `epoch` create-only, and return the recipients.
@@ -604,6 +671,7 @@ async fn stores_wrap(blob: &dyn BlobStore, wrap: &SealedWrap) -> bool {
 #[derive(Debug)]
 pub(crate) struct SealedWrap {
     recipient: Ss58,
+    epoch: u64,
     object_key: String,
     bytes: Vec<u8>,
 }
@@ -612,7 +680,7 @@ pub(crate) struct SealedWrap {
 /// verifies and that `manifest` authorizes. Reads and writes nothing: the
 /// caller resolves the manifest (the store through its rollback watermark,
 /// the free functions straight from the bucket) and picks the write
-/// ([`put_wraps`] or [`create_wraps`]).
+/// ([`provision_wraps`] or [`create_wraps`]).
 ///
 /// With no `manifest`, every verified key is authorized when `expected_founder`
 /// is `None` (an open team), and none when a founder is pinned (fail-closed).
@@ -675,6 +743,7 @@ pub(crate) fn seal_wraps<S: Signer + ?Sized>(
         let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch, provisioner)?;
         wraps.push(SealedWrap {
             recipient: member.ss58.clone(),
+            epoch,
             object_key: wrapped_key_key(team, epoch, member.ss58.as_str()),
             bytes: serde_json::to_vec(&wrapped)?,
         });

@@ -65,10 +65,10 @@ impl Machine {
         self.home.path().join("hippius-mem.toml")
     }
 
-    fn write_config(&self, live: &Live, founder: &str) -> anyhow::Result<()> {
+    fn write_config(&self, live: &Live, team: &str, founder: &str) -> anyhow::Result<()> {
         let toml = format!(
             "s3_endpoint = \"{endpoint}\"\ns3_region = \"{region}\"\nbucket = \"{bucket}\"\n\
-             access_key_id = \"{access}\"\nsecret = \"{secret}\"\nteam = \"{TEAM}\"\n\
+             access_key_id = \"{access}\"\nsecret = \"{secret}\"\nteam = \"{team}\"\n\
              team_key_hex = \"{TEAM_KEY_HEX}\"\nauthor_seed_hex = \"{seed}\"\n\
              founder_ss58 = \"{founder}\"\nsemantic_embeddings = false\n",
             endpoint = live.endpoint,
@@ -171,6 +171,19 @@ impl Live {
     }
 }
 
+/// Every object under `prefix`, with its bytes.
+async fn objects_under(
+    bucket: &dyn BlobStore,
+    prefix: &str,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut objects = Vec::new();
+    for key in bucket.list(prefix).await? {
+        let bytes = bucket.get(&key).await?;
+        objects.push((key, bytes));
+    }
+    Ok(objects)
+}
+
 async fn clear_team(bucket: &dyn BlobStore, team: &str) {
     for key in bucket
         .list(&format!("{team}/"))
@@ -249,22 +262,40 @@ impl Server {
 
     /// Call `remember` and return the tool result (`isError` and text).
     fn remember(&mut self, summary: &str) -> anyhow::Result<(bool, String)> {
+        self.call(
+            "remember",
+            &json!({
+                "note_type": "decision",
+                "summary": summary,
+                "body": "written after the removal",
+                "repo": "global",
+            }),
+        )
+    }
+
+    /// Call `remember`, require it to succeed, and return the new note's id.
+    fn remember_id(&mut self, summary: &str) -> anyhow::Result<String> {
+        let (refused, text) = self.remember(summary)?;
+        if refused {
+            bail!("remember was refused: {text}");
+        }
+        let answer: Value = serde_json::from_str(&text)?;
+        answer["id"]
+            .as_str()
+            .map(str::to_owned)
+            .with_context(|| format!("remember answer has no id: {text}"))
+    }
+
+    /// Call the tool `name` and return the tool result (`isError` and text).
+    fn call(&mut self, name: &str, arguments: &Value) -> anyhow::Result<(bool, String)> {
         let reply = self.request(
             "tools/call",
-            &json!({
-                "name": "remember",
-                "arguments": {
-                    "note_type": "decision",
-                    "summary": summary,
-                    "body": "written after the removal",
-                    "repo": "global",
-                }
-            }),
+            &json!({ "name": name, "arguments": arguments }),
         )?;
         let result = &reply["result"];
         let text = result["content"][0]["text"]
             .as_str()
-            .with_context(|| format!("remember reply has no text: {reply}"))?
+            .with_context(|| format!("{name} reply has no text: {reply}"))?
             .to_owned();
         Ok((result["isError"].as_bool() == Some(true), text))
     }
@@ -315,7 +346,7 @@ async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyho
     )?;
     let founder_address = founder.address()?;
     for machine in [&founder, &member, &removed] {
-        machine.write_config(&live, &founder_address)?;
+        machine.write_config(&live, TEAM, &founder_address)?;
     }
 
     for machine in [&founder, &member, &removed] {
@@ -418,5 +449,68 @@ async fn joining_by_bundle_with_a_mnemonic_publishes_the_member_key() -> anyhow:
     assert_eq!(member_keys.len(), 1, "one member key: {member_keys:?}");
 
     clear_team(&live.raw_bucket(), JOIN_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the member-provision test owns.
+const PROVISION_TEAM: &str = "rw-provision-live";
+
+/// After a rotation, a member's `provision` (with or without a recovery key)
+/// fails before it writes: every wrap and the manifest stay byte for byte, and
+/// the founder still reads its epoch-1 note from a fresh session. A member's
+/// `provision` used to replace the founder's wraps with ones only it signed,
+/// which no reader accepts, so the epoch-1 notes became unreadable to everyone.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_members_provision_changes_no_wrap_and_the_founder_keeps_reading() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, PROVISION_TEAM).await;
+
+    let founder = Machine::new(
+        41,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        42,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, PROVISION_TEAM, &founder_address)?;
+        machine.run(&["join"])?;
+    }
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+    founder.run(&["rotate"])?;
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under epoch one by the founder")?;
+    drop(session);
+
+    let keys = format!("{PROVISION_TEAM}/_keys/");
+    let manifests = format!("{PROVISION_TEAM}/_manifest/");
+    let wraps_before = objects_under(&bucket, &keys).await?;
+    let manifests_before = objects_under(&bucket, &manifests).await?;
+    for args in [&["provision", "--no-recovery"][..], &["provision"][..]] {
+        let output = member.command(Mnemonic::Set).args(args).output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains("only the team founder"),
+            "a member's `{}` must be refused: {stderr}",
+            args.join(" ")
+        );
+    }
+    assert_eq!(objects_under(&bucket, &keys).await?, wraps_before);
+    assert_eq!(objects_under(&bucket, &manifests).await?, manifests_before);
+
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let (failed, text) = session.call("get", &json!({ "id": id }))?;
+    assert!(
+        !failed && text.contains("written after the removal"),
+        "the founder reads its epoch-1 note: {text}"
+    );
+    drop(session);
+
+    clear_team(&bucket, PROVISION_TEAM).await;
     Ok(())
 }

@@ -620,7 +620,12 @@ an attacker could vary (epoch, ephemeral public key, ciphertext, provisioner key
 is the same author-signature discipline every other bucket-stored type carries, and
 `unwrap_team_key` checks it before spending any ECDH work — a bucket writer who only
 knows a recipient's *public* x25519 key cannot forge a wrap installing an
-attacker-chosen team key. The signed transcript is `hippius-memory-teamkey-wrap-sign/v2`
+attacker-chosen team key. Readers accept a wrap only when its provisioner is the live
+manifest's founder or trusted recovery key, and `provision` refuses any other signer before it
+writes. Every wrap write reads the slot first and keeps a wrap a reader accepts, so neither a
+member's `provision` nor a re-run by the founder can replace a wrap that holds an epoch key
+(the read comes first because a gateway that ignores `If-None-Match` would overwrite a
+create-only write). The signed transcript is `hippius-memory-teamkey-wrap-sign/v2`
 (every field length-framed, including `epoch`). `/v1` used a raw-LE `epoch` and is not
 read: this is a pre-release clean break, so upgrade means re-`provision` / `rotate`
 rather than a dual-read window. A joining member who was never handed the key **bootstraps**

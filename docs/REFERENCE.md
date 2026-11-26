@@ -423,7 +423,10 @@ stated plainly.
   `--bundle -`. Bare `join` (requires
   `HIPPIUS_MEM_MNEMONIC`) only publishes this member's signed key. The founder runs
   `provision` to wrap the current-epoch team key to every published, manifest-authorized
-  member key; `members` prints the founder-signed membership (one SS58 per line, or a note
+  member key. Only the founder (or the manifest's recovery key) may run it: anyone else is
+  refused before anything is written, because readers refuse a wrap they signed. It never
+  replaces a wrap a reader accepts, so a re-run writes only the missing wraps; a member who
+  re-joined with another mnemonic keeps the old wrap until the next `rotate`. `members` prints the founder-signed membership (one SS58 per line, or a note
   that the team is open).
 - **`recover`** — the founder-key-loss escape hatch: rotate the founder identity itself
   through the team's published recovery key (the seed is prompted on the terminal or read

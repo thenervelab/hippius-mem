@@ -61,10 +61,11 @@ use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
-    Identity, ManifestMarker, MemberKey, TeamManifest, create_wraps, first_provisioned_epoch,
-    load_manifest, load_member_keys, next_free_manifest_version, provisioner_authorized,
-    publish_manifest, publish_member_key, put_wraps, read_wrapped_key, seal_wraps,
-    unauthorized_wrap, unwrap_team_key, wrap_epochs_addressed_to, wrap_keys_above,
+    Identity, ManifestMarker, MemberKey, Provisioned, TeamManifest, create_wraps,
+    first_provisioned_epoch, load_manifest, load_member_keys, next_free_manifest_version,
+    provision_wraps, provisioner_authorized, publish_manifest, publish_member_key,
+    read_wrapped_key, seal_wraps, unauthorized_wrap, unwrap_team_key, wrap_epochs_addressed_to,
+    wrap_keys_above,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -8050,7 +8051,15 @@ impl MemoryStore {
 
     /// Founder action: wrap this team's CURRENT-epoch key to every published member
     /// key the founder-signed manifest authorizes, so those members can decrypt
-    /// notes. Returns the number of published member keys considered.
+    /// notes.
+    ///
+    /// Only a signer a reader accepts wraps from may run it: the live manifest's
+    /// founder or its trusted recovery key; with no manifest, the pinned founder
+    /// (whose fail-closed gate then wraps to no one), or anyone on an open team,
+    /// where readers accept any wrap. Anyone else is refused before any read of
+    /// member keys or any write, because a wrap only they signed would be
+    /// refused by every reader and, written over an accepted one, would strand
+    /// the notes sealed under the key it held.
     ///
     /// The manifest gate is threaded with THIS store's pinned founder
     /// ([`self.founder`], the same pin [`MemoryStore::sync`] uses), so a bucket
@@ -8058,20 +8067,23 @@ impl MemoryStore {
     /// wrapped the key — provisioning read-authz is gated by the same signed
     /// authority as write convergence, and fails closed when a pin has no manifest.
     ///
-    /// Idempotent: re-running rewrites each member's wrap under the same epoch key.
-    /// Run it after [`publish_membership`](Self::publish_membership) so the manifest
-    /// the gate reads reflects the intended members.
+    /// Create-only per wrap slot (see `provision_wraps`): a slot that already
+    /// holds a wrap a reader accepts is kept, so re-running it is safe and
+    /// writes only the wraps that are missing.
     ///
     /// # Errors
     ///
+    /// [`MemError::Unauthorized`] if this signer may not provision (see above),
     /// [`MemError::KeyUnavailable`] if this store's key-ring lacks the current
-    /// epoch's key (it is not the founder, or the key was never configured), or
-    /// whatever [`load_manifest`] / [`load_member_keys`] / the wrap writes report.
-    pub async fn provision_members(&self) -> Result<usize, MemError> {
+    /// epoch's key, or whatever [`load_manifest`] / [`load_member_keys`] / the
+    /// wrap reads and writes report.
+    pub async fn provision_members(&self) -> Result<Provisioned, MemError> {
+        let manifest = self.current_manifest().await?;
+        self.require_provisioner(manifest.as_ref())?;
+
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
         let epoch = self.current_epoch();
         let team_key = self.key_for_epoch(epoch)?;
-        let manifest = self.current_manifest().await?;
         // This store's own signer is the provisioner: it signs every wrap this
         // call produces, recorded in each `WrappedKey` as proof of who sealed it.
         let wraps = seal_wraps(
@@ -8083,8 +8095,39 @@ impl MemoryStore {
             self.founder.as_ref(),
             self.signer.as_ref(),
         )?;
-        put_wraps(self.blob.as_ref(), wraps).await?;
-        Ok(member_keys.len())
+        provision_wraps(
+            self.blob.as_ref(),
+            wraps,
+            manifest.as_ref(),
+            self.founder.as_ref(),
+        )
+        .await
+    }
+
+    /// Refuse a signer whose wraps no reader would accept (see
+    /// [`provision_members`](Self::provision_members)).
+    fn require_provisioner(&self, manifest: Option<&TeamManifest>) -> Result<(), MemError> {
+        let founder = match (manifest, &self.founder) {
+            (Some(manifest), _) => {
+                if manifest.authorizes_provisioner(&self.signer.verifying_key()) {
+                    return Ok(());
+                }
+                &manifest.founder
+            }
+            (None, Some(pinned)) => {
+                if &self.author == pinned {
+                    return Ok(());
+                }
+                pinned
+            }
+            (None, None) => return Ok(()),
+        };
+        Err(MemError::Unauthorized(format!(
+            "only the team founder or its recovery key may provision team-key wraps: {:?} is \
+             not founder {:?}, and members' readers refuse a wrap it signs",
+            self.author.as_str(),
+            founder.as_str(),
+        )))
     }
 
     /// Founder action: rotate the team key — mint a fresh key at a fresh epoch,
@@ -11490,6 +11533,162 @@ mod tests {
         Ok(())
     }
 
+    /// The objects under `team`'s `_keys/` prefix, with their bytes.
+    async fn wrap_objects(blob: &dyn BlobStore) -> Result<Vec<(String, Vec<u8>)>, MemError> {
+        let mut objects = Vec::new();
+        for key in blob.list(&format!("{TEAM}/_keys/")).await? {
+            let bytes = blob.get(&key).await?;
+            objects.push((key, bytes));
+        }
+        Ok(objects)
+    }
+
+    /// A founder and a member who both joined, a published roster naming the
+    /// member, and a rotation to epoch 1, so the member holds both epoch keys.
+    async fn founder_and_member_after_a_rotation(
+        blob: &Arc<dyn BlobStore>,
+    ) -> Result<(MemoryStore, MemoryStore), Box<dyn std::error::Error>> {
+        const FOUNDER_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        const MEMBER_PHRASE: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let founder = store_over(Arc::clone(blob), SOLO_SEED)?;
+        let member = store_over(Arc::clone(blob), OTHER_SEED)?;
+        founder
+            .join_as_member(&crate::derive_identity(
+                FOUNDER_PHRASE,
+                NetworkPrefix::HIPPIUS,
+            )?)
+            .await?;
+        let member_identity = crate::derive_identity(MEMBER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        member.join_as_member(&member_identity).await?;
+        founder
+            .publish_membership(BTreeSet::from([member.author.clone()]))
+            .await?;
+        founder.provision_members().await?;
+        let rotation = founder.rotate_key(0).await?;
+        member
+            .bootstrap_epoch_keys(&member_identity, &[rotation.new_epoch])
+            .await?;
+        assert_eq!(member.held_epochs(), [0, 1]);
+        Ok((founder, member))
+    }
+
+    /// A member who holds every epoch key still cannot provision: readers
+    /// refuse a wrap only a member signed, so writing one over the founder's
+    /// would strand the notes sealed under that epoch. The refusal comes before
+    /// any write. A member's `provision` used to overwrite the founder's wraps.
+    #[tokio::test]
+    async fn a_members_provision_is_refused_before_it_writes() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (_founder, member) = founder_and_member_after_a_rotation(&blob).await?;
+        member.set_current_epoch(1);
+        let before = wrap_objects(blob.as_ref()).await?;
+
+        for epoch in [0, 1] {
+            member.set_current_epoch(epoch);
+            let refused = member.provision_members().await;
+            assert!(
+                matches!(&refused, Err(MemError::Unauthorized(message)) if message.contains("only the team founder")),
+                "epoch {epoch}: {refused:?}"
+            );
+        }
+        assert_eq!(
+            wrap_objects(blob.as_ref()).await?,
+            before,
+            "no wrap changed"
+        );
+        Ok(())
+    }
+
+    /// A store whose create-only write overwrites, as a gateway that ignores
+    /// `If-None-Match` does.
+    #[derive(Debug, Default)]
+    struct CreateOnlyIgnoringBlob {
+        inner: MemoryBlobStore,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for CreateOnlyIgnoringBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.inner.put(key, bytes).await?;
+            Ok(CreateOutcome::Created)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The founder's re-run keeps every wrap a reader accepts, also where the
+    /// gateway ignores create-only writes: each wrap seals under a fresh
+    /// ephemeral key, so an overwrite would change the bytes.
+    #[tokio::test]
+    async fn a_founders_provision_keeps_accepted_wraps_on_any_gateway() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(CreateOnlyIgnoringBlob::default());
+        let (founder, _member) = founder_and_member_after_a_rotation(&blob).await?;
+        let before = wrap_objects(blob.as_ref()).await?;
+
+        let again = founder.provision_members().await?;
+        assert!(again.written.is_empty(), "{again:?}");
+        assert_eq!(
+            wrap_objects(blob.as_ref()).await?,
+            before,
+            "no wrap changed"
+        );
+        Ok(())
+    }
+
+    /// A slot holding a wrap no reader accepts (one a member signed) is
+    /// replaced by the founder's provision, so the member it is addressed to
+    /// gets a wrap that loads.
+    #[tokio::test]
+    async fn a_founders_provision_replaces_a_wrap_no_reader_accepts() -> TestResult {
+        const MEMBER_PHRASE: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        let identity = crate::derive_identity(MEMBER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        member.join_as_member(&identity).await?;
+        founder
+            .publish_membership(BTreeSet::from([member.author.clone()]))
+            .await?;
+        let slot = crate::wrapped_key_key(TEAM, 0, member.author.as_str());
+        let planted = crate::wrap_team_key(
+            TEAM,
+            &SecretKey::from_bytes(EPOCH1_KEY),
+            &identity.x25519_public(),
+            0,
+            member.signer.as_ref(),
+        )?;
+        blob.put(&slot, serde_json::to_vec(&planted)?).await?;
+
+        let provisioned = founder.provision_members().await?;
+        assert!(
+            provisioned.written.contains(&(0, member.author.clone())),
+            "{provisioned:?}"
+        );
+        let stored: crate::WrappedKey = serde_json::from_slice(&blob.get(&slot).await?)?;
+        assert_eq!(stored.provisioner, founder.signer.verifying_key());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn join_then_provision_considers_the_joined_member() -> TestResult {
         // Feature 5 end-to-end (founder side): a member `join`s by publishing its
@@ -11503,16 +11702,20 @@ mod tests {
         let store = store_over(blob.clone(), SOLO_SEED)?;
         let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
 
-        assert_eq!(
-            store.provision_members().await?,
-            0,
+        assert!(
+            store.provision_members().await?.written.is_empty(),
             "no member keys are published before any join"
         );
         store.join_as_member(&identity).await?;
         assert_eq!(
-            store.provision_members().await?,
+            store.provision_members().await?.written.len(),
             1,
-            "the joined member key is considered for provisioning"
+            "the joined member key is provisioned"
+        );
+        let again = store.provision_members().await?;
+        assert!(
+            again.written.is_empty() && again.kept == 1,
+            "a re-run keeps the accepted wrap: {again:?}"
         );
         Ok(())
     }

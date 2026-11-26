@@ -104,11 +104,13 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
 
-    let considered = store.provision_members().await?;
+    let provisioned = store.provision_members().await?;
     tracing::info!(
-        member_keys = considered,
+        written = provisioned.written.len(),
+        kept = provisioned.kept,
         team = %cfg.team,
-        "provisioned the team key to authorized published member keys"
+        "provisioned the team key to authorized published member keys (kept every wrap a \
+         reader already accepts)"
     );
 
     // The founder holds the team's keys by construction, so this is a place a
