@@ -179,7 +179,8 @@ pub enum MemError {
     //
     /// The team's founder has no published member key, so a new epoch would
     /// be wrapped to every member but the founder, or the founder cannot be
-    /// sent a key share.
+    /// sent a key share. On an open team (no manifest, no pin) the rotating
+    /// author is the founder this names: a rotation there claims the team.
     //
     // A rotation refuses this BEFORE it writes a wrap: the founder reads a
     // rotated epoch only from a wrap addressed to its own member key, so an

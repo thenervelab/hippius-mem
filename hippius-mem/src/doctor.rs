@@ -829,7 +829,8 @@ async fn removed_member_still_holds_key_lines(
 /// that check reports. The founding key also travels without one: `join
 /// --bundle` hands it over as `team_key_hex`, and a member who never joined
 /// appears in no wrap at all. So while the team is still at epoch 0, every
-/// member ever listed can read every note, and a removal that never rotated
+/// member ever listed may hold the key every note is sealed under (if they ever
+/// received it), and a removal that never rotated
 /// (a `remove` before 0.8.1 with nobody joined, or a rotation that failed after
 /// the roster shrank) leaves that open. Silent when any lookup fails.
 async fn unrotated_removal_lines(
@@ -851,8 +852,8 @@ async fn unrotated_removal_lines(
         .map(|ss58| {
             format!(
                 "WARN: {ss58} was removed from the roster, but the team key was never rotated, \
-                 so they still hold the key every note is sealed under; run: hippius-mem \
-                 rotate (then revoke their sub-token in the console)",
+                 so if they ever received it they still hold the key every note is sealed \
+                 under; run: hippius-mem rotate (then revoke their sub-token in the console)",
                 ss58 = ss58.as_str(),
             )
         })

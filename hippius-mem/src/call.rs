@@ -100,7 +100,7 @@ fn parse(args: &[String], value_flags: &[&str], switch_flags: &[&str]) -> anyhow
 }
 
 /// Where the daemon listens and the file holding its token.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct Daemon {
     port: u16,
     token_file: std::path::PathBuf,

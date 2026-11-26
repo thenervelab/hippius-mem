@@ -668,9 +668,11 @@ async fn routed_store(cfg: &Config) -> anyhow::Result<(TeamProfile, MemoryStore)
 /// clear every epoch this founder can see (a stale local ring must not re-mint
 /// an existing epoch), and these entry points read/write full team memory, so
 /// skipping it would silently pin them to the founding epoch (the recorded
-/// `bootstrap_epochs` gotcha). The member key is published before the
-/// membership publish and the rotation, so the new epoch is wrapped to the
-/// founder; stdout says when that happened.
+/// `bootstrap_epochs` gotcha). This machine's member key is published before
+/// the membership publish and the rotation, so the new epoch is wrapped to the
+/// founder; stdout says when that happened. It is published before the
+/// founder check those two make, so a non-founder's attempt also publishes its
+/// member key, which is what `join` does and grants nothing.
 async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     use std::io::Write;
 
@@ -688,8 +690,8 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     if store.ensure_joined(&identity).await? == Joined::Now {
         let _ = writeln!(
             std::io::stdout(),
-            "published this founder's member key (what `hippius-mem join` does), so the new \
-             epoch is wrapped to this founder too"
+            "published this machine's member key (what `hippius-mem join` does), so the new \
+             epoch is wrapped to it too"
         );
     }
 

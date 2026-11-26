@@ -8360,7 +8360,9 @@ impl MemoryStore {
     /// [`adopt_shared_epoch_keys`](Self::adopt_shared_epoch_keys) opens the
     /// founder-signed wrap with it, so the founder never trusts this member for
     /// the key itself. An epoch where the founder already holds a wrap a
-    /// reader accepts is skipped.
+    /// reader accepts is skipped. That includes a founder wrap sealed to a
+    /// mnemonic the founder no longer uses: a wrap does not record its
+    /// recipient key, so this cannot tell it is stale (see `provision_wraps`).
     ///
     /// One LIST of `_keys/`, the manifest and member keys, then up to two wrap
     /// GETs and one PUT per epoch this member holds a wrap of.
@@ -8475,14 +8477,15 @@ impl MemoryStore {
     /// Whatever the LIST, the manifest or member-key reads report.
     pub async fn adopt_shared_epoch_keys(&self, identity: &Identity) -> Result<Vec<u64>, MemError> {
         let held = self.held_epochs();
-        let shares: Vec<(u64, String)> = self
+        let shares: Vec<(u64, String, String)> = self
             .blob
             .list(&key_shares_prefix(&self.team))
             .await?
             .into_iter()
             .filter_map(|key| {
-                let (epoch, _) = parse_key_share_key(&self.team, &key)?;
-                (!held.contains(&epoch)).then_some((epoch, key))
+                let (epoch, holder) = parse_key_share_key(&self.team, &key)?;
+                let holder = holder.to_owned();
+                (!held.contains(&epoch)).then_some((epoch, holder, key))
             })
             .collect();
         if shares.is_empty() {
@@ -8492,13 +8495,10 @@ impl MemoryStore {
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
 
         let mut adopted = Vec::new();
-        for (epoch, share_key) in &shares {
+        for (epoch, holder, share_key) in &shares {
             if adopted.contains(epoch) {
                 continue;
             }
-            let Some((_, holder)) = parse_key_share_key(&self.team, share_key) else {
-                continue;
-            };
             let Some(holder_key) = member_keys.iter().find(|key| key.ss58.as_str() == holder)
             else {
                 continue;
@@ -11890,7 +11890,6 @@ mod tests {
     async fn a_members_provision_is_refused_before_it_writes() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let (_founder, member) = founder_and_member_after_a_rotation(&blob).await?;
-        member.set_current_epoch(1);
         let before = wrap_objects(blob.as_ref()).await?;
 
         for epoch in [0, 1] {

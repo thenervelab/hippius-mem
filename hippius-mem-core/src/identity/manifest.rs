@@ -551,12 +551,12 @@ pub async fn load_manifest(
 /// when it verifies, is bound to `team` and sits at the key its version
 /// designates (the checks [`load_manifest`] applies), and `live.founder_key`
 /// signed it. Manifests a former founder signed before a recovery do not
-/// count. One LIST and a GET per stored manifest; an object that cannot be
-/// fetched or decoded is skipped.
+/// count. One LIST and a GET per stored manifest; an object that is gone by
+/// the time of its GET, or does not decode, is skipped.
 ///
 /// # Errors
 ///
-/// Whatever the LIST reports.
+/// Whatever the LIST or a GET reports, except a missing object.
 pub async fn members_ever_listed(
     blob: &dyn BlobStore,
     team: &str,
@@ -564,8 +564,10 @@ pub async fn members_ever_listed(
 ) -> Result<BTreeSet<Ss58>, MemError> {
     let mut members = live.members.clone();
     for key in blob.list(&manifest_prefix(team)).await? {
-        let Ok(bytes) = blob.get(&key).await else {
-            continue;
+        let bytes = match blob.get(&key).await {
+            Ok(bytes) => bytes,
+            Err(MemError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
         };
         let Ok(manifest) = serde_json::from_slice::<TeamManifest>(&bytes) else {
             continue;

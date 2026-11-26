@@ -35,9 +35,12 @@ Nothing else in the storage format changes.
   epoch whose every founder-signed wrap a member's 0.8.0 `provision` replaced
   cannot be repaired: no wrap the founder signed holds its key any more. See
   docs/TEAMS.md, "Repair an epoch the founder cannot read".
-- **`provision` never replaces a wrap a reader accepts.** A member who
-  re-joined with another mnemonic keeps the wrap to the old key until the next
-  `rotate`.
+- **`provision` never replaces a wrap a reader accepts.** A wrap does not
+  record the x25519 key it is sealed to, so a member (the founder included) who
+  re-joins with another mnemonic cannot read the epochs already wrapped to the
+  old one, and neither `provision` nor `admin share-epoch-keys` can repair that;
+  only epochs minted afterwards reach the new key. Keep using the mnemonic each
+  machine joined with.
 - **Team commands follow the git remote.** On a config with `[[teams]]`
   profiles, run `join`, `provision`, `publish-membership`, `members`, `rotate`,
   `remove`, `recover` and the `admin` commands from a checkout of the team's

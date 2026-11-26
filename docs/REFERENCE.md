@@ -430,8 +430,10 @@ stated plainly.
   `HIPPIUS_MEM_MNEMONIC` loads) to every published, manifest-authorized member key, so a member
   who joins after a rotation reads the older epochs too. Only the founder (or the manifest's recovery key) may run it: anyone else is
   refused before anything is written, because readers refuse a wrap they signed. It never
-  replaces a wrap a reader accepts, so a re-run writes only the missing wraps; a member who
-  re-joined with another mnemonic keeps the old wrap until the next `rotate`. `members` prints the founder-signed membership (one SS58 per line, or a note
+  replaces a wrap a reader accepts, so a re-run writes only the missing wraps. A wrap does not
+  record the x25519 key it is sealed to, so a member (the founder included) who re-joins with
+  another mnemonic cannot read the epochs already wrapped to the old one; only epochs minted
+  afterwards reach the new key. `members` prints the founder-signed membership (one SS58 per line, or a note
   that the team is open).
 - **`recover`** — the founder-key-loss escape hatch: rotate the founder identity itself
   through the team's published recovery key (the seed is prompted on the terminal or read

@@ -664,7 +664,7 @@ async fn a_founder_who_never_joined_reads_the_epoch_its_rotate_mints() -> anyhow
 
     let rotation = founder.run(&["rotate"])?;
     assert!(
-        rotation.contains("published this founder's member key")
+        rotation.contains("published this machine's member key")
             && rotation.contains(&format!("  {founder_address}")),
         "rotate says it published the founder's key and wraps the founder: {rotation}"
     );

@@ -667,7 +667,7 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
 
 /// What a provisioning write did: the wrap slots it wrote and how many it
 /// left alone because they already held a wrap a reader accepts.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct Provisioned {
     /// The `(epoch, member)` slots this call wrote a wrap to.
     pub written: BTreeSet<(u64, Ss58)>,
@@ -688,9 +688,14 @@ pub struct Provisioned {
 ///
 /// Keeping an accepted wrap is the point: a wrap sealed earlier may hold the
 /// only copy of an epoch key some member can open, and replacing it with a
-/// wrap of another key would strand every note sealed under the first. The
-/// cost is that a member who re-joined with another mnemonic keeps the wrap to
-/// the old x25519 key until the next rotation.
+/// wrap of another key would strand every note sealed under the first.
+///
+/// The cost: a member (the founder included) who re-joined with another
+/// mnemonic keeps, for every epoch already wrapped to it, the wrap to its old
+/// x25519 key, and cannot read those epochs' notes with the new mnemonic. A
+/// wrap does not record the x25519 key it is sealed to, so a provisioner cannot
+/// tell such a slot is stale; recording it would change the signed wrap
+/// format. Epochs minted after the re-join are wrapped to the new key.
 ///
 /// # Errors
 ///
