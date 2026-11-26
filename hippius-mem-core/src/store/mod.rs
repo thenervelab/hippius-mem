@@ -29,7 +29,7 @@ pub use copy::copy_store;
 use decoded::DecodedLedger;
 pub use fs::FsBlobStore;
 pub use instrumented::{BlobStats, InstrumentedBlobStore, OpStats};
-pub use keycheck::matches_published_key_check;
+pub use keycheck::{KeyCheckMatch, matches_published_key_check};
 use keycheck::{
     PublishedCheck, WriteMode, key_check_epochs, key_check_key, read_key_check, write_key_check,
 };

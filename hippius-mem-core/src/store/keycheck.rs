@@ -161,8 +161,19 @@ pub(crate) async fn read_key_check(
     }
 }
 
-/// Whether `team_key` matches `team`'s published key check for `epoch`:
-/// `Some(true)` or `Some(false)`, or `None` when no usable check is published.
+/// How a key compares with a team's published key check for one epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCheckMatch {
+    /// The published check is this key's.
+    Matches,
+    /// The published check is another key's.
+    Differs,
+    /// No usable check is published: none, or an object this build cannot
+    /// read.
+    Unpublished,
+}
+
+/// How `team_key` compares with `team`'s published key check for `epoch`.
 ///
 /// For callers without a [`MemoryStore`](crate::MemoryStore), such as `doctor`,
 /// which has the configured key and the bucket and nothing else. A store checks
@@ -177,10 +188,13 @@ pub async fn matches_published_key_check(
     team: &str,
     epoch: u64,
     team_key: &SecretKey,
-) -> Result<Option<bool>, MemError> {
+) -> Result<KeyCheckMatch, MemError> {
     Ok(match read_key_check(blob, team, epoch).await? {
-        PublishedCheck::Value(check) => Some(check == key_check_value(team_key, team, epoch)),
-        PublishedCheck::Absent | PublishedCheck::Unusable => None,
+        PublishedCheck::Value(check) if check == key_check_value(team_key, team, epoch) => {
+            KeyCheckMatch::Matches
+        }
+        PublishedCheck::Value(_) => KeyCheckMatch::Differs,
+        PublishedCheck::Absent | PublishedCheck::Unusable => KeyCheckMatch::Unpublished,
     })
 }
 
@@ -349,7 +363,7 @@ mod tests {
         );
         assert_eq!(
             matches_published_key_check(&blob, "team", 0, &SecretKey::from_bytes([3; 32])).await?,
-            None
+            KeyCheckMatch::Unpublished
         );
         Ok(())
     }

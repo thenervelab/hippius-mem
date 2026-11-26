@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyProbe, MemError, MemoryStore,
-    OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail, derive_identity,
-    find_suppressed_tails, load_manifest, matches_published_key_check, open, probe_create_only,
-    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
+    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyCheckMatch, KeyProbe, MemError,
+    MemoryStore, OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail,
+    derive_identity, find_suppressed_tails, load_manifest, matches_published_key_check, open,
+    probe_create_only, read_heads, read_wrapped_key, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -454,11 +454,6 @@ fn config_for_key_probe(cfg: &Config) -> Config {
     }
 }
 
-/// Whether `doctor` should report that the published check matches this key.
-fn published_check_matches(published: Option<bool>) -> bool {
-    published == Some(true)
-}
-
 /// A store over `profile` for trying the team key on the team's notes: the
 /// production wiring ([`TeamProfile::build_store`]), so the probe applies the
 /// same founder pin and membership filter the server does, but with the
@@ -574,7 +569,7 @@ async fn check_team_key(
         .await
         .context("reading the team-key check failed")?;
 
-    if published == Some(false) {
+    if published == KeyCheckMatch::Differs {
         bail!(
             "the configured team key is not team {team}'s key: it does not match the key check \
              the team published at {team}/_keycheck/{:020}. Writes from this machine are \
@@ -590,7 +585,7 @@ async fn check_team_key(
         // this probe too, so doctor neither fails nor says which side is
         // wrong. Nor after a rotation: epoch 0 is then history, and the probe
         // is all `rotate` cannot change.
-        KeyProbe::FailsToOpen if published == Some(true) => tracing::warn!(
+        KeyProbe::FailsToOpen if published == KeyCheckMatch::Matches => tracing::warn!(
             "WARN: the configured team key matches team {team}'s published key check, but opens \
              fewer than half of epoch 0's oldest notes it tried. Either the check was published \
              from a machine with another key, or those notes were sealed under another key; \
@@ -630,7 +625,7 @@ async fn check_team_key(
         ),
     }
 
-    if published_check_matches(published) {
+    if published == KeyCheckMatch::Matches {
         tracing::info!("the configured team key matches the team's published key check");
     } else {
         tracing::warn!(
@@ -1230,9 +1225,8 @@ mod tests {
         PROBE_KEY_PREFIX, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key,
         config_for_key_probe, create_only_line, head_regression_lines,
         newest_epoch_unopenable_line, offline_report_lines, op_log_integrity_lines,
-        probe_encryption_boundary, probe_live, probe_storage_then_team_key,
-        published_check_matches, quarantine_lines, removed_member_still_holds_key_lines,
-        resolve_profile_for_remote, suppressed_tail_lines,
+        probe_encryption_boundary, probe_live, probe_storage_then_team_key, quarantine_lines,
+        removed_member_still_holds_key_lines, resolve_profile_for_remote, suppressed_tail_lines,
         unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
@@ -1841,13 +1835,6 @@ mod tests {
         assert!(!probe.semantic_embeddings);
         assert!(probe.chain_ws_url.is_none());
         assert_eq!(probe.team, "keep-me", "every other field is preserved");
-    }
-
-    #[test]
-    fn published_check_matches_only_a_confirmed_match() {
-        assert!(published_check_matches(Some(true)));
-        assert!(!published_check_matches(Some(false)));
-        assert!(!published_check_matches(None));
     }
 
     /// `doctor` fails for a key other than the one the team's published key check
