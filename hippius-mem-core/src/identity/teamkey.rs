@@ -989,9 +989,8 @@ fn member_keys_prefix(team: &str) -> String {
 /// The object-key prefix under which `team`'s wrapped team keys live, one
 /// path segment up from [`wrapped_key_key`]'s per-epoch/per-member leaf.
 ///
-/// Shared by [`wrapped_key_key`] (writes) and [`highest_published_epoch`]
-/// (lists) so the two can never disagree about what a wrapped-key object key
-/// looks like.
+/// Shared by [`wrapped_key_key`] (writes) and the listings below so they can
+/// never disagree about what a wrapped-key object key looks like.
 fn wrapped_keys_prefix(team: &str) -> String {
     format!("{team}/_keys/")
 }
@@ -1010,46 +1009,6 @@ fn wrapped_keys_prefix(team: &str) -> String {
 #[must_use]
 pub fn wrapped_key_key(team: &str, epoch: u64, ss58: &str) -> String {
     format!("{}{epoch:020}/{ss58}", wrapped_keys_prefix(team))
-}
-
-/// Parse the `{epoch:020}` segment out of an object key listed under
-/// [`wrapped_keys_prefix`], the exact inverse of the format [`wrapped_key_key`]
-/// writes. `None` for a key that does not match that shape (foreign object
-/// under the prefix, or a listing bug) — the caller skips it rather than
-/// treating it as epoch 0.
-fn parse_epoch_segment(team: &str, object_key: &str) -> Option<u64> {
-    let rest = object_key.strip_prefix(&wrapped_keys_prefix(team))?;
-    let epoch_str = rest.split('/').next()?;
-    epoch_str.parse().ok()
-}
-
-/// The highest team-key epoch this team has actually published a wrapped key
-/// at, by listing the `_keys/` prefix `wrapped_key_key` writes under. `0`
-/// when the team has published nothing (a fresh or pre-provision team).
-///
-/// This is the on-bucket epoch discovery [`crate::MemoryStore::bootstrap_epoch_keys`]'s
-/// docs call out as left to the caller: that method only tries the epochs it is
-/// TOLD about, with no way to see what actually exists on the bucket. This gives
-/// that visibility — in particular to the stale-`max_epoch` warning: a
-/// misconfigured, un-raised `max_epoch` silently hides every note sealed under a
-/// rotated epoch past it, so comparing this against the configured `max_epoch`
-/// is how that gets caught instead of rediscovered.
-///
-/// # Errors
-///
-/// Returns [`MemError::Storage`] if the backend listing fails. A key present
-/// under the prefix that does not parse as `{epoch:020}/...` is skipped, not
-/// fatal (mirrors [`load_member_keys`]'s tolerance of a foreign object under
-/// its own prefix).
-pub async fn highest_published_epoch(blob: &dyn BlobStore, team: &str) -> Result<u64, MemError> {
-    let prefix = wrapped_keys_prefix(team);
-    let keys = blob.list(&prefix).await?;
-
-    Ok(keys
-        .iter()
-        .filter_map(|key| parse_epoch_segment(team, key))
-        .max()
-        .unwrap_or(0))
 }
 
 /// The wrap keys of `team` at epochs above `floor`, newest epoch first, from
@@ -1185,9 +1144,9 @@ fn wrapped_key_epoch_prefix(team: &str, epoch: u64) -> String {
 /// with [`MemError::NothingToRotate`] because no remaining member has
 /// published a [`MemberKey`] yet). Comparing this set against the live
 /// [`crate::TeamManifest`]'s members at the CURRENT epoch (the one
-/// [`highest_published_epoch`] reports) is exactly the check `hippius-mem
-/// doctor` runs to catch a half-completed removal that a later run never
-/// finished.
+/// [`crate::MemoryStore::newest_provisioned_epoch`] reports) is exactly the
+/// check `hippius-mem doctor` runs to catch a half-completed removal that a
+/// later run never finished.
 ///
 /// # Errors
 ///
@@ -2586,44 +2545,6 @@ mod tests {
              correlated with its input",
             floor = MEAN_FLOOR * PAIRS,
         );
-    }
-
-    #[tokio::test]
-    async fn highest_published_epoch_reads_the_epoch_objects() -> Result<(), MemError> {
-        let blob = MemoryBlobStore::new();
-
-        // A team with no wrapped-key objects at all has published nothing.
-        assert_eq!(
-            highest_published_epoch(&blob, TEAM).await?,
-            0,
-            "an empty store reports epoch 0"
-        );
-
-        // Publish wrapped keys for epochs 0, 1, 2 via the existing teamkey
-        // publish path (`provision_team_key`), exactly how a real rotation
-        // populates the `_keys/` prefix.
-        let member = member_key_for(PHRASE_A)?;
-        let provisioner = test_provisioner();
-        for epoch in 0..=2u64 {
-            let team_key = SecretKey::from_bytes([u8::try_from(epoch).unwrap_or(0); 32]);
-            provision_team_key(
-                &blob,
-                TEAM,
-                &team_key,
-                epoch,
-                std::slice::from_ref(&member),
-                None,
-                &provisioner,
-            )
-            .await?;
-        }
-
-        assert_eq!(
-            highest_published_epoch(&blob, TEAM).await?,
-            2,
-            "the highest epoch actually published on the bucket must be reported"
-        );
-        Ok(())
     }
 
     #[tokio::test]
