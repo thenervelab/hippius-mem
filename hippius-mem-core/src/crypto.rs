@@ -266,6 +266,50 @@ mod tests {
     // seal and open agree on the authenticated identity.
     const AAD: &[u8] = b"team/global/mem_01J/ver_1";
 
+    /// A known answer, computed outside this crate with a separate BLAKE3
+    /// implementation (single chunk, checked against BLAKE3's published hash
+    /// of the empty input): `derive_key` of the token under the proof's
+    /// context, then `keyed_hash` of the nonce. Pins the construction, so a
+    /// change to it (context string, which input is the key) breaks the
+    /// challenge between an old client and a new daemon, and fails here.
+    #[test]
+    fn token_proof_matches_its_known_answer() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            token_proof(TOKEN, "n0nce"),
+            "dd0a81180830398f7ffbaf6d0092cb919b5f4d3836b8655fe79c54877e1d3fbe"
+        );
+        assert_eq!(
+            token_proof(TOKEN, "01JABCDEFGHJKMNPQRSTVWXYZ0"),
+            "71d2fa8f32f4f2afb2174de6e05a2e0bf8da22be1fc2750edd83ff60683ab65a"
+        );
+    }
+
+    /// The proof is 64 lowercase hex characters, differs per token and per
+    /// nonce, and never contains the token, so a listener that relays or
+    /// replays one learns neither the token nor the proof for a fresh nonce.
+    #[test]
+    fn token_proof_binds_token_and_nonce_and_hides_the_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let proof = token_proof(token, "nonce-a");
+
+        assert_eq!(proof.len(), 64);
+        assert!(
+            proof
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{proof}"
+        );
+        assert!(!proof.contains(token));
+        assert_ne!(proof, token_proof(token, "nonce-b"), "per nonce");
+        assert_ne!(
+            proof,
+            token_proof("fedcba9876543210fedcba9876543210", "nonce-a"),
+            "per token"
+        );
+        assert_eq!(proof, token_proof(token, "nonce-a"), "deterministic");
+    }
+
     proptest! {
         #[test]
         fn seal_open_round_trips(
