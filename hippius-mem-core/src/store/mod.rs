@@ -1314,8 +1314,9 @@ pub struct MemoryStore {
     // joined). While any is here the index is incomplete, so no checkpoint is
     // written from it. An entry is removed when the note later decodes; one
     // whose note is forgotten first stays until the process exits, which only
-    // costs this process its checkpoint writes.
-    keyless: Mutex<BTreeSet<NoteId>>,
+    // costs this process its checkpoint writes. Each note maps to the epoch it
+    // is sealed under, so `get` and the tool warnings can name it.
+    keyless: Mutex<BTreeMap<NoteId, u64>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -1472,7 +1473,7 @@ impl MemoryStore {
             create_only: Mutex::new(None),
             synced_tip_revision: Mutex::new(None),
             undecodable: Mutex::new(BTreeMap::new()),
-            keyless: Mutex::new(BTreeSet::new()),
+            keyless: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -3465,6 +3466,19 @@ impl MemoryStore {
             .len()
     }
 
+    /// How many notes the index currently leaves out because this process
+    /// holds no key for the epoch they are sealed under, by epoch. Empty when
+    /// every synced note decoded or failed for another reason. Reads a map
+    /// this process keeps: no I/O.
+    pub fn keyless_notes(&self) -> BTreeMap<u64, usize> {
+        let keyless = self.keyless.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut by_epoch = BTreeMap::new();
+        for epoch in keyless.values() {
+            *by_epoch.entry(*epoch).or_insert(0) += 1;
+        }
+        by_epoch
+    }
+
     /// Whether the verdict held for `epoch` is "no published check, and the
     /// key opened fewer than half of the notes tried". No I/O.
     fn key_opened_few_notes(&self, epoch: u64) -> bool {
@@ -4019,7 +4033,8 @@ impl MemoryStore {
     ///
     /// Returns [`MemError::NotFound`] if `id` is not indexed,
     /// [`MemError::KeyUnavailable`] if the note's key epoch is not in this store's
-    /// key-ring (this member was never provisioned that epoch),
+    /// key-ring (this member was never provisioned that epoch), including a note
+    /// the last sync left out of the index for that reason,
     /// [`MemError::Integrity`] if the fetched ciphertext does not match the
     /// indexed content hash, or the last sync left the note out because its
     /// ciphertext failed a check, [`MemError::Crypto`] if decryption or UTF-8
@@ -4031,19 +4046,29 @@ impl MemoryStore {
     /// the caller asked for this specific note and cannot be served it.
     pub async fn hydrate(&self, id: NoteId) -> Result<Note, MemError> {
         let Some(located) = self.index.locate(id)? else {
-            // A note the last sync left out because its ciphertext was bad exists;
-            // calling it "not found" would invite re-creating it.
+            // A note the last sync left out because its ciphertext was bad, or
+            // because this process holds no key for its epoch, exists; calling it
+            // "not found" would invite re-creating it.
             let undecodable = self
                 .undecodable
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get(&id)
                 .copied();
-            return Err(match undecodable {
-                Some(reason) => MemError::Integrity {
+            if let Some(reason) = undecodable {
+                return Err(MemError::Integrity {
                     id: id.to_string(),
                     reason,
-                },
+                });
+            }
+            let keyless = self
+                .keyless
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&id)
+                .copied();
+            return Err(match keyless {
+                Some(epoch) => MemError::KeyUnavailable { epoch },
                 None => MemError::NotFound { id: id.to_string() },
             });
         };
@@ -7618,8 +7643,8 @@ impl MemoryStore {
     fn record_decode_outcome(&self, note_id: NoteId, decoded: &Result<IndexRecord, MemError>) {
         {
             let mut keyless = self.keyless.lock().unwrap_or_else(PoisonError::into_inner);
-            if matches!(decoded, Err(MemError::KeyUnavailable { .. })) {
-                keyless.insert(note_id);
+            if let Err(MemError::KeyUnavailable { epoch }) = decoded {
+                keyless.insert(note_id, *epoch);
             } else {
                 keyless.remove(&note_id);
             }
@@ -10985,6 +11010,38 @@ mod tests {
             blob.get(checkpoint).await?,
             written,
             "the team's checkpoint is kept"
+        );
+        Ok(())
+    }
+
+    /// A process that holds no key for a note's epoch reports that, by epoch,
+    /// instead of "not found": `get` names the epoch and `keyless_notes` counts
+    /// the note. Both used to read as if the note did not exist, which invites
+    /// an agent to write it again.
+    #[tokio::test]
+    async fn a_note_under_an_epoch_this_process_lacks_reads_as_key_unavailable() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .join_as_member(&crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        let sealed_at_1 = founder.remember(numbered_input(1)).await?;
+        founder.remember(numbered_input(2)).await?;
+
+        let lagging = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        lagging.sync().await?;
+        assert_eq!(lagging.keyless_notes(), BTreeMap::from([(1, 2)]));
+        let refused = lagging.get(sealed_at_1).await;
+        assert!(
+            matches!(refused, Err(MemError::KeyUnavailable { epoch: 1 })),
+            "{refused:?}"
+        );
+        let unknown = lagging.get(NoteId::new()).await;
+        assert!(
+            matches!(unknown, Err(MemError::NotFound { .. })),
+            "{unknown:?}"
         );
         Ok(())
     }

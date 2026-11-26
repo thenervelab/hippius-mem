@@ -397,14 +397,36 @@ async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyho
     );
 
     let mut with_mnemonic = Server::spawn(&member, Mnemonic::Set)?;
-    let (refused, text) = with_mnemonic.remember("sealed under the rotated key")?;
-    assert!(!refused, "a server with the mnemonic loads epoch 1: {text}");
+    let sealed_at_1 = with_mnemonic.remember_id("sealed under the rotated key")?;
     drop(with_mnemonic);
     assert_eq!(
         key_epochs_of(live.raw_bucket(), &member.address()?).await?,
         [0, 1],
         "the member's write after the removal is sealed under the rotated key"
     );
+
+    // A process without the epoch-1 key says the note exists and why it
+    // cannot open it, instead of "not found".
+    let mut daemon_like = Server::spawn(&member, Mnemonic::Unset)?;
+    let (failed, text) = daemon_like.call("get", &json!({ "id": sealed_at_1 }))?;
+    assert!(
+        failed && text.contains("no team key for epoch 1"),
+        "get names the missing epoch: {text}"
+    );
+    for (tool, arguments) in [
+        ("refresh", json!({})),
+        (
+            "recall",
+            json!({ "text": "sealed under the rotated key", "repo": "global" }),
+        ),
+    ] {
+        let (failed, text) = daemon_like.call(tool, &arguments)?;
+        assert!(
+            !failed && text.contains("keyless_notes") && text.contains("epoch 1"),
+            "{tool} warns that notes are left out: {text}"
+        );
+    }
+    drop(daemon_like);
 
     clear_team(&live.raw_bucket(), TEAM).await;
     Ok(())

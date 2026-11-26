@@ -8,7 +8,7 @@
 //! standing up a client<->server round-trip.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -1235,9 +1235,7 @@ impl MemoryServer {
             total_matched: result.total_matched,
             pointers,
             semantic: self.store.is_semantic(),
-            warnings: undecodable_warning(self.store.undecodable_notes())
-                .into_iter()
-                .collect(),
+            warnings: index_warnings(&self.store),
         })
     }
 
@@ -1247,9 +1245,7 @@ impl MemoryServer {
         let indexed = self.store.sync().await?;
         Ok(RefreshOutput {
             indexed,
-            warnings: undecodable_warning(self.store.undecodable_notes())
-                .into_iter()
-                .collect(),
+            warnings: index_warnings(&self.store),
         })
     }
 
@@ -1900,7 +1896,8 @@ fn note_to_dto(note: &Note, version: String) -> NoteDto {
 #[derive(Debug, Serialize)]
 struct Warning {
     /// Stable, snake-case: `unserialized_write`, `tip_not_recorded`,
-    /// `head_not_published`, `team_key_unverified` or `undecodable_notes`.
+    /// `head_not_published`, `team_key_unverified`, `undecodable_notes` or
+    /// `keyless_notes`.
     code: &'static str,
     /// What went degraded and what to do about it.
     message: String,
@@ -1946,6 +1943,39 @@ fn degradation_warning(found: Degradation) -> Warning {
         code,
         message: message.to_owned(),
     }
+}
+
+/// The warnings for notes the index leaves out: undecodable ones, and ones
+/// sealed under an epoch this process holds no key for. Reported on `recall`
+/// and `refresh`, which read the index.
+fn index_warnings(store: &MemoryStore) -> Vec<Warning> {
+    undecodable_warning(store.undecodable_notes())
+        .into_iter()
+        .chain(keyless_warning(&store.keyless_notes()))
+        .collect()
+}
+
+/// The warning for notes left out of the index because this process holds no
+/// key for their epoch, if there are any.
+fn keyless_warning(keyless_notes: &BTreeMap<u64, usize>) -> Option<Warning> {
+    let notes: usize = keyless_notes.values().sum();
+    (notes > 0).then(|| {
+        let epochs = keyless_notes
+            .keys()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Warning {
+            code: "keyless_notes",
+            message: format!(
+                "{notes} note(s) are left out of recall because this process holds no team key \
+                 for the epoch they are sealed under (epoch {epochs}); they exist, so do not \
+                 re-create them. Restart this server with HIPPIUS_MEM_MNEMONIC set (the `serve` \
+                 daemon runs without it and cannot load rotated keys), and run `hippius-mem \
+                 doctor`, which names the fix"
+            ),
+        }
+    })
 }
 
 /// The warning for notes left out of the index as undecodable, if there are

@@ -649,11 +649,14 @@ Every write tool (`remember`, `edit`, `forget`, `link`, `redact`) adds a `warnin
 (an update that failed after the op was durable), or `team_key_unverified` (no key check is
 published and this machine's key opened fewer than half of the notes it tried). `recall` and
 `refresh` add `undecodable_notes` when notes are left out of recall because their ciphertext
-failed its integrity check. The key is absent when there is nothing to report. A write the server
+failed its integrity check, and `keyless_notes` when notes are left out because this process
+holds no key for the epoch they are sealed under (the `serve` daemon after a rotation, or a
+member the founder has not provisioned yet); its message names the epochs. The key is absent when there is nothing to report. A write the server
 refuses (another process holding the writer lock for over 30 s, a team key that does not match
 the published check, or an append the gateway did not confirm) fails with an error instead; only
 the last may have stored the note, and the error says not to re-issue it. `get` on a note whose stored ciphertext was altered, replaced or sealed under
-another key fails with "failed its integrity check", not "not found".
+another key fails with "failed its integrity check", not "not found", and `get` on a note sealed
+under an epoch this process holds no key for fails with "no team key for epoch N".
 
 > [!TIP]
 > **The `recall`/`get` split is the context-efficiency mechanism:** an agent searches

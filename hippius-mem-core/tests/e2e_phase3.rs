@@ -702,9 +702,10 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
         !recall_surfaces(&bob, "post-rotation rotated epoch", &repo, post_rotation)?,
         "the post-rotation note never surfaces for the removed member"
     );
+    let hydrated = bob.get(post_rotation).await;
     assert!(
-        matches!(bob.get(post_rotation).await, Err(MemError::NotFound { .. })),
-        "the removed member cannot hydrate a note written after rotation"
+        matches!(hydrated, Err(MemError::KeyUnavailable { epoch: 1 })),
+        "the removed member cannot hydrate a note written after rotation: {hydrated:?}"
     );
 
     // Alice, still a member, bootstraps the rotated epoch from the bucket with
@@ -828,8 +829,11 @@ async fn remove_seam_shrinks_the_manifest_and_excludes_the_removed_member() -> R
         "the removed member's sync skips the post-removal note"
     );
     assert!(
-        matches!(bob.get(post_removal).await, Err(MemError::NotFound { .. })),
-        "the removed member cannot read a note written after removal"
+        matches!(
+            bob.get(post_removal).await,
+            Err(MemError::KeyUnavailable { epoch: 1 })
+        ),
+        "the removed member cannot read a note written after removal, and is told why"
     );
     let alice = store(
         &bucket,
