@@ -49,9 +49,14 @@ read. What that does and does not buy you, stated plainly.
 - **After a rotation, a process that cannot load the new key stops writing.** A process
   loads a rotated epoch's key only with `HIPPIUS_MEM_MNEMONIC` set (the wrap is opened
   with the mnemonic's x25519 key). The `serve` daemon the installer wires runs without it,
-  so after a `rotate` or `remove` it refuses every write (`EpochSuperseded`, naming the
-  new epoch) and does not show notes sealed under the new epoch, until it can load the
-  key. It never seals a note under the older key a removed member holds. Its writes
+  so after a `rotate` or `remove` it refuses every note write (`remember`, `edit`:
+  `EpochSuperseded`, naming the new epoch; `forget`, `link` and `redact` seal no body and
+  still run) and does not show notes sealed under the new epoch (`get` says "no team key
+  for epoch N", `recall` and `refresh` carry a `keyless_notes` warning), until it can load
+  the key. Every process, daemon or not, lists the team's wraps before it seals each note
+  body, so it does not seal a note under the older key a removed member holds once the new
+  epoch's wraps are in the bucket; the one exception is a write whose listing ran just
+  before those wraps landed. Its writes
   resume only on a server started with the mnemonic; deriving the encryption key from
   the per-machine `author_seed_hex` instead is a planned format change, not in this
   release. An epoch counts as rotated only when a wrap at it is signed by the founder or

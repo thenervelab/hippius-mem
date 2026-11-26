@@ -311,8 +311,17 @@ impl Drop for Server {
 
 /// The key epoch of each of `author`'s ops on the bucket, in Lamport order.
 async fn key_epochs_of(bucket: S3BlobStore, author: &str) -> anyhow::Result<Vec<u64>> {
+    key_epochs_of_team(bucket, TEAM, author).await
+}
+
+/// [`key_epochs_of`] for `team`.
+async fn key_epochs_of_team(
+    bucket: S3BlobStore,
+    team: &str,
+    author: &str,
+) -> anyhow::Result<Vec<u64>> {
     let blob: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(bucket);
-    let ops = OpLogStore::new(blob).read_all(TEAM).await?;
+    let ops = OpLogStore::new(blob).read_all(team).await?;
     let mut ops: Vec<_> = ops
         .iter()
         .filter(|op| op.author.as_str() == author)
@@ -767,5 +776,67 @@ async fn a_founder_stranded_by_an_older_rotation_recovers_the_epoch() -> anyhow:
     );
 
     clear_team(&bucket, STRANDED_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the live-session removal test owns.
+const SESSION_TEAM: &str = "rw-live-session-live";
+
+/// A member's session that wrote a moment before the founder removed someone
+/// is refused its next write, after `refresh` and without one, instead of
+/// sealing it under the key the removed member holds. The session used to
+/// keep sealing under the old key for a minute after its last write.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_session_that_just_wrote_is_refused_after_a_removal() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, SESSION_TEAM).await;
+
+    let founder = Machine::new(
+        81,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        82,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let removed = Machine::new(
+        83,
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member, &removed] {
+        machine.write_config(&live, SESSION_TEAM, &founder_address)?;
+        machine.run(&["join"])?;
+    }
+    let roster = [member.address()?, removed.address()?].join(",");
+    founder.run(&["publish-membership", "--members", &roster])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    session.remember_id("written before the removal")?;
+    founder.run(&["remove", &removed.address()?])?;
+
+    let (refused, text) = session.remember("written right after the removal")?;
+    assert!(
+        refused && text.contains("rotated its key to epoch 1"),
+        "the session refuses at once: {text}"
+    );
+    let (failed, text) = session.call("refresh", &json!({}))?;
+    assert!(!failed, "{text}");
+    let (refused, text) = session.remember("written after a refresh")?;
+    assert!(
+        refused && text.contains("rotated its key to epoch 1"),
+        "the session refuses after a refresh: {text}"
+    );
+    drop(session);
+    assert_eq!(
+        key_epochs_of_team(live.raw_bucket(), SESSION_TEAM, &member.address()?).await?,
+        [0],
+        "nothing was sealed after the removal"
+    );
+
+    clear_team(&bucket, SESSION_TEAM).await;
     Ok(())
 }

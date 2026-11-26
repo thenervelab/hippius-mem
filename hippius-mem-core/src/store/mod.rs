@@ -1008,17 +1008,6 @@ const _: () = assert!(2 * PENDING_OP_MAX_AGE.as_secs() <= MIN_GC_GRACE.as_secs()
 /// clock difference between that machine and the one running `gc`.
 pub const MIN_GC_GRACE: Duration = Duration::from_hours(2);
 
-/// What this process found when it last looked for an epoch newer than the
-/// one it seals under, and when.
-#[derive(Debug, Clone, Copy)]
-struct KnownNewestEpoch {
-    /// The epoch the lookup was made above: the one writes sealed under.
-    sealing: u64,
-    /// The newest epoch above `sealing` the founder provisioned, if any.
-    newer: Option<u64>,
-    at: Instant,
-}
-
 /// How long a verdict is used before the published check is read again.
 /// Bounds how long a running server keeps writing after a check is published
 /// or replaced (`--replace` can turn a match into a mismatch), or keeps
@@ -1288,10 +1277,6 @@ pub struct MemoryStore {
     // the team's published key check (see `keycheck`), and when. Re-read after
     // `KEY_CHECK_RECHECK`.
     key_checks: Mutex<BTreeMap<u64, KnownKeyCheck>>,
-    // Whether the founder provisioned an epoch newer than the one writes seal
-    // under, as last looked up, and when. Looked up again after the same
-    // interval as `key_checks`.
-    newest_epoch: Mutex<Option<KnownNewestEpoch>>,
     // How long a verdict is used: `KEY_CHECK_RECHECK` outside tests.
     key_check_recheck: Duration,
     // Age past which an unconfirmed op is dropped, not completed:
@@ -1478,7 +1463,6 @@ impl MemoryStore {
             missing_lock_warned: std::sync::atomic::AtomicBool::new(false),
             // No epoch checked yet; the first write or `check_team_key` fills it.
             key_checks: Mutex::new(BTreeMap::new()),
-            newest_epoch: Mutex::new(None),
             key_check_recheck: KEY_CHECK_RECHECK,
             pending_op_max_age: PENDING_OP_MAX_AGE,
             create_only: Mutex::new(None),
@@ -3765,18 +3749,22 @@ impl MemoryStore {
     /// Only note bodies are fenced: an op about an older note carries nothing a
     /// holder of the older key lacks. A checkpoint of an index that lacks the
     /// newer epoch's notes is not written at all (see
-    /// [`maybe_persist_checkpoint`](Self::maybe_persist_checkpoint)). Uses the answer this process holds,
-    /// looked up again (one LIST of `_keys/`, see
-    /// [`newest_provisioned_epoch`](Self::newest_provisioned_epoch)) when older
-    /// than [`KEY_CHECK_RECHECK`]. A lookup that fails keeps the answer held;
-    /// only a first lookup that fails fails the write.
+    /// [`maybe_persist_checkpoint`](Self::maybe_persist_checkpoint)).
+    ///
+    /// Looks every time (one LIST of `_keys/`, see
+    /// [`newest_provisioned_epoch`](Self::newest_provisioned_epoch)), before
+    /// the body is sealed, and fails the write when the lookup fails. An answer
+    /// kept for a minute used to let a process that had just written keep
+    /// sealing under the older key for up to that minute after a rotation, a
+    /// `refresh` included. What remains: a rotation whose wraps land after this
+    /// LIST can still follow one write sealed under the older key.
     ///
     /// # Errors
     ///
-    /// [`MemError::EpochSuperseded`] when a newer epoch exists, or whatever a
-    /// first lookup reports.
+    /// [`MemError::EpochSuperseded`] when a newer epoch exists, or whatever the
+    /// lookup reports.
     async fn require_newest_epoch(&self, epoch: u64) -> Result<(), MemError> {
-        match self.newer_provisioned_epoch(epoch).await? {
+        match self.newest_provisioned_epoch(epoch).await? {
             Some(newest) => Err(MemError::EpochSuperseded {
                 team: self.team.clone(),
                 epoch,
@@ -3819,38 +3807,6 @@ impl MemoryStore {
             }),
             TeamKeyCheck::Matches | TeamKeyCheck::Unpublished { .. } => Ok(()),
         }
-    }
-
-    /// The newest epoch above `epoch` the founder provisioned, from the answer
-    /// this process holds when it is fresh, else looked up again and kept.
-    async fn newer_provisioned_epoch(&self, epoch: u64) -> Result<Option<u64>, MemError> {
-        let held = self
-            .newest_epoch
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .filter(|held| held.sealing == epoch);
-        if let Some(held) = held
-            && held.at.elapsed() < self.key_check_recheck
-        {
-            return Ok(held.newer);
-        }
-        let newer = match (self.newest_provisioned_epoch(epoch).await, held) {
-            (Ok(newer), _) => newer,
-            (Err(err), Some(held)) => {
-                tracing::warn!(epoch, error = %err, "could not look for a newer team-key epoch; keeping the last answer");
-                held.newer
-            }
-            (Err(err), None) => return Err(err),
-        };
-        *self
-            .newest_epoch
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(KnownNewestEpoch {
-            sealing: epoch,
-            newer,
-            at: Instant::now(),
-        });
-        Ok(newer)
     }
 
     /// Read `epoch`'s published check again and keep the result. With none
@@ -11246,6 +11202,37 @@ mod tests {
             blob.get(checkpoint).await?,
             written,
             "the team's checkpoint is kept"
+        );
+        Ok(())
+    }
+
+    /// A process that wrote a moment ago is refused its next write as soon as
+    /// the founder rotates: it looks for a newer epoch before every body seal.
+    /// It used to keep its answer for a minute, so a session that had just
+    /// written sealed its next notes under the key a removed member holds.
+    #[tokio::test]
+    async fn a_write_right_after_a_rotation_is_refused() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .join_as_member(&crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        member.remember(numbered_input(1)).await?;
+
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        let refused = member.remember(numbered_input(2)).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MemError::EpochSuperseded {
+                    epoch: 0,
+                    newest: 1,
+                    ..
+                })
+            ),
+            "{refused:?}"
         );
         Ok(())
     }
@@ -23637,20 +23624,24 @@ mod tests {
         }
     }
 
-    /// Writes within `KEY_CHECK_RECHECK` of each other look for a newer epoch
-    /// once, not once per write: the lookup is a LIST of every wrapped key.
+    /// Each write looks for a newer epoch with exactly one LIST of the wrapped
+    /// keys: the fence costs one request per write, never more.
     #[tokio::test]
-    async fn writes_close_together_look_for_a_newer_epoch_once() -> TestResult {
+    async fn each_write_looks_for_a_newer_epoch_once() -> TestResult {
         let bucket = Arc::new(KeyListCountingBlob::default());
         let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
         let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
         store.remember(numbered_input(0)).await?;
-        let after_first = bucket.key_lists.load(Ordering::SeqCst);
-        assert!(after_first > 0, "the first write looks");
 
-        store.remember(numbered_input(1)).await?;
-        store.remember(numbered_input(2)).await?;
-        assert_eq!(bucket.key_lists.load(Ordering::SeqCst), after_first);
+        for n in 1..=2 {
+            let before = bucket.key_lists.load(Ordering::SeqCst);
+            store.remember(numbered_input(n)).await?;
+            assert_eq!(
+                bucket.key_lists.load(Ordering::SeqCst),
+                before + 1,
+                "write {n}"
+            );
+        }
         Ok(())
     }
 

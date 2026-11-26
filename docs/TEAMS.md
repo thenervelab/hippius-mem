@@ -266,7 +266,7 @@ sub-token revocation, is the manual step above):
    member restarts their MCP server with `HIPPIUS_MEM_MNEMONIC` set, which loads the
    new epoch's key. No config edit is needed: startup loads keys up to the newest epoch
    the founder provisioned. A server that cannot load the new key, such as the `serve`
-   daemon (it runs without the mnemonic), refuses every write with an error naming the
+   daemon (it runs without the mnemonic), refuses every note write with an error naming the
    new epoch instead of sealing notes under the old key the removed member holds.
 
 `remove` and `rotate` require `HIPPIUS_MEM_MNEMONIC` and refuse before writing anything
