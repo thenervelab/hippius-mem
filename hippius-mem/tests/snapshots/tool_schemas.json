@@ -249,7 +249,7 @@
     "name": "refresh"
   },
   {
-    "description": "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it has none. Returns the new note id and the `repo` it was written to.",
+    "description": "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it was launched outside one, and the shared loopback daemon refuses it. Returns the new note id and the `repo` it was written to.",
     "input_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -269,7 +269,7 @@
         },
         "repo": {
           "default": null,
-          "description": "Repository scope: a repo name, or `\"global\"` for a team-wide note. Omitted,\nthe note goes to the repository this server was launched in, or to\nteam-global when it has none (the shared daemon). The result names the\nscope written.",
+          "description": "Repository scope: a repo name, or `\"global\"` for a team-wide note. Omitted,\nthe note goes to the repository this server was launched in, or to\nteam-global when it was launched outside one; the shared loopback daemon\nrefuses an omitted `repo`. The result names the scope written.",
           "type": [
             "string",
             "null"

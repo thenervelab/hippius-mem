@@ -136,8 +136,8 @@ struct RememberParams {
     note_type: String,
     /// Repository scope: a repo name, or `"global"` for a team-wide note. Omitted,
     /// the note goes to the repository this server was launched in, or to
-    /// team-global when it has none (the shared daemon). The result names the
-    /// scope written.
+    /// team-global when it was launched outside one; the shared loopback daemon
+    /// refuses an omitted `repo`. The result names the scope written.
     #[serde(default)]
     repo: Option<String>,
     /// Free-form tags indexed alongside the summary. A tag `path:<file or
@@ -900,7 +900,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it has none. Returns the new note id and the `repo` it was written to."
+        description = "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it was launched outside one, and the shared loopback daemon refuses it. Returns the new note id and the `repo` it was written to."
     )]
     async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> CallToolResult {
         into_call_result(self.logic_remember(params).await)
@@ -3610,7 +3610,7 @@ mod tests {
     }
 
     /// An explicit `"global"` still writes a team-wide note on a bound server,
-    /// and an unbound server (the shared daemon) keeps writing team-wide and
+    /// and an unbound server keeps writing team-wide and
     /// says so in its result.
     #[tokio::test]
     async fn remember_names_the_scope_it_wrote_to() {
