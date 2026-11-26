@@ -551,8 +551,9 @@ key.
 
 - Who publishes decides what the check is worth, so no client publishes one on its own
   judgment. `rotate` (and `remove`) publish the new epoch's check, `provision` publishes the
-  founder's epochs, and `hippius-mem admin keycheck publish` publishes it for a team that
-  predates the check. Each publish first tries its key on the epoch's 16 oldest notes (a
+  founder's epochs, `upgrade` publishes the trial vault's (its one user sealed every note it
+  copies), and `hippius-mem admin keycheck publish` publishes it for a team that predates the
+  check. Each publish first tries its key on the epoch's 16 oldest notes (a
   missing or altered blob counts for neither side) and publishes nothing when most of those it
   could read fail to open (`--replace` included), because that check
   would refuse the clients whose key those notes were sealed under; an epoch with no notes is

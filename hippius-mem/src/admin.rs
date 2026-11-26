@@ -114,21 +114,10 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     );
 
     // The founder holds the team's keys by construction, so this is a place a
-    // team-key check can be published without trusting anyone's judgment. Only
-    // where none exists: a check that disagrees is reported, never replaced.
-    // Best effort, like `rotate`'s: the members are provisioned already, and the
+    // team-key check can be published without trusting anyone's judgment. Best
+    // effort, like `rotate`'s: the members are provisioned already, and the
     // recovery key below must still be generated.
-    match publish_key_checks(&store, PublishKeyCheck::IfAbsent).await {
-        Ok(unpublished) => {
-            for (epochs, message) in provision_unpublished_warnings(&unpublished) {
-                tracing::warn!(epochs = ?epochs, "{message}");
-            }
-        }
-        Err(err) => tracing::warn!(
-            error = %format!("{err:#}"),
-            "could not publish the team-key check; run `hippius-mem admin keycheck publish`"
-        ),
-    }
+    publish_founder_key_checks(&store).await;
 
     if generate_recovery {
         generate_and_print_recovery_key(&store, store.team()).await?;
@@ -1339,6 +1328,25 @@ pub(crate) async fn publish_key_checks(
         }
     }
     Ok(unpublished)
+}
+
+/// Publish the team-key check of every epoch `store` holds a key for where
+/// none exists, from a machine that holds the team's keys by construction (the
+/// founder's `provision`, or `upgrade` of the vault's only user). A check that
+/// disagrees is reported, never replaced. Best effort: every failure is a
+/// warning naming `admin keycheck publish`.
+pub(crate) async fn publish_founder_key_checks(store: &MemoryStore) {
+    match publish_key_checks(store, PublishKeyCheck::IfAbsent).await {
+        Ok(unpublished) => {
+            for (epochs, message) in provision_unpublished_warnings(&unpublished) {
+                tracing::warn!(epochs = ?epochs, "{message}");
+            }
+        }
+        Err(err) => tracing::warn!(
+            error = %format!("{err:#}"),
+            "could not publish the team-key check; run `hippius-mem admin keycheck publish`"
+        ),
+    }
 }
 
 /// Warning lines `provision` emits for epochs it published no check for.

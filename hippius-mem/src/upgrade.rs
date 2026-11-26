@@ -692,8 +692,9 @@ fn reload_config(path: &Path) -> anyhow::Result<Config> {
 /// probe against this EXACT config — never `doctor::run(&[])`, which
 /// re-resolves its own config from the environment/cwd (see the module
 /// docs) — then a `refresh`-equivalent sync so the local index rebuilds
-/// from the bucket. The sync skips a note it cannot decode with a warning,
-/// so it is not proof that every copied note opens.
+/// from the bucket, then publish the team-key check where none exists. The
+/// sync skips a note it cannot decode with a warning, so it is not proof that
+/// every copied note opens.
 ///
 /// # Errors
 ///
@@ -712,6 +713,11 @@ async fn finish_upgrade(cfg: &Config) -> anyhow::Result<()> {
         .sync()
         .await
         .context("syncing the index from the new bucket failed")?;
+    // The trial vault had one user, whose key sealed every copied note, so the
+    // upgrader is the team's founder and may publish the check, as the
+    // founder's `provision` does. Without it no later client can tell its key
+    // is the team's before it writes.
+    crate::admin::publish_founder_key_checks(&store).await;
     Ok(())
 }
 

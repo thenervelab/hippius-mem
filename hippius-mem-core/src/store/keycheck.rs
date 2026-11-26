@@ -25,6 +25,8 @@
 //! - `rotate` (and `remove`, which rotates), for the new epoch: the rotating
 //!   founder generated that key;
 //! - `provision`, run by the founder, for every epoch the founder holds;
+//! - `upgrade`, for the trial vault's epochs: the vault had one user, whose key
+//!   sealed every note it copies;
 //! - `hippius-mem admin keycheck publish`, run by an operator, for a team that
 //!   predates the check, or with `--replace` to recover from a wrong one.
 //!
