@@ -291,13 +291,13 @@ pub(crate) struct Config {
     /// dirty git-tracked instruction file refuses the whole provisioning in
     /// favor of the nudge (see `setup::provision_on_serve`).
     pub(crate) auto_init: bool,
-    /// Lowest ceiling for the team-key epochs bootstrapped from the bucket at
-    /// startup, and a floor for the next rotation's epoch.
+    /// The range of team-key epochs startup tries when it cannot list this
+    /// member's wraps, and a floor for the next rotation's epoch.
     ///
-    /// Defaults to 0. When `HIPPIUS_MEM_MNEMONIC` is set, startup loads the
-    /// wrapped keys this member can unwrap for epochs up to the newest one the
-    /// founder provisioned, or up to `max_epoch` when that is higher or the
-    /// lookup fails, so a rotation reaches this machine without editing it.
+    /// Defaults to 0. When `HIPPIUS_MEM_MNEMONIC` is set, startup loads the key
+    /// of every epoch with a wrap addressed to this member, from one listing,
+    /// so a rotation reaches this machine without editing it. Only when that
+    /// listing fails does it try epochs 0 through `max_epoch`.
     pub(crate) max_epoch: u64,
     /// The team founder's SS58 address, pinned out of band.
     ///
