@@ -1194,8 +1194,10 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
 /// check for every epoch it holds a key for (the configured key, plus the
 /// rotated epochs `HIPPIUS_MEM_MNEMONIC` unwraps).
 ///
-/// For a team that predates the check, run once from a machine whose key is
-/// the team's (the founder's, or one whose notes teammates read). Without
+/// For a team that predates the check, run once from the founder's machine:
+/// on an epoch with no notes the probe below cannot tell a wrong key, so a
+/// member with a mistyped key would publish a check that refuses the rest of
+/// the team. Without
 /// `--replace` an existing check is never overwritten, so a wrong one is
 /// reported and the command fails. `--replace` overwrites it: the recovery
 /// for a wrong or unusable check, and a decision that this machine's key IS

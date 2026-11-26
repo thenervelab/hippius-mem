@@ -633,8 +633,8 @@ async fn check_team_key(
         tracing::warn!(
             "WARN: team {team} has no usable team-key check for epoch 0, so this run cannot tell \
              for certain whether the configured key is the team's, and a wrong key would not be \
-             refused; run `hippius-mem admin keycheck publish` from a machine with the right key \
-             (the founder's, or one whose notes the team reads)"
+             refused; ask the founder to run `hippius-mem admin keycheck publish` from their \
+             machine"
         );
     }
     Ok(())

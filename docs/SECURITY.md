@@ -568,7 +568,9 @@ key.
   which side is wrong, because only a published check decides. The probe can only
   withhold a publish: when most of an epoch's oldest notes were sealed under another key, a
   right key's publish is refused too, and `rotate` (a new epoch, with no notes) gets past that.
-  A team without a check keeps working, with that warning, until someone publishes one.
+  A team without a check keeps working, with that warning, until the founder publishes one.
+  The warning names the founder because on an epoch with no notes the probe cannot tell a
+  wrong key, and a member's mistyped key published there would refuse the rest of the team.
 - A wrong check, or an object that cannot be read, is undone with `hippius-mem admin keycheck
   publish --replace` from a machine with the right key. Nothing else overwrites it.
 - What is not guaranteed: the object is not signed. It guards against a misconfigured key,

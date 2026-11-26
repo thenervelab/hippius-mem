@@ -103,7 +103,9 @@ field.
   an error naming the fix, and `doctor` fails. Its message names the check's
   object and says the check may be what was replaced (it is unsigned), so a
   member compares with a teammate's `doctor` before changing a key. With no check the server only
-  warns, loudly when its key opens fewer than half of the epoch's oldest notes.
+  warns, loudly when its key opens fewer than half of the epoch's oldest notes,
+  and the warning and `doctor` ask the founder to publish the check: on an
+  epoch with no notes a publish cannot tell a wrong key.
   A publish (`--replace` included) tries the key on those notes first and
   publishes nothing when it opens fewer than half of them, and `doctor` reports
   that probe and fails on it while no check is published and the team has not

@@ -479,8 +479,8 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
             Ok(TeamKeyCheck::Unpublished { probe }) => tracing::warn!(
                 ?probe,
                 "the team has published no key check for this epoch, so a wrong team key \
-                 would not be refused; run `hippius-mem admin keycheck publish` from a machine \
-                 with the right key"
+                 would not be refused; ask the founder to run `hippius-mem admin keycheck \
+                 publish` from their machine (a member's typo would lock the team out)"
             ),
             Err(err) => tracing::warn!(error = %err, "could not check the team key at boot"),
         }
