@@ -375,7 +375,8 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").ok();
     let newest_epoch = match epoch {
         Some(epoch) if epoch > 0 => {
-            newest_epoch_unopenable_line(&store, epoch, &author, mnemonic.as_deref()).await
+            let mnemonic = mnemonic.as_deref();
+            newest_epoch_key_line(blob.as_ref(), &store, epoch, &author, mnemonic).await
         }
         Some(_) | None => None,
     };
@@ -389,16 +390,19 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
 
 /// The failure line when the team has rotated to `epoch` (above 0, the newest
 /// epoch the founder provisioned) and this machine cannot load that epoch's
-/// key, or `None` when it can.
+/// key, or loads one that the team's published key check for `epoch` names as
+/// another key; `None` when the key loads and the check matches or is absent.
 ///
 /// A machine loads a rotated epoch's key only from the wrap under its author
 /// address `author`, signed by a provisioner the manifest in force authorizes,
 /// and opened with the x25519 key of `mnemonic` (`HIPPIUS_MEM_MNEMONIC`), as
 /// [`MemoryStore::open_epoch_key`] checks. Without it the machine reads no note
 /// sealed under that epoch, and its note writes are refused
-/// (`EpochSuperseded`). A listing or fetch fault yields `None`, like the other
-/// best-effort checks here; the storage probe reports those.
-async fn newest_epoch_unopenable_line(
+/// (`EpochSuperseded`); with a key the check names as another key's, its writes
+/// are refused too (`TeamKeyMismatch`). A listing or fetch fault yields `None`,
+/// like the other best-effort checks here; the storage probe reports those.
+async fn newest_epoch_key_line(
+    blob: &dyn BlobStore,
     store: &MemoryStore,
     epoch: u64,
     author: &Ss58,
@@ -437,12 +441,39 @@ async fn newest_epoch_unopenable_line(
             "does not open with HIPPIUS_MEM_MNEMONIC ({err}); check that it is the mnemonic \
              this machine joined with"
         ),
-        // Loadable, or a storage fault the storage probe reports.
-        Ok(_) | Err(_) => return None,
+        Ok(key) => return newest_epoch_key_check_line(blob, team, epoch, &key).await,
+        // A storage fault the storage probe reports.
+        Err(_) => return None,
     };
     Some(format!(
         "FAIL: team {team:?} epoch {epoch}: the wrap addressed to this machine ({author}) {cause}"
     ))
+}
+
+/// The failure line when `key`, the key this machine loaded for the rotated
+/// `epoch`, is not the one the team's published key check for `epoch` names;
+/// `None` when the check matches, is absent or unusable, or cannot be read
+/// (the storage probe reports read faults).
+///
+/// The key came from a founder-signed wrap, not from `team_key_hex`, so the fix
+/// is a new wrap or a new epoch, never an edit of this machine's configuration.
+async fn newest_epoch_key_check_line(
+    blob: &dyn BlobStore,
+    team: &str,
+    epoch: u64,
+    key: &SecretKey,
+) -> Option<String> {
+    match matches_published_key_check(blob, team, epoch, key).await {
+        Ok(KeyCheckMatch::Differs) => Some(format!(
+            "FAIL: team {team:?} epoch {epoch}: the key this machine opens from its wrap does \
+             not match the key check the team published at {}, or that check was replaced, so \
+             this machine's writes are refused. Compare `hippius-mem doctor` on a teammate's \
+             machine: if theirs matches, ask the founder to run `hippius-mem provision` for \
+             this machine; if no machine matches, the founder runs `hippius-mem rotate`",
+            key_check_key(team, epoch)
+        )),
+        Ok(KeyCheckMatch::Matches | KeyCheckMatch::Unpublished) | Err(_) => None,
+    }
 }
 
 /// Config used to build the store `doctor` probes with: never load an
@@ -550,8 +581,8 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 /// epoch the founder provisioned; `None` when that lookup failed). A check that matches decides, and a failing probe
 /// beside it is warned: when epoch 0's oldest notes were sealed under another
 /// key, the right key fails the probe too. Keys for rotated epochs come from
-/// founder-signed wraps, not from this configuration, and the server checks
-/// the current epoch's at boot. No usable published check is otherwise warned,
+/// founder-signed wraps, not from this configuration, and
+/// [`newest_epoch_key_line`] checks the newest epoch's. No usable published check is otherwise warned,
 /// not failed, with the command that publishes one.
 ///
 /// # Errors
@@ -1230,10 +1261,10 @@ mod tests {
 
     use super::{
         PROBE_KEY_PREFIX, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key,
-        config_for_key_probe, create_only_line, head_regression_lines,
-        newest_epoch_unopenable_line, offline_report_lines, op_log_integrity_lines,
-        probe_encryption_boundary, probe_live, probe_storage_then_team_key, quarantine_lines,
-        removed_member_still_holds_key_lines, resolve_profile_for_remote, suppressed_tail_lines,
+        config_for_key_probe, create_only_line, head_regression_lines, newest_epoch_key_line,
+        offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
+        probe_storage_then_team_key, quarantine_lines, removed_member_still_holds_key_lines,
+        resolve_profile_for_remote, suppressed_tail_lines,
         unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
@@ -2664,7 +2695,7 @@ mod tests {
     /// machine read none of the rotated epoch's notes, and then passed a
     /// planted or corrupt wrap that the server's bootstrap refuses.
     #[tokio::test]
-    async fn newest_epoch_unopenable_line_fails_without_a_loadable_wrap()
+    async fn newest_epoch_key_line_fails_without_a_loadable_wrap()
     -> Result<(), Box<dyn std::error::Error>> {
         const TEAM: &str = "clientx";
         const PHRASE: &str =
@@ -2684,7 +2715,7 @@ mod tests {
         publish_manifest(blob.as_ref(), &manifest).await?;
         let store = key_store(&blob, TEAM, [4u8; 32], [1u8; 32])?;
         let line = |mnemonic: Option<&'static str>| {
-            newest_epoch_unopenable_line(&store, 1, &author_ss58, mnemonic)
+            newest_epoch_key_line(blob.as_ref(), &store, 1, &author_ss58, mnemonic)
         };
 
         // The wrap sits under the mnemonic's own address, not the machine's
