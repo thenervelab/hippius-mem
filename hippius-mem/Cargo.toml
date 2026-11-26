@@ -140,6 +140,10 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 # the shipped MCP binary links only the `[dependencies]` feature set (server
 # side), never this one.
 rmcp = { version = "3.9.0", default-features = false, features = ["client"] }
+# `test-util` adds paused time (`#[tokio::test(start_paused = true)]`) to the
+# `[dependencies]` tokio entry (Cargo unions the feature sets), so a test of a
+# time bound does not wait it out in real time. Same crate, no lockfile change.
+tokio = { version = "1.52.3", features = ["test-util"] }
 # Throwaway `tempdir()`s for the CLI and config tests. Test-only: the shipped
 # binary's atomic config writes go through `hippius_mem_core::AtomicFile`.
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }

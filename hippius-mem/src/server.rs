@@ -2111,7 +2111,7 @@ mod tests {
     /// A session whose exit flush never finishes still ends: off chain, the
     /// flush is cut at `EXIT_FLUSH_TIMEOUT`. Catches a flush awaited without
     /// that bound, which keeps a closed session's process alive for good.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_exit_flush_that_never_finishes_ends_at_the_timeout() {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
@@ -2131,7 +2131,7 @@ mod tests {
 
         // Ten times the bound, so only a flush that ignores it runs into this.
         let outer = super::EXIT_FLUSH_TIMEOUT * 10;
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         assert!(
             tokio::time::timeout(outer, server.flush_on_exit())
                 .await
