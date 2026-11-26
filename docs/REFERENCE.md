@@ -654,7 +654,8 @@ stated plainly.
 Size limits on `remember` and `edit`, refused with an error naming the limit: `summary` is one
 line of at most 512 characters, `body` at most 131072 characters, `tags` at most 64 of at most
 128 characters each. Characters are Unicode scalar values, not bytes, so a body of 131072
-four-byte characters (512 KiB of UTF-8) is accepted. An `edit` that leaves an older, larger body
+four-byte characters (512 KiB of UTF-8) is accepted. "One line" means no control character
+and no U+2028 or U+2029 separator. An `edit` that leaves an older, larger body
 or tag set unchanged is not refused.
 
 Every write tool (`remember`, `edit`, `forget`, `link`, `redact`) adds a `warnings` array of

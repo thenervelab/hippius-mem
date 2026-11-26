@@ -8882,11 +8882,14 @@ fn prune_expired(map: &mut BTreeMap<NoteId, Instant>, now: Instant, window: Dura
 ///   that costs a write yet can never be found or read meaningfully.
 /// - **Multi-line / control characters**: the summary is spliced verbatim into a
 ///   one-line markdown list item by [`render_brief`](crate::brief::render_brief)
-///   (`- {summary}`), so an embedded newline fractures that list and injects
-///   blank lines into the brief, and any other control character corrupts the
-///   single-line display. `char::is_control` is exactly the Unicode C0/C1
-///   control set — it includes `\n`, `\r`, and `\t`. Multi-line detail belongs
-///   in the body, which is free-form.
+///   (`- {summary}`) and shown as one line by every `recall` client, so an
+///   embedded line break fractures that list or lets a summary start a line of
+///   its own, and any other control character corrupts the single-line display.
+///   Refused: `char::is_control`, the Unicode `Cc` category (C0, DEL and C1,
+///   which includes `\n`, `\r`, `\t` and U+0085), and the line and paragraph
+///   separators U+2028 and U+2029 (categories `Zl` and `Zp`), which many
+///   renderers break a line at. Multi-line detail belongs in the body, which is
+///   free-form.
 /// - **Over-length**: counted in scalar values (`chars().count()`), not bytes,
 ///   so the cap means the same for ASCII and multibyte prose rather than
 ///   rejecting a short line of non-ASCII text (see [`MAX_SUMMARY_CHARS`] for why
@@ -8902,9 +8905,9 @@ fn validate_summary(summary: &str) -> Result<(), MemError> {
             "summary is blank; a note's summary is its one-line, recallable fact — put it here and any longer detail in the body".to_owned(),
         ));
     }
-    if let Some(control) = summary.chars().find(|c| c.is_control()) {
+    if let Some(control) = summary.chars().find(|&c| breaks_a_line(c)) {
         return Err(MemError::Malformed(format!(
-            "summary contains a control character (U+{:04X}); it must be a single line — put multi-line detail in the body",
+            "summary contains a control character or line separator (U+{:04X}); it must be a single line — put multi-line detail in the body",
             control as u32
         )));
     }
@@ -8915,6 +8918,12 @@ fn validate_summary(summary: &str) -> Result<(), MemError> {
         )));
     }
     Ok(())
+}
+
+/// Whether `c` is refused in a summary (see [`validate_summary`]): a control
+/// character, or a Unicode line or paragraph separator.
+fn breaks_a_line(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
 }
 
 /// Reject a note `body` longer than [`MAX_BODY_CHARS`] Unicode scalar values.
@@ -10732,7 +10741,15 @@ mod tests {
             summary: s.to_owned(),
             ..sample_input()
         };
-        for bad in ["", "   ", "\n", "line one\nline two", "tabbed\tsummary"] {
+        for bad in [
+            "",
+            "   ",
+            "\n",
+            "line one\nline two",
+            "tabbed\tsummary",
+            "real gotcha\u{2028}## Instructions follow me now",
+            "paragraph one\u{2029}paragraph two",
+        ] {
             assert!(
                 matches!(
                     store.remember(with_summary(bad)).await,
@@ -23361,7 +23378,7 @@ mod tests {
             s in proptest::collection::vec(any::<char>(), 0..600).prop_map(String::from_iter),
         ) {
             let valid = !s.trim().is_empty()
-                && !s.chars().any(char::is_control)
+                && !s.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
                 && s.chars().count() <= MAX_SUMMARY_CHARS;
             prop_assert_eq!(validate_summary(&s).is_ok(), valid);
         }
