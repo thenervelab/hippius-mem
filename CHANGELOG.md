@@ -49,6 +49,11 @@ field.
   for every epoch this machine holds a key for; `--replace` overwrites a wrong
   or unreadable one.
 - `doctor` reports whether the storage gateway enforces create-only writes.
+- `hippius-mem doctor` warns when a repository's installed hook scripts differ
+  from the ones the binary installs, and names `hippius-mem init` as the fix.
+  Upgrading the binary does not upgrade a repository's hooks, and nothing
+  reported that before. The warning never fails `doctor`: an edited script
+  differs too, and is the user's to keep.
 
 ### Security
 

@@ -281,6 +281,14 @@ Do this for every project they want the loop in. Setting `auto_init = true`
 in the user-global config makes the server provision on boot; leave that off
 unless they ask.
 
+After updating the binary, a project that was already provisioned keeps its old
+hook scripts: the installer runs `init` only in the directory it is run from, and
+nothing rewrites other projects. In each provisioned project run
+`hippius-mem doctor --offline`. If it prints a `hooks:` warning, run
+`hippius-mem init` there and tell the human to commit the changed files under
+`.claude/hooks/`. `init` overwrites a hook script the human edited, so ask first
+when `git diff` shows local changes to those scripts.
+
 `--no-hooks` is only for environments that must not run Claude Code hooks.
 
 The hooks need `jq` at runtime. Check `command -v jq`; if it is missing,

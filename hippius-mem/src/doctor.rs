@@ -79,8 +79,32 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 
     // Not in `run_for_config`: quickstart probes before it wires agents.
     check_hermes_wiring()?;
+    report_hook_script_drift();
 
     run_for_config(&cfg, opts.offline).await
+}
+
+/// Warn when the launch repo's installed hook scripts are not the ones this
+/// binary carries, naming `init` as the way to replace them.
+///
+/// A warning, never a failure: the scripts differ either because a newer binary
+/// was installed after the repo's last `init`, or because the user edited them,
+/// and an edited script is theirs to keep. Failing would also make every
+/// repo's `doctor` red after each upgrade that changes a hook. An unreadable
+/// script is warned about for the same reason: it does not make the config or
+/// the gateway, which the rest of `doctor` checks, any less valid.
+fn report_hook_script_drift() {
+    match crate::setup::hook_scripts_differing_from_binary() {
+        Ok(differing) if differing.is_empty() => {}
+        Ok(differing) => tracing::warn!(
+            "hooks: {} differ from the scripts this binary ({}) installs: an older or newer \
+             release wrote them, or they were edited. Run `hippius-mem init` in this repo to \
+             replace them (this overwrites local edits), then commit the change",
+            differing.join(", "),
+            env!("CARGO_PKG_VERSION"),
+        ),
+        Err(err) => tracing::warn!("hooks: cannot compare the installed scripts: {err:#}"),
+    }
 }
 
 /// Run the doctor checks against an already-resolved `cfg`, skipping
