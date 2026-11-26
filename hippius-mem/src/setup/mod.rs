@@ -213,9 +213,12 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     };
     #[cfg(not(feature = "http-mcp"))]
     let launch = mcp::McpLaunch::resolve(&home);
-    configure_global_with_launch(&home, &flags, hermes_env.as_deref(), &launch)?;
+    // The daemon check runs even when an agent was skipped, so it matches the
+    // entries the other agents' configs now hold.
+    let configured = configure_global_with_launch(&home, &flags, hermes_env.as_deref(), &launch);
     #[cfg(feature = "http-mcp")]
     retire_unused_daemon(&home)?;
+    configured?;
     tracing::info!(home = %home.display(), "hippius-mem install complete");
     Ok(())
 }
@@ -901,22 +904,18 @@ fn configure_global_with_launch(
         );
     }
     if flags.uninstall {
-        for id in &selected {
-            match id {
-                agents::AgentId::Hermes => {
-                    hermes::uninstall_with(
-                        home,
-                        &flags.hermes,
-                        hermes_home_env.map(std::ffi::OsStr::to_os_string),
-                    )?;
-                }
-                other => other.unregister(home)?,
-            }
-        }
+        let skipped = skip_failed_agents(&selected, |id| match id {
+            agents::AgentId::Hermes => hermes::uninstall_with(
+                home,
+                &flags.hermes,
+                hermes_home_env.map(std::ffi::OsStr::to_os_string),
+            ),
+            other => other.unregister(home),
+        });
         if selected.contains(&agents::AgentId::Claude) {
             instructions::remove_md_section(&home.join(".claude"), "CLAUDE.md")?;
         }
-        return Ok(());
+        return fail_on_skipped(&skipped, "uninstall");
     }
     if selected.contains(&agents::AgentId::Claude) {
         let claude_dir = home.join(".claude");
@@ -938,7 +937,7 @@ fn configure_global_with_launch(
     // not ours to do, so AGENTS.md support stays repo-level (`init`) only.
     // MCP registration for non-Claude clients is the adapter's job (`--agent`
     // / `--all-detected`); those adapters write only the documented MCP key.
-    for id in selected {
+    let skipped = skip_failed_agents(&selected, |id| {
         match id {
             agents::AgentId::Hermes => {
                 hermes::install_with(
@@ -957,8 +956,46 @@ fn configure_global_with_launch(
                 tracing::info!(agent = id.as_str(), "registered hippius-mem MCP server");
             }
         }
+        Ok(())
+    });
+    fail_on_skipped(&skipped, "install")
+}
+
+/// Run `apply` for each of `selected`, and return the agents it failed for
+/// with their errors.
+///
+/// One agent's failure (a config refused because it is a symlink, a file that
+/// does not parse) does not stop the rest: stopping at it left the agents
+/// after it unregistered on install, and still registered on uninstall.
+fn skip_failed_agents(
+    selected: &[agents::AgentId],
+    mut apply: impl FnMut(agents::AgentId) -> anyhow::Result<()>,
+) -> Vec<(agents::AgentId, anyhow::Error)> {
+    selected
+        .iter()
+        .filter_map(|&id| apply(id).err().map(|err| (id, err)))
+        .collect()
+}
+
+/// An error naming every agent in `skipped` and why, so the command still
+/// ends non-zero when an agent was not handled; `Ok` when none was.
+fn fail_on_skipped(
+    skipped: &[(agents::AgentId, anyhow::Error)],
+    action: &str,
+) -> anyhow::Result<()> {
+    if skipped.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let reasons: Vec<String> = skipped
+        .iter()
+        .map(|(id, err)| format!("{}: {err:#}", id.as_str()))
+        .collect();
+    bail!(
+        "{action} skipped {} agent(s); the others were handled. Fix each and run {action} \
+         again:\n{}",
+        skipped.len(),
+        reasons.join("\n")
+    )
 }
 
 /// The hook scripts installed in the cwd's git repo whose bytes differ from the
@@ -1634,6 +1671,64 @@ mod tests {
         assert!(
             home.path().join(".claude.json").exists(),
             "~/.claude.json must exist"
+        );
+    }
+
+    /// An agent whose config is refused (here `~/.codex` linked into a
+    /// dotfiles checkout) is skipped, and install and uninstall still handle
+    /// the agents after it and the CLAUDE.md block, then fail naming it. Both
+    /// used to stop at the refused agent: install left Gemini unregistered,
+    /// and uninstall left Gemini's entry and the CLAUDE.md block behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_agent_does_not_stop_install_or_uninstall_of_the_others() {
+        let home = TempDir::new().expect("tempdir");
+        let dotfiles = home.path().join("dotfiles/codex");
+        std::fs::create_dir_all(&dotfiles).expect("dir");
+        std::os::unix::fs::symlink(&dotfiles, home.path().join(".codex")).expect("symlink");
+        std::fs::create_dir_all(home.path().join(".gemini")).expect("gemini dir");
+        let gemini = home.path().join(".gemini/settings.json");
+        let all_detected = |uninstall| SetupFlags {
+            uninstall,
+            agents: agents::AgentSelect::AllDetected,
+            ..SetupFlags::default()
+        };
+
+        let refused = configure_global(home.path(), &all_detected(false), None)
+            .expect_err("install fails while codex is skipped");
+
+        let message = format!("{refused:#}");
+        assert!(message.contains("skipped 1 agent(s)"), "{message}");
+        assert!(
+            message.contains("codex: ") && message.contains(".codex"),
+            "{message}"
+        );
+        assert!(
+            std::fs::read_to_string(&gemini)
+                .expect("gemini registered")
+                .contains("hippius-mem"),
+            "gemini, after codex, is registered"
+        );
+
+        let codex_entry = "[mcp_servers.hippius-mem]\ncommand = \"x\"\n";
+        std::fs::write(dotfiles.join("config.toml"), codex_entry).expect("seed");
+        let refused = configure_global(home.path(), &all_detected(true), None)
+            .expect_err("uninstall fails while codex is skipped");
+
+        assert!(format!("{refused:#}").contains("codex: "), "{refused:#}");
+        assert!(
+            !std::fs::read_to_string(&gemini)
+                .expect("read")
+                .contains("hippius-mem"),
+            "gemini's entry is removed"
+        );
+        let global_md =
+            std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap_or_default();
+        assert!(!global_md.contains(SECTION_START), "{global_md:?}");
+        assert_eq!(
+            std::fs::read_to_string(dotfiles.join("config.toml")).expect("read"),
+            codex_entry,
+            "the link's target is untouched"
         );
     }
 

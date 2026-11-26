@@ -278,7 +278,10 @@ field.
   writing through the link would put the entry, which can carry the bearer
   token, into a file the user may commit. Uninstall refuses a linked config
   only when it holds the entry, so `install --uninstall --all-detected`
-  passes a linked config it never wrote to. The file used to be
+  passes a linked config it never wrote to. An agent whose config is
+  refused is skipped: `install` and `install --uninstall` still handle the
+  other selected agents and the `~/.claude/CLAUDE.md` block, then exit
+  non-zero naming each skipped agent and why. The file used to be
   re-serialized whole. This adds the `toml_edit` crate to the binary, already in the
   lockfile.
 - `upgrade` refuses a destination bucket whose team prefix already holds
