@@ -636,6 +636,21 @@ while older epochs stay wrapped so previously shared notes remain readable. The 
 lifecycle (join, removal, rotation, forged-author rejection) is exercised in
 `hippius-mem-core/tests/e2e_phase3.rs`.
 
+**A rotation never strands its founder.** The founder reads a rotated epoch only from a wrap
+addressed to its own member key, and nobody else may wrap one to it. So `rotate_key` refuses
+(`FounderHasNoMemberKey`) before writing any wrap when none would be addressed to the
+founder, and the CLI's `rotate` / `remove` require `HIPPIUS_MEM_MNEMONIC` and publish the
+founder's member key first when it is missing. An epoch an older release minted without the
+founder is repaired by a key share (`admin share-epoch-keys`): a member seals to the founder
+the AEAD key of its own founder-signed wrap of that epoch, and the founder's `provision`
+opens that founder-signed ciphertext with it. The founder trusts no member for the key
+itself: a share carrying any other AEAD key fails the Poly1305 tag of the founder's
+ciphertext, and a share is only ever used with a wrap the founder or the recovery key
+signed. The share's additional data names its own domain
+(`hippius-memory-keyshare-v1`), so a share never opens as a wrap of a team key. A share
+reveals nothing the bucket does not already guard: it opens only that one wrap, whose key
+the member already holds, and only the founder's x25519 secret opens the share.
+
 **Sub-token minting (`console` feature).** Minting a per-developer S3 sub-token from the
 same mnemonic is wired behind the opt-in `console` Cargo feature: it derives an ETH key
 from the mnemonic, runs the api.hippius.com challenge/verify flow, and mints a

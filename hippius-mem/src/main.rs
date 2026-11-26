@@ -153,8 +153,9 @@ Usage:
                                        founder: publish the signed membership manifest
   hippius-mem rotate [--members <ss58,...>]
                                        founder: rotate the team key to a new epoch
-                                       (primary profile only; --members publishes a
-                                       shrunk membership first)
+                                       (needs HIPPIUS_MEM_MNEMONIC; primary profile
+                                       only; --members publishes a shrunk membership
+                                       first)
   hippius-mem remove <ss58>            founder: remove a member — publish the roster
                                        without them, rotate the team key, and print
                                        the manual sub-token revoke step
@@ -169,6 +170,10 @@ Usage:
                                        unsigned_anchor_records gauge can reach 0;
                                        every member runs it, then
                                        require_signed_anchors is safe to enable
+  hippius-mem admin share-epoch-keys   member: give the founder the keys of epochs it
+                                       holds no wrap of; the founder's next
+                                       `provision` loads them (needs
+                                       HIPPIUS_MEM_MNEMONIC)
   hippius-mem admin keycheck publish [--replace]
                                        publish the team-key check for every epoch
                                        this machine holds a key for, so a wrong key

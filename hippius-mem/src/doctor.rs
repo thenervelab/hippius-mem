@@ -438,10 +438,10 @@ async fn newest_epoch_key_line(
     };
     let cause = match store.open_epoch_key(&identity, epoch).await {
         Err(MemError::NotFound { .. }) => {
+            let remedy = missing_epoch_remedy(store, author, epoch).await;
             return Some(format!(
                 "FAIL: team {team:?} rotated to epoch {epoch}, and no wrap of its key is \
-                 addressed to this machine ({author}); run `hippius-mem join` here, then ask \
-                 the founder to run `hippius-mem provision`"
+                 addressed to this machine ({author}); {remedy}"
             ));
         }
         Err(err @ (MemError::Unauthorized(_) | MemError::Serialize(_))) => format!(
@@ -479,24 +479,49 @@ async fn keyless_epoch_lines(
         return Vec::new();
     }
     let team = store.team();
-    let author = author.as_str();
-    let remedy = if has_mnemonic {
+    let mut lines = Vec::new();
+    for (epoch, notes) in store.keyless_notes() {
+        let remedy = if has_mnemonic {
+            missing_epoch_remedy(store, author.as_str(), epoch).await
+        } else {
+            "set HIPPIUS_MEM_MNEMONIC to this member's mnemonic, which loads the epochs wrapped \
+             to it, and run `hippius-mem doctor` again"
+                .to_owned()
+        };
+        lines.push(format!(
+            "WARN: team {team:?}: {notes} note(s) are sealed under epoch {epoch}, which this \
+             machine ({author}) holds no key for, so its server does not show them; {remedy}",
+            author = author.as_str(),
+        ));
+    }
+    lines
+}
+
+/// What a machine whose author is `author` does to get a wrap of `epoch` it
+/// lacks. A member asks the founder to provision. The founder cannot provision
+/// a key it does not hold: an epoch minted before the founder had a member key
+/// reached the members only, so a member sends the founder a key share, which
+/// the founder's next `provision` loads and wraps.
+async fn missing_epoch_remedy(store: &MemoryStore, author: &str, epoch: u64) -> String {
+    let founder = store
+        .membership_manifest()
+        .await
+        .ok()
+        .flatten()
+        .map(|manifest| manifest.founder);
+    if founder.is_some_and(|founder| founder.as_str() == author) {
+        format!(
+            "this founder holds no key for epoch {epoch} (it was minted before this founder's \
+             member key was published, so only members received it); run `hippius-mem join` \
+             here if this machine has not, have a member who holds epoch {epoch} run \
+             `hippius-mem admin share-epoch-keys`, then run `hippius-mem provision` here with \
+             HIPPIUS_MEM_MNEMONIC set"
+        )
+    } else {
         "run `hippius-mem join` here if this machine has not, then ask the founder to run \
          `hippius-mem provision`, which wraps every epoch the founder holds"
-    } else {
-        "set HIPPIUS_MEM_MNEMONIC to this member's mnemonic, which loads the epochs wrapped \
-         to it, and run `hippius-mem doctor` again"
-    };
-    store
-        .keyless_notes()
-        .into_iter()
-        .map(|(epoch, notes)| {
-            format!(
-                "WARN: team {team:?}: {notes} note(s) are sealed under epoch {epoch}, which this \
-                 machine ({author}) holds no key for, so its server does not show them; {remedy}"
-            )
-        })
-        .collect()
+            .to_owned()
+    }
 }
 
 /// The failure line when `key`, the key this machine loaded for the rotated
@@ -731,8 +756,8 @@ async fn check_team_key(
 ///
 /// This is the read-side detector for the recorded `rotate --members`
 /// non-atomicity gotcha: `publish_membership` can land while `rotate_key`
-/// then refuses (typically `MemError::NothingToRotate` because no remaining
-/// member has `join`ed yet), leaving a removed member's wrap for the CURRENT
+/// then fails (a storage fault, or another rotation taking the epoch),
+/// leaving a removed member's wrap for the CURRENT
 /// epoch on the bucket even though the manifest no longer lists them —
 /// `hippius-mem remove` is now resumable and reports this itself on the run
 /// that hits it (see `crate::admin::remove`), but a machine that never

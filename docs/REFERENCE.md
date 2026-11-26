@@ -211,7 +211,7 @@ a project can pin its own config. (This resolution is identical on macOS and Lin
 | — | `HIPPIUS_MEM_STATE_DIR` | Base directory for this machine's local **state**: `hippius-mem/state/<team>/` holds `head-watermarks.json` (the per-author head high-water marks that back `reconcile`'s `head_regressions`) plus `writer.lock`, `writer-tip-v3-<bucket>.json` and `writer-tip.json` (the cross-process writer lock that serializes same-machine writers on every backend; this version's tip file, one per bucket (the bucket name, or a local vault's root, not the endpoint URL) with one entry per author key, so two author seeds, or one team name used against two buckets, each keep their own chain, and sessions that reach one bucket through different endpoint URLs (a trailing slash, a host alias, a proxy) share one tip; an author has one entry per endpoint, and a write uses another endpoint's newer entry only after a GET finds that entry's op in its bucket, so two gateways that each hold a bucket of the same name never chain to each other's ops or erase each other's entries (exact where the gateway's GET is read-after-write consistent; an entry whose unconfirmed op has not landed and whose committed op id is unknown is ignored); and the single-tip file hippius-mem 0.7.1 and earlier read, kept current for them during a rollout). A `writer-tip-v2-<location>.json` left by a pre-release 0.8.0 build is not read and can be deleted. Env var only, no TOML field. Unset resolves the first of `XDG_STATE_HOME`, `XDG_DATA_HOME`, `$HOME/.local/share` that is set, so on a default macOS/Linux box the files live under `~/.local/share/hippius-mem/state/`. Deleting a team's `head-watermarks.json` is the documented remedy for the benign regressions in [Security](SECURITY.md#threat-model--honest-limits); it also disables rollback detection until this machine verifies a head again (the lock and tip files are recreated on demand). |
 | — | `HIPPIUS_MEM_CACHE_DIR` | Root of the **disposable** encrypted blob cache (per-team subdirectory). Env var only, no TOML field. Unset uses `$XDG_CACHE_HOME`, else `~/.cache`, under `hippius-mem/<team>`; `off` or an empty value disables caching. Safe to delete — it is rebuilt from the bucket, and unlike the state directory nothing verified is lost with it. |
 | — | `HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT` | Opt out of the `https://`-only requirement on `s3_endpoint`, for a local or dev gateway (e.g. MinIO over http). Env var only. Env values are case-insensitive: unset/empty/`0`/`false`/`no`/`off` keep the requirement; anything else set opts out. Note bodies are E2E-encrypted regardless, but over http the object **keys and metadata** (note ids, key epochs, member SS58s) travel in cleartext — do not set this against a production gateway. |
-| — | `HIPPIUS_MEM_MNEMONIC` | The developer's BIP-39 mnemonic. Env var only — **never stored in the config file**. 🔒 Secret. Gates every mnemonic-derived flow (the list is not exhaustive): the startup epoch-key bootstrap wherever a store boots (`serve`, `brief`, `report`, `upgrade`, …), member-key publish (`join`), and console minting (`mint-token`, `invite`). Founder flows **degrade** without it: `rotate` / `remove` warn and rotate with only the configured key-ring. See [Operating model](#operating-model). |
+| — | `HIPPIUS_MEM_MNEMONIC` | The developer's BIP-39 mnemonic. Env var only — **never stored in the config file**. 🔒 Secret. Gates every mnemonic-derived flow (the list is not exhaustive): the startup epoch-key bootstrap wherever a store boots (`serve`, `brief`, `report`, `upgrade`, …), member-key publish (`join`), and console minting (`mint-token`, `invite`). `rotate` / `remove` refuse without it, before writing anything: the founder reads a rotated epoch only with it. See [Operating model](#operating-model). |
 | — | `HIPPIUS_MEM_RECALL_WINDOW_SECS` | Read by the **hooks**, not the server: how long one `recall` holds the PreToolUse edit-gate open for the session (default 1800 s). Env var only. See [Teams § Using it day to day](TEAMS.md#using-it-day-to-day). |
 | — | `HIPPIUS_MEM_HOOKS_BYPASS` | Read by the **hooks**, not the server: `1` bypasses the recall edit-gate for emergencies. Env var only. Use sparingly — the gate is the enforcement half of the recall discipline. |
 
@@ -540,6 +540,12 @@ stated plainly.
   (the documented pre-strict residual), and a clean Accept-mode reconcile rules that
   out. The migration runbook: every member runs `admin resign-anchors` → watch
   `reconcile`'s `unsigned_anchor_records` reach 0 → enable `require_signed_anchors`.
+- **`admin share-epoch-keys`** (member, `HIPPIUS_MEM_MNEMONIC` required): for every epoch
+  this member holds a founder-signed wrap of and the founder holds none, writes a key share
+  to `{team}/_keyshares/{epoch:020}/{member}`. The founder's next `provision` (with its
+  mnemonic) opens its own founder-signed wrap with each share, loads the key, and wraps it
+  to the founder and every member. The repair for an epoch minted before the founder had a
+  member key; see [Repair an epoch the founder cannot read](TEAMS.md#repair-an-epoch-the-founder-cannot-read).
 - **`admin keycheck publish [--replace]`**: publishes the team-key check
   (`{team}/_keycheck/{epoch}`, see [Security](SECURITY.md#team-key-check)) for every epoch
   this machine holds a key for: the configured key, plus the rotated epochs
@@ -557,12 +563,15 @@ stated plainly.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, then says that
   every member must restart with `HIPPIUS_MEM_MNEMONIC` set. `--members` publishes a shrunk membership first.
-  It also publishes the new epoch's team-key check.
+  It also publishes the new epoch's team-key check. It requires `HIPPIUS_MEM_MNEMONIC`, and
+  publishes the founder's member key first when the founder has not run `join` (stdout says
+  so), so the new epoch is always wrapped to the founder; a rotation with no wrap for the
+  founder is refused before anything is written.
 - **`remove <ss58>`** — founder-only: the member-removal runbook as one command —
   validates the target against the published roster, re-publishes membership without
   them, rotates the key (the same path as `rotate --members`), and prints the one
-  manual step left: revoking the removed member's sub-token in the console. Safe to
-  re-run with the same address (a not-yet-rotated key is reported, not a failure). See
+  manual step left: revoking the removed member's sub-token in the console. Requires
+  `HIPPIUS_MEM_MNEMONIC`, like `rotate`. Safe to re-run with the same address. See
   [Remove a member](TEAMS.md#remove-a-member).
 - **`brief [--tokens N]`** — prints a token-bounded SessionStart digest of the team's
   live memory (conventions/decisions first, then newest gotchas, then a compact index)

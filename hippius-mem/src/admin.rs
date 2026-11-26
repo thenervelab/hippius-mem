@@ -11,9 +11,9 @@ use std::io::IsTerminal as _;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    CreateOnly, DropClass, Identity, KeyCheckPublished, MemError, MemoryStore, NetworkPrefix,
-    PublishKeyCheck, QuarantinedAuthorDetail, Signer, Sr25519Signer, Ss58, TeamManifest,
-    derive_identity,
+    CreateOnly, DropClass, Identity, Joined, KeyCheckPublished, MemError, MemoryStore,
+    NetworkPrefix, PublishKeyCheck, QuarantinedAuthorDetail, Signer, Sr25519Signer, Ss58,
+    TeamManifest, derive_identity,
 };
 use zeroize::Zeroizing;
 
@@ -102,6 +102,7 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     // hard failure.
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+        adopt_shared_epoch_keys(&store, &mnemonic).await?;
     }
 
     let provisioned = store.provision_members().await?;
@@ -134,6 +135,33 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
         generate_and_print_recovery_key(&store, &cfg.team).await?;
     }
 
+    Ok(())
+}
+
+/// Load the keys of epochs this founder holds no wrap of from the key shares
+/// members published (`admin share-epoch-keys`), and say so on stdout, so the
+/// `provision_members` that follows wraps them to the founder and to every
+/// member. Writes nothing itself.
+///
+/// # Errors
+///
+/// A mnemonic that does not derive an identity, or a failed share listing.
+async fn adopt_shared_epoch_keys(store: &MemoryStore, mnemonic: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let identity = derive_identity(mnemonic, HIPPIUS_SS58_PREFIX)
+        .context("deriving the identity from HIPPIUS_MEM_MNEMONIC failed")?;
+    let adopted = store
+        .adopt_shared_epoch_keys(&identity)
+        .await
+        .context("reading the members' key shares failed")?;
+    for epoch in adopted {
+        let _ = writeln!(
+            std::io::stdout(),
+            "loaded the key of epoch {epoch} from a member's key share, checked against the \
+             founder-signed wrap it opens; this run wraps it to the founder and every member"
+        );
+    }
     Ok(())
 }
 
@@ -351,7 +379,7 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
     // should-we-bother guard `remove` uses (see `removal_requires_rotation`)
     // is meaningless here — there is no single removal target to check
     // against.
-    publish_and_rotate(&cfg, &store, members, RotationStrictness::Strict, true).await
+    publish_and_rotate(&cfg, &store, members, true).await
 }
 
 /// Run `remove <ss58>`: as the founder, fuse the removable parts of the
@@ -366,11 +394,7 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 ///
 /// # Resumability
 ///
-/// Every step is safe to re-run with the exact same `<ss58>` argument, which
-/// is what recovers from the recorded `rotate --members` non-atomicity gotcha
-/// (`publish_membership` can land while `rotate_key` then refuses, typically
-/// [`MemError::NothingToRotate`] because no remaining member has `join`ed
-/// yet):
+/// Every step is safe to re-run with the exact same `<ss58>` argument:
 ///
 /// - If the target is still in the live roster, the shrunk membership is
 ///   published (as on a fresh run). If it is already absent — a prior
@@ -379,30 +403,16 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 ///   nothing is (re-)published, and a "resuming" line is printed instead.
 /// - Rotation runs EXACTLY when THIS invocation's republish actually shrank
 ///   the roster (see [`removal_requires_rotation`]) — never based on
-///   `_keys/` wrap membership. A `_keys/`-based proxy used to silently skip
-///   rotation for an invite-bundle-provisioned member: `join --bundle`
-///   hands `team_key_hex` directly (see `crate::join_bundle`), so such a
-///   member never appears in ANY `_keys/` wrap, and the old check read that
-///   absence as "already excluded" — leaving their epoch-0 key able to
-///   decrypt every future note forever. A fresh removal now always
-///   rotates, regardless of what `_keys/` holds. A completed-removal
-///   re-run (or a bogus never-a-member target) does NOT rotate — the
-///   target was already off the roster before this invocation ran, so
-///   republishing changed nothing and rotating again would mint a
-///   gratuitous new epoch for no security benefit (Task 12's
-///   churn-avoidance, preserved). One residual, documented rather than
-///   silently reintroduced: a HALF-DONE resume — a prior run published the
-///   shrink but `rotate_key` then refused — now also reads as "already
-///   excluded" and is NOT retried by a `remove` re-run; run `hippius-mem
-///   rotate` directly (once a remaining member has joined) to finish it, or
-///   rely on `hippius-mem doctor`'s check below.
-/// - When rotation DOES run, `Ok` and [`MemError::NothingToRotate`] both
-///   leave this command exiting successfully: the security-relevant half
-///   (membership no longer converging the target's ops) is done regardless,
-///   and a rotation that could not happen yet (no remaining member has
-///   `join`ed) is now durably caught on every later run by `hippius-mem
-///   doctor`'s "removed member still holds the current epoch key" check —
-///   not only by this command's exit code.
+///   `_keys/` wrap membership, which a member who joined by invite bundle
+///   (holding `team_key_hex` directly) never appears in. A completed-removal
+///   re-run (or a never-a-member target) does NOT rotate: nothing changed, and
+///   rotating again would mint a new epoch for no security benefit. A
+///   half-done run (the shrink published, then the rotation failed) also reads
+///   as already excluded on a re-run; its error says to finish with
+///   `hippius-mem rotate`.
+/// - The rotation always has a recipient: the founder, whose member key
+///   [`load_rotation_store`] publishes first, so it no longer waits for a
+///   remaining member to `join`.
 /// - The manual revoke reminder — the one step no CLI reaches — prints on
 ///   every run, success or not, resumed or not, rotated or not: the
 ///   membership shrink alone already means the removed member should no
@@ -410,11 +420,11 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if the argument is missing/malformed, the configuration
-/// cannot be loaded, the removal is refused (open team, or target is the
-/// founder — see [`RemoveRefusal`]), or the publish/rotate path fails for a
-/// reason OTHER than the tolerated `NothingToRotate` above (e.g. this signer
-/// is not the founder, or a storage failure).
+/// Returns an error if the argument is missing/malformed, `HIPPIUS_MEM_MNEMONIC`
+/// is unset, the configuration cannot be loaded, the removal is refused (open
+/// team, or target is the founder — see [`RemoveRefusal`]), or the
+/// publish/rotate path fails (e.g. this signer is not the founder, or a
+/// storage failure).
 pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -454,22 +464,11 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
         );
     }
 
-    // The revoke reminder must survive BOTH arms. On a genuine failure the
-    // operator is reading stderr and will finish via plain `rotate` (the
-    // half-applied recovery), which never mentions the sub-token — so the
-    // reminder rides the error chain itself rather than a stdout banner
-    // around an error. `Tolerant`: `NothingToRotate` is not a genuine failure
-    // here (see the doc comment above), so it falls through to the manual-step
-    // banner below like any other success.
-    if let Err(err) = publish_and_rotate(
-        &cfg,
-        &store,
-        members_to_publish,
-        RotationStrictness::Tolerant,
-        should_rotate,
-    )
-    .await
-    {
+    // The revoke reminder must survive BOTH arms. On a failure the operator is
+    // reading stderr and will finish via plain `rotate` (the half-applied
+    // recovery), which never mentions the sub-token — so the reminder rides
+    // the error chain itself rather than a stdout banner around an error.
+    if let Err(err) = publish_and_rotate(&cfg, &store, members_to_publish, should_rotate).await {
         return Err(err.context(pending_revoke_reminder(&target)));
     }
 
@@ -531,23 +530,10 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
 /// member to restart, for no security benefit — Task 12's
 /// churn-avoidance, preserved.
 ///
-/// One residual, documented rather than silently reintroduced: a HALF-DONE
-/// resume — a prior run published the shrunk roster but `rotate_key` then
-/// refused (typically [`MemError::NothingToRotate`] because no remaining
-/// member had `join`ed yet) — now also presents as `AlreadyExcluded` and is
-/// NOT retried by re-running `remove` with the same target. `hippius-mem
-/// rotate` (run directly, once a remaining member has joined) still
-/// finishes it, and for an ORDINARY member — one who ever received a
-/// `_keys/`-wrapped key — `hippius-mem doctor`'s "removed member still
-/// holds the current epoch key" check still catches the exposure
-/// independent of whether either command is ever re-run. A
-/// bundle-provisioned target (holds `team_key_hex` directly via `join
-/// --bundle`, never wrapped in `_keys/` at any epoch) combined with
-/// `NothingToRotate` on that SAME removal is the one case doctor cannot
-/// see: the only signal is the one-time stdout message `remove` prints at
-/// the moment of that failed attempt, not a durably re-checkable state —
-/// the remedy is still `hippius-mem rotate` once a remaining member has
-/// joined.
+/// One residual: a HALF-DONE resume — a prior run published the shrunk roster
+/// but the rotation then failed — also presents as `AlreadyExcluded` and is
+/// NOT retried by re-running `remove` with the same target. That run's error
+/// names `hippius-mem rotate`, which finishes it.
 fn removal_requires_rotation(step: &RemovalStep) -> bool {
     matches!(step, RemovalStep::Publish(_))
 }
@@ -648,45 +634,45 @@ fn plan_removal(
 }
 
 /// Shared preamble of the rotation-driving commands (`rotate`, `remove`): load
-/// the primary-profile config, build its store, and run the mnemonic-gated
-/// epoch bootstrap.
+/// the primary-profile config, build its store, run the epoch bootstrap, and
+/// publish this founder's member key when it is missing.
+///
+/// `HIPPIUS_MEM_MNEMONIC` is required, and checked before anything else: the
+/// founder loads a rotated epoch's key only from a wrap addressed to its member
+/// key, opened with that mnemonic, so a rotation without it mints an epoch this
+/// founder cannot read once the command exits, and nobody else may wrap it to
+/// the founder again.
 ///
 /// The bootstrap runs BEFORE any rotation for two reasons: the new epoch must
 /// clear every epoch this founder can see (a stale local ring must not re-mint
 /// an existing epoch), and these entry points read/write full team memory, so
 /// skipping it would silently pin them to the founding epoch (the recorded
-/// `bootstrap_epochs` gotcha).
+/// `bootstrap_epochs` gotcha). The member key is published before the
+/// membership publish and the rotation, so the new epoch is wrapped to the
+/// founder; stdout says when that happened.
 async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
+    use std::io::Write;
+
+    let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").context(
+        "`rotate` and `remove` require HIPPIUS_MEM_MNEMONIC (the founder's mnemonic): the \
+         founder reads a rotated epoch only with it, so rotating without it would mint an epoch \
+         this founder cannot read once the command exits",
+    )?;
+    let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
+        .context("deriving the founder identity from HIPPIUS_MEM_MNEMONIC failed")?;
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     let store = cfg.build_store().await?;
 
-    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
-        bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
-    } else {
-        tracing::warn!("HIPPIUS_MEM_MNEMONIC is unset: rotating with only the configured key-ring");
+    bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    if store.ensure_joined(&identity).await? == Joined::Now {
+        let _ = writeln!(
+            std::io::stdout(),
+            "published this founder's member key (what `hippius-mem join` does), so the new \
+             epoch is wrapped to this founder too"
+        );
     }
 
     Ok((cfg, store))
-}
-
-/// Whether [`publish_and_rotate`]'s rotation half must treat
-/// [`MemError::NothingToRotate`] as a command failure, or as an ordinary
-/// not-yet-ready state to report and move past.
-///
-/// `rotate` ([`Strict`](Self::Strict)) keeps refusing: an operator who
-/// explicitly asked for a rotation right now must be told when it did not
-/// happen. `remove` ([`Tolerant`](Self::Tolerant)) does not: its own job —
-/// shrinking membership, which already stops the target's future ops from
-/// converging — is complete regardless, and the still-open read exposure
-/// through the un-rotated epoch key is now durably caught by `hippius-mem
-/// doctor`'s "removed member still holds the current epoch key" check on
-/// every later run, not only by this one command's exit code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RotationStrictness {
-    /// Surface `NothingToRotate` as a command failure.
-    Strict,
-    /// Report `NothingToRotate` and return success.
-    Tolerant,
 }
 
 /// Publish `members` (when given) and rotate the team key — the shared tail of
@@ -695,13 +681,8 @@ enum RotationStrictness {
 ///
 /// The manifest is published FIRST so the rotation's wrap gate already excludes
 /// anyone removed. The two halves are NOT atomic; when the manifest landed but
-/// the rotation refused (typically `NothingToRotate` because no remaining
-/// member has `join`ed), `strictness` decides what happens next: under
-/// [`RotationStrictness::Strict`] the error names that half-applied state and
-/// the way out, so the operator does not read the refusal as "nothing
-/// happened"; under [`RotationStrictness::Tolerant`] it is reported to stdout
-/// and treated as a successful (if incomplete) run — see
-/// [`RotationStrictness`]'s docs for why that is safe.
+/// the rotation then failed, the error names that half-applied state and the
+/// way out, so the operator does not read the failure as "nothing happened".
 ///
 /// `should_rotate = false` publishes `members` (if any) exactly as above, but
 /// returns `Ok(())` immediately afterward WITHOUT calling `rotate_key` at
@@ -714,7 +695,6 @@ async fn publish_and_rotate(
     cfg: &Config,
     store: &MemoryStore,
     members: Option<BTreeSet<Ss58>>,
-    strictness: RotationStrictness,
     should_rotate: bool,
 ) -> anyhow::Result<()> {
     use std::io::Write;
@@ -736,34 +716,18 @@ async fn publish_and_rotate(
 
     let outcome = match store.rotate_key(cfg.max_epoch).await {
         Ok(outcome) => outcome,
-        Err(MemError::NothingToRotate { .. }) if strictness == RotationStrictness::Tolerant => {
-            let mut out = std::io::stdout();
-            let _ = writeln!(
-                out,
-                "membership is published, but the key is NOT yet rotated (no remaining \
-                 member has `join`ed yet) -- have them join, then run `hippius-mem rotate` \
-                 to finish (a `remove` re-run will NOT retry this: the target is already \
-                 off the roster)"
-            );
-            return Ok(());
+        // A rotation that fails after the membership publish leaves a
+        // half-applied command: the shrunk manifest IS published (removed
+        // members' ops already filtered) while the key is NOT rotated. Name
+        // that state and the way out.
+        Err(err) if published_members => {
+            return Err(anyhow::Error::new(err).context(
+                "the new membership WAS already published (removed members' ops are filtered), \
+                 but the key is NOT yet rotated; fix the cause below, then run `hippius-mem \
+                 rotate` (without --members) to finish (a `remove` re-run does not retry it)",
+            ));
         }
-        Err(err) => {
-            // `--members` then NothingToRotate leaves a half-applied command: the
-            // shrunk manifest IS published (removed members' ops already filtered)
-            // while the key is NOT rotated. Name that state and the way out, so
-            // the operator does not read the refusal as "nothing happened".
-            return Err(
-                if published_members && matches!(err, MemError::NothingToRotate { .. }) {
-                    anyhow::Error::new(err).context(
-                        "the shrunk membership WAS already published (removed members' ops \
-                         are filtered), but the key is NOT yet rotated — have the remaining \
-                         members `join`, then re-run `rotate` (without --members) to finish",
-                    )
-                } else {
-                    anyhow::Error::new(err)
-                },
-            );
-        }
+        Err(err) => return Err(err.into()),
     };
 
     // Operator-facing output goes to the stdout handle directly (the workspace
@@ -1173,7 +1137,7 @@ const QUARANTINE_USAGE: &str = "usage: admin quarantine [--remove <object-key> [
 
 /// Usage line for the `admin` namespace router, naming every subcommand.
 const ADMIN_USAGE: &str = "usage: admin quarantine [--remove <object-key> [--yes]] | admin \
-     resign-anchors | admin keycheck publish [--replace]";
+     resign-anchors | admin keycheck publish [--replace] | admin share-epoch-keys";
 
 /// Run `admin <subcommand>`: the operator-maintenance namespace — `quarantine`
 /// (persistent op-log quarantine inspection and safety-railed remediation) and
@@ -1187,10 +1151,60 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
             "quarantine" => quarantine(rest).await,
             "resign-anchors" => resign_anchors(rest).await,
             "keycheck" => keycheck(rest).await,
+            "share-epoch-keys" => share_epoch_keys(rest).await,
             other => bail!("unknown admin subcommand `{other}`; {ADMIN_USAGE}"),
         },
         None => bail!("admin requires a subcommand; {ADMIN_USAGE}"),
     }
+}
+
+/// Run `admin share-epoch-keys`: as a member, give the founder what it needs
+/// to load every epoch key it holds no wrap of (see
+/// [`MemoryStore::share_epoch_keys`]), then tell the operator the founder's next
+/// step.
+///
+/// The repair for an epoch minted by a founder that had no member key yet.
+/// The founder opens its own founder-signed wrap with what this sends, so it
+/// trusts no member for the key itself.
+///
+/// # Errors
+///
+/// Stray arguments, `HIPPIUS_MEM_MNEMONIC` unset or invalid, a store that
+/// cannot be built, a team without a manifest, a founder without a member key,
+/// or a failed read or write.
+async fn share_epoch_keys(args: &[String]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    reject_args("admin share-epoch-keys", args)?;
+    let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").context(
+        "`admin share-epoch-keys` requires HIPPIUS_MEM_MNEMONIC (this member's mnemonic), which \
+         opens this member's wraps",
+    )?;
+    let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
+        .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+    let store = cfg.build_store().await?;
+
+    let shared = store.share_epoch_keys(&identity).await?;
+    let mut out = std::io::stdout();
+    if shared.is_empty() {
+        let _ = writeln!(
+            out,
+            "the founder already holds a wrap of every epoch this machine holds; nothing to share"
+        );
+    } else {
+        let epochs = shared
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "shared the key of epoch {epochs} with the founder; the founder now runs \
+             `hippius-mem provision` with HIPPIUS_MEM_MNEMONIC set, which loads and wraps it"
+        );
+    }
+    Ok(())
 }
 
 /// Run `admin keycheck publish [--replace]`: publish this machine's team-key
@@ -1763,13 +1777,13 @@ mod tests {
     };
 
     use super::{
-        HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, Unpublished, admin,
-        bootstrap_epochs, keycheck_problems, parse_keycheck_args, parse_members,
-        parse_provision_args, parse_publish_membership_args, parse_quarantine_args,
-        parse_remove_args, parse_rotate_args, pending_revoke_reminder, plan_removal, plan_warnings,
-        print_recovery_outcome, print_recovery_seed, provision_unpublished_warnings,
-        publish_and_rotate, publish_key_checks, reject_args, reject_recover_args,
-        removal_requires_rotation, sr25519_signer_from_hex_seed,
+        HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, Unpublished, admin, bootstrap_epochs,
+        keycheck_problems, parse_keycheck_args, parse_members, parse_provision_args,
+        parse_publish_membership_args, parse_quarantine_args, parse_remove_args, parse_rotate_args,
+        pending_revoke_reminder, plan_removal, plan_warnings, print_recovery_outcome,
+        print_recovery_seed, provision_unpublished_warnings, publish_and_rotate,
+        publish_key_checks, reject_args, reject_recover_args, removal_requires_rotation,
+        sr25519_signer_from_hex_seed,
     };
     use crate::config::Config;
 
@@ -2365,79 +2379,38 @@ mod tests {
         }
     }
 
+    /// A rotation that fails after the membership publish says the membership
+    /// landed and how to finish, and keeps the cause in the chain. Here the
+    /// founder has no member key, so the rotation is refused before any wrap
+    /// is written.
     #[tokio::test]
-    async fn remove_treats_nothing_to_rotate_as_done() -> anyhow::Result<()> {
-        // No remaining member has published a MemberKey (nobody `join`ed),
-        // so once the shrunk manifest is published, `rotate_key` can wrap the
-        // new epoch to NOBODY and returns `NothingToRotate` -- the exact
-        // half-applied gotcha state. In `Tolerant` mode (the path `remove`
-        // drives) that must still complete the command successfully instead
-        // of leaving the recorded gotcha state: membership shrunk, key
-        // un-rotated, command failed.
+    async fn a_rotation_failing_after_the_publish_names_the_half_applied_state()
+    -> anyhow::Result<()> {
         let bucket = Arc::new(MemoryBlobStore::default());
         let store = epoch0_store(&bucket)?;
         let cfg = rotation_test_config();
-
-        // Seed an initial manifest with DEV as a member, so there is
-        // something for the shrink below to actually remove.
         store
             .publish_membership(BTreeSet::from([Ss58::new(DEV)?]))
             .await?;
-
         let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
-        let remaining = BTreeSet::from([founder]);
 
-        publish_and_rotate(
-            &cfg,
-            &store,
-            Some(remaining),
-            RotationStrictness::Tolerant,
-            true,
-        )
-        .await
-        .expect(
-            "NothingToRotate after a successful republish must be treated as done in \
-             Tolerant mode, not surfaced as a command failure",
-        );
-
-        // The membership shrink DID land, even though rotation did not.
-        let live = store
-            .membership_manifest()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("a manifest must have been published"))?;
+        let err = publish_and_rotate(&cfg, &store, Some(BTreeSet::from([founder])), true)
+            .await
+            .expect_err("the founder has no member key");
         assert!(
-            !live.members.contains(&Ss58::new(DEV)?),
-            "the shrunk membership must still be published even though rotation was skipped"
+            format!("{err:#}").contains("membership WAS already published"),
+            "{err:#}"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn publish_and_rotate_strict_still_fails_on_nothing_to_rotate() -> anyhow::Result<()> {
-        // `rotate` (the direct command, not via `remove`) must keep the
-        // ORIGINAL strict behavior: NothingToRotate is a genuine command
-        // failure the operator must see and act on.
-        let bucket = Arc::new(MemoryBlobStore::default());
-        let store = epoch0_store(&bucket)?;
-        let cfg = rotation_test_config();
-        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
-        let remaining = BTreeSet::from([founder]);
-
-        let err = publish_and_rotate(
-            &cfg,
-            &store,
-            Some(remaining),
-            RotationStrictness::Strict,
-            true,
-        )
-        .await
-        .expect_err("NothingToRotate must still fail the direct rotate path");
         assert!(
             err.chain().any(|cause| matches!(
                 cause.downcast_ref::<MemError>(),
-                Some(MemError::NothingToRotate { .. })
+                Some(MemError::FounderHasNoMemberKey { .. })
             )),
-            "the underlying NothingToRotate cause must stay in the error chain: {err}"
+            "{err:#}"
+        );
+        assert!(
+            bucket.list(&format!("{TEAM}/_keys/")).await?.is_empty(),
+            "no wrap is written"
         );
         Ok(())
     }
@@ -2454,14 +2427,7 @@ mod tests {
         let cfg = rotation_test_config();
         let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
 
-        publish_and_rotate(
-            &cfg,
-            &store,
-            Some(BTreeSet::from([founder])),
-            RotationStrictness::Tolerant,
-            false,
-        )
-        .await?;
+        publish_and_rotate(&cfg, &store, Some(BTreeSet::from([founder])), false).await?;
 
         assert_eq!(
             store.current_epoch(),
@@ -2535,14 +2501,7 @@ mod tests {
         let RemovalStep::Publish(remaining) = step else {
             anyhow::bail!("expected a Publish step");
         };
-        publish_and_rotate(
-            &cfg,
-            &store,
-            Some(remaining),
-            RotationStrictness::Tolerant,
-            should_rotate,
-        )
-        .await?;
+        publish_and_rotate(&cfg, &store, Some(remaining), should_rotate).await?;
 
         assert_eq!(
             store.current_epoch(),
@@ -2576,14 +2535,7 @@ mod tests {
         let should_rotate = removal_requires_rotation(&step);
         assert!(!should_rotate, "an already-excluded target must not rotate");
 
-        publish_and_rotate(
-            &cfg,
-            &store,
-            None,
-            RotationStrictness::Tolerant,
-            should_rotate,
-        )
-        .await?;
+        publish_and_rotate(&cfg, &store, None, should_rotate).await?;
 
         assert_eq!(
             store.current_epoch(),

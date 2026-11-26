@@ -69,8 +69,9 @@ pub use teamkey::{
     wrapped_key_key, wrapped_key_recipients,
 };
 pub(crate) use teamkey::{
-    create_wraps, first_provisioned_epoch, provision_wraps, provisioner_authorized, seal_wraps,
-    unauthorized_wrap, wrap_epochs_addressed_to, wrap_keys_above,
+    accepted_wrap, create_wraps, first_provisioned_epoch, key_share_key, key_shares_prefix,
+    open_key_share, parse_key_share_key, provision_wraps, provisioner_authorized, read_slot,
+    seal_key_share, seal_wraps, unauthorized_wrap, wrap_epochs_addressed_to, wrap_keys_above,
 };
 
 use blake2::{Blake2b512, Digest};

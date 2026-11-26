@@ -105,7 +105,7 @@ pub use report::{
 };
 pub use store::{
     AnchorProof, BlobStats, BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, Degradation,
-    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, KeyCheckMatch,
+    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, Joined, KeyCheckMatch,
     KeyCheckPublished, KeyProbe, MIN_GC_GRACE, MemoryBlobStore, MemoryStore, NoteHistory,
     OpKindLabel, OpStats, PublishKeyCheck, RecallInput, RememberInput, RotationOutcome,
     S3BlobStore, SealedRecord, TeamKeyCheck, copy_store, key_check_key, load_latest_snapshot,

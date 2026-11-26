@@ -109,7 +109,7 @@ pub fn object_key(scope: &Scope, id: NoteId, version: Ulid) -> Result<String, Me
 /// The prefix of a repo segment that holds an escaped repo name.
 ///
 /// A leading `_` is otherwise reserved for the store's internal namespaces
-/// (`_oplog`, `_snapshots`, `_anchors`, `_heads`, `_keys`, `_keycheck`), so no
+/// (`_oplog`, `_snapshots`, `_anchors`, `_heads`, `_keys`, `_keycheck`, `_keyshares`), so no
 /// plain repo segment and no namespace starts with this prefix, and an escaped
 /// name can never land a note blob inside a namespace.
 pub(crate) const ESCAPED_REPO_PREFIX: &str = "_repo-";

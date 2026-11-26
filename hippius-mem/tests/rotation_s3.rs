@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use hippius_mem_core::{
-    BlobStore, NetworkPrefix, OpLogStore, S3BlobStore, Signer as _, Sr25519Signer,
+    BlobStore, NetworkPrefix, OpLogStore, S3BlobStore, SecretKey, Signer as _, Sr25519Signer, Ss58,
+    load_member_keys, rotate_team_key,
 };
 use serde_json::{Value, json};
 
@@ -603,5 +604,168 @@ async fn a_member_who_joins_after_two_rotations_reads_every_epoch() -> anyhow::R
     );
 
     clear_team(&bucket, LATE_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the never-joined-founder test owns.
+const FOUNDER_TEAM: &str = "rw-founder-live";
+
+/// A founder that follows the runbook without `join` and runs `rotate` still
+/// reads the epoch it minted: `rotate` publishes the founder's member key
+/// first and says so, the new epoch is wrapped to the founder, and its fresh
+/// session reads a member's note sealed under it. Without the mnemonic,
+/// `rotate` is refused before it writes anything. The founder used to be left
+/// out of the new epoch, with only a stderr warning, and could never read it.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_founder_who_never_joined_reads_the_epoch_its_rotate_mints() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, FOUNDER_TEAM).await;
+
+    let founder = Machine::new(
+        61,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        62,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, FOUNDER_TEAM, &founder_address)?;
+    }
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    let keys = format!("{FOUNDER_TEAM}/_keys/");
+    let before = objects_under(&bucket, &keys).await?;
+    let unset = founder.command(Mnemonic::Unset).arg("rotate").output()?;
+    let unset_err = String::from_utf8_lossy(&unset.stderr);
+    assert!(
+        !unset.status.success() && unset_err.contains("require HIPPIUS_MEM_MNEMONIC"),
+        "rotate without the mnemonic is refused: {unset_err}"
+    );
+    assert_eq!(
+        objects_under(&bucket, &keys).await?,
+        before,
+        "nothing written"
+    );
+
+    let rotation = founder.run(&["rotate"])?;
+    assert!(
+        rotation.contains("published this founder's member key")
+            && rotation.contains(&format!("  {founder_address}")),
+        "rotate says it published the founder's key and wraps the founder: {rotation}"
+    );
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under epoch one by a member")?;
+    drop(session);
+
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let (failed, text) = session.call("get", &json!({ "id": id }))?;
+    assert!(
+        !failed,
+        "the founder reads the member's epoch-1 note: {text}"
+    );
+    drop(session);
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    assert!(
+        doctor.status.success(),
+        "doctor passes for the founder: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    clear_team(&bucket, FOUNDER_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the stranded-epoch repair test owns.
+const STRANDED_TEAM: &str = "rw-stranded-live";
+
+/// An epoch an older release minted without the founder (wrapped by the
+/// founder to the member only) is repaired: `doctor` names the repair, the
+/// member's `admin share-epoch-keys` sends the founder the opening of its own
+/// founder-signed wrap, and the founder's `provision` loads the key from that
+/// wrap and wraps it to the founder, whose fresh session then reads the
+/// member's note. Before, no command could give the founder that epoch.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_founder_stranded_by_an_older_rotation_recovers_the_epoch() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, STRANDED_TEAM).await;
+
+    let founder = Machine::new(
+        71,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        72,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, STRANDED_TEAM, &founder_address)?;
+    }
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    // What an older `rotate` by a founder that never joined left behind.
+    let founder_signer =
+        Sr25519Signer::from_seed_with_prefix(&founder.seed, NetworkPrefix::HIPPIUS)?;
+    let member_keys = load_member_keys(&bucket, STRANDED_TEAM).await?;
+    let founder_pin = Ss58::new(&founder_address)?;
+    let wrapped = rotate_team_key(
+        &bucket,
+        STRANDED_TEAM,
+        &SecretKey::from_bytes([91_u8; 32]),
+        1,
+        &member_keys,
+        Some(&founder_pin),
+        &founder_signer,
+    )
+    .await?;
+    assert_eq!(wrapped.len(), 1, "epoch 1 reaches the member only");
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under the stranded epoch")?;
+    drop(session);
+
+    founder.run(&["join"])?;
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        !doctor.status.success() && doctor_err.contains("admin share-epoch-keys"),
+        "doctor names the repair: {doctor_err}"
+    );
+
+    let shared = member.run(&["admin", "share-epoch-keys"])?;
+    assert!(
+        shared.contains("shared the key of epoch 0, 1 with"),
+        "{shared}"
+    );
+    let provision = founder.run(&["provision", "--no-recovery"])?;
+    assert!(
+        provision.contains("loaded the key of epoch 1"),
+        "provision loads the shared epoch: {provision}"
+    );
+
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let (failed, text) = session.call("get", &json!({ "id": id }))?;
+    assert!(
+        !failed,
+        "the founder reads the stranded epoch's note: {text}"
+    );
+    drop(session);
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    assert!(
+        doctor.status.success(),
+        "doctor passes once the founder holds the epoch: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    clear_team(&bucket, STRANDED_TEAM).await;
     Ok(())
 }
