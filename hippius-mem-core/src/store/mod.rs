@@ -17093,17 +17093,21 @@ mod tests {
         let version = first.current_version(id)?;
 
         fake.armed.store(true, Ordering::SeqCst);
-        let (held, other) = tokio::join!(
-            first.edit_with_precondition(id, numbered_input(1), Some(version)),
-            async {
-                fake.paused.notified().await;
-                let result = second
-                    .edit_with_precondition(id, numbered_input(2), Some(version))
-                    .await;
-                fake.resume.notify_one();
-                result
+        let held_edit = first.edit_with_precondition(id, numbered_input(1), Some(version));
+        tokio::pin!(held_edit);
+        // An edit that ends before its note PUT never pauses; it fails the test
+        // here instead of leaving it waiting for the pause.
+        tokio::select! {
+            ended = &mut held_edit => {
+                return Err(format!("the first edit ended before its note PUT: {ended:?}").into());
             }
-        );
+            () = fake.paused.notified() => {}
+        }
+        let other = second
+            .edit_with_precondition(id, numbered_input(2), Some(version))
+            .await;
+        fake.resume.notify_one();
+        let held = held_edit.await;
 
         other?;
         assert!(
