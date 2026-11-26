@@ -11,8 +11,9 @@ use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
     BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyCheckMatch, KeyProbe, MemError,
     MemoryStore, OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail,
-    derive_identity, find_suppressed_tails, load_manifest, matches_published_key_check, open,
-    probe_create_only, read_heads, read_wrapped_key, seal, wrapped_key_recipients,
+    derive_identity, find_suppressed_tails, key_check_key, load_manifest,
+    matches_published_key_check, open, probe_create_only, read_heads, read_wrapped_key, seal,
+    wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -572,10 +573,11 @@ async fn check_team_key(
     if published == KeyCheckMatch::Differs {
         bail!(
             "the configured team key is not team {team}'s key: it does not match the key check \
-             the team published at {team}/_keycheck/{:020}. Writes from this machine are \
-             refused until it is fixed. Set the correct key in team_key_hex (or in \
+             the team published at {}, or that check was replaced. Writes from this machine \
+             are refused until it is fixed. Compare with `hippius-mem doctor` on a teammate's \
+             machine before changing the key; then set the correct key in team_key_hex (or in \
              HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) and run doctor again",
-            0
+            key_check_key(team, 0)
         );
     }
 

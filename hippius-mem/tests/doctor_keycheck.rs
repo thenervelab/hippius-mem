@@ -66,7 +66,8 @@ fn doctor_warns_when_no_key_check_is_published() -> anyhow::Result<()> {
 }
 
 /// After the key's check is published, `doctor` reports the match and drops
-/// the warning; with another key it fails, naming the check's object key.
+/// the warning; with another key it fails, naming the check's object key and
+/// that the check itself may be the replaced side, since it is unsigned.
 #[test]
 fn doctor_reports_a_published_key_check_match_and_fails_a_mismatch() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
@@ -87,6 +88,10 @@ fn doctor_reports_a_published_key_check_match_and_fails_a_mismatch() -> anyhow::
     assert!(
         err.contains("is not team trial's key")
             && err.contains(&format!("trial/_keycheck/{:020}", 0)),
+        "{err}"
+    );
+    assert!(
+        err.contains("or that check was replaced") && err.contains("on a teammate's machine"),
         "{err}"
     );
     assert!(!err.contains(MATCHES), "{err}");

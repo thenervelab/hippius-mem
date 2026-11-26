@@ -96,7 +96,8 @@ pub(crate) enum WriteMode {
 
 /// The object key of `team`'s check for `epoch`. The epoch is zero-padded to the
 /// width of `u64::MAX`, as op keys are, so a listing sorts by epoch.
-pub(crate) fn key_check_key(team: &str, epoch: u64) -> String {
+#[must_use]
+pub fn key_check_key(team: &str, epoch: u64) -> String {
     format!("{team}/_keycheck/{epoch:020}")
 }
 

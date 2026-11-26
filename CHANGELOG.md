@@ -100,7 +100,9 @@ field.
   server never publishes one at boot. The server compares its key at boot and
   re-reads the check about once a minute after that. A mismatch
   refuses writes and index checkpoints, before any ciphertext is uploaded, with
-  an error naming the fix, and `doctor` fails. With no check the server only
+  an error naming the fix, and `doctor` fails. Its message names the check's
+  object and says the check may be what was replaced (it is unsigned), so a
+  member compares with a teammate's `doctor` before changing a key. With no check the server only
   warns, loudly when its key opens fewer than half of the epoch's oldest notes.
   A publish (`--replace` included) tries the key on those notes first and
   publishes nothing when it opens fewer than half of them, and `doctor` reports
