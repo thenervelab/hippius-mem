@@ -1037,8 +1037,9 @@ const ANCHOR_SEQ_ATTEMPTS: u32 = 8;
 /// normally suffices; the rest cover a burst of concurrent writers. Arbitrary.
 const EDIT_SYNC_ATTEMPTS: usize = 3;
 
-/// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries. A bound,
-/// so the probe costs at most this many GETs. Its majority result is reported
+/// How many of an epoch's oldest notes [`MemoryStore::probe_epoch_key`] tries,
+/// counting a missing or altered blob, so the probe costs at most this many
+/// GETs. Its majority result is reported
 /// at boot, withholds a key-check publish and can fail `doctor`, so the number
 /// must be large enough that a few stray notes sealed under another key do not
 /// decide it. Arbitrary within that reasoning.
@@ -3570,8 +3571,8 @@ impl MemoryStore {
         Ok(KeyCheckPublished::Published { create_only })
     }
 
-    /// Try this machine's key for `epoch` on that epoch's oldest notes, up to
-    /// [`KEY_PROBE_NOTES`] of them, and report the majority outcome, whatever
+    /// Try this machine's key for `epoch` on that epoch's [`KEY_PROBE_NOTES`]
+    /// oldest notes, and report the majority outcome, whatever
     /// the team has published. For `doctor`, which reports it beside the
     /// published check. Keeps no verdict, so the write path is unaffected.
     ///
@@ -3679,11 +3680,13 @@ impl MemoryStore {
         )
     }
 
-    /// Try `key` on the oldest notes sealed under `epoch`, up to
-    /// [`KEY_PROBE_NOTES`] of them, and report the majority outcome.
+    /// Try `key` on the [`KEY_PROBE_NOTES`] oldest notes sealed under `epoch`,
+    /// and report the majority outcome.
     ///
     /// Only an AEAD failure on a blob whose content hash matches its signed op
-    /// counts against the key: a missing or altered blob says nothing about it.
+    /// counts against the key: a missing or altered blob says nothing about it,
+    /// and counts for neither side. It still uses one of the attempts, so a
+    /// bucket that lost its oldest blobs costs at most the bound in GETs.
     async fn probe_epoch_key(&self, epoch: u64, key: &SecretKey) -> Result<KeyProbe, MemError> {
         let (members_view, _raw_lamport_tip) = self.read_and_filter().await?;
         // `converge` keys by note id, a ULID, so iteration runs oldest first.
@@ -3698,10 +3701,7 @@ impl MemoryStore {
         }
 
         let (mut opened, mut failed) = (0_usize, 0_usize);
-        for pointer in pointers {
-            if opened + failed == KEY_PROBE_NOTES {
-                break;
-            }
+        for pointer in pointers.into_iter().take(KEY_PROBE_NOTES) {
             let Ok(ciphertext) = self.blob.get(&pointer.object_key).await else {
                 continue;
             };
@@ -16821,20 +16821,63 @@ mod tests {
         Ok(())
     }
 
-    /// A store that counts GETs of key-check objects.
-    struct CountingKeyCheckGets {
+    /// A missing blob uses one of the probe's attempts: with every note blob
+    /// of the epoch gone, the probe stops at `super::KEY_PROBE_NOTES` GETs. Missing
+    /// blobs used to be skipped without counting, so the probe walked the
+    /// whole epoch, one GET per note, at every boot.
+    #[tokio::test]
+    async fn missing_blobs_count_toward_the_key_probe_bound() -> TestResult {
+        let fake = Arc::new(CountingGets::new("/mem_"));
+        let blob = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let writer = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        for i in 0..super::KEY_PROBE_NOTES + 4 {
+            writer.remember(numbered_input(i)).await?;
+        }
+        for key in blob.list(&format!("{TEAM}/")).await? {
+            if key.contains("/mem_") {
+                blob.delete(&key).await?;
+            }
+        }
+        let reader = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
+        let before = fake.gets.load(Ordering::SeqCst);
+
+        let probe = reader
+            .probe_epoch_key(0, &SecretKey::from_bytes(TEST_KEY))
+            .await?;
+
+        assert_eq!(probe, KeyProbe::Inconclusive, "nothing could be read");
+        assert_eq!(
+            fake.gets.load(Ordering::SeqCst) - before,
+            super::KEY_PROBE_NOTES
+        );
+        Ok(())
+    }
+
+    /// A store that counts GETs of keys containing `counted`.
+    struct CountingGets {
         inner: MemoryBlobStore,
+        counted: &'static str,
         gets: std::sync::atomic::AtomicUsize,
     }
 
+    impl CountingGets {
+        fn new(counted: &'static str) -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                counted,
+                gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
-    impl BlobStore for CountingKeyCheckGets {
+    impl BlobStore for CountingGets {
         async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
             self.inner.put(key, bytes).await
         }
 
         async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-            if key.contains("/_keycheck/") {
+            if key.contains(self.counted) {
                 self.gets.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.get(key).await
@@ -16853,10 +16896,7 @@ mod tests {
     /// published check, not one per write.
     #[tokio::test]
     async fn writes_inside_the_recheck_interval_read_the_check_once() -> TestResult {
-        let fake = Arc::new(CountingKeyCheckGets {
-            inner: MemoryBlobStore::default(),
-            gets: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let fake = Arc::new(CountingGets::new("/_keycheck/"));
         let store = store_over(Arc::clone(&fake) as Arc<dyn BlobStore>, SOLO_SEED)?;
         store.remember(numbered_input(0)).await?;
         store.remember(numbered_input(1)).await?;

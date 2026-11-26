@@ -587,7 +587,7 @@ stated plainly.
   — it runs a live seal→put→get→open probe whose stored object the gateway
   returns as ciphertext that round-trips, proving the note-content encryption
   boundary holds. It then compares `team_key_hex` with the team's published key check
-  for epoch 0, and tries it on up to 16 of that epoch's oldest notes, reporting the
+  for epoch 0, and tries it on that epoch's 16 oldest notes (one GET each), reporting the
   result; the run fails when the check is another key's, or when no usable check is
   published, the team has not rotated past epoch 0, and the key opens fewer than half of
   the notes tried. Beside a matching check, or after a rotation, that probe result is a
