@@ -531,11 +531,12 @@ fn render_fresh_config(
 /// - a profile (primary or `[[teams]]`) already named `bundle.team`;
 /// - an `s3_endpoint` differing from the existing top level (a shared
 ///   TOP-LEVEL key — one file cannot speak to two gateways);
-/// - a bundle `max_epoch` above the existing top level (also TOP-LEVEL; a
-///   silent drop would hide every post-rotation note — the documented rotate
-///   gotcha);
 /// - no `--orgs` (an org-less `[[teams]]` profile is a second catch-all,
 ///   which `Config::validate` rejects at the next launch).
+///
+/// A bundle `max_epoch` above the existing top-level one is not a conflict:
+/// startup lists the epochs wrapped to this member, and `max_epoch` is only the
+/// range it tries when that listing fails, so the existing value is kept.
 ///
 /// The full candidate document is validated before the block is appended, so
 /// a refused append leaves the existing file byte-identical. A successful
@@ -578,18 +579,6 @@ fn append_profile(
              cannot hold teams on two gateways — use a separate config \
              (HIPPIUS_MEM_CONFIG=<other file> hippius-mem join --bundle ...)",
             existing_endpoint = existing.s3_endpoint,
-            path = path.display()
-        );
-    }
-    if let Some(epoch) = bundle.max_epoch
-        && existing.max_epoch < epoch.get()
-    {
-        bail!(
-            "this team has rotated to epoch {epoch}, but {path} sets max_epoch = {existing_epoch}; \
-             max_epoch is a shared TOP-LEVEL key — raise `max_epoch = {epoch}` at the top of the \
-             file (before any [[teams]] table), then re-run; a stale max_epoch silently hides \
-             every note sealed after the rotation",
-            existing_epoch = existing.max_epoch,
             path = path.display()
         );
     }
@@ -1044,43 +1033,14 @@ mod tests {
         Ok(())
     }
 
+    /// A bundle from a team that rotated appends to a config whose top-level
+    /// `max_epoch` is lower, keeping that value: startup lists the rotated
+    /// epochs, and `max_epoch` is only the range it tries when the listing
+    /// fails. The append used to be refused until the operator raised it.
     #[test]
-    fn append_with_stale_max_epoch_is_refused_with_guidance() -> anyhow::Result<()> {
-        // The rotate gotcha: silently dropping max_epoch would hide every
-        // post-rotation note. The refusal names the exact top-level edit.
+    fn append_with_a_lower_max_epoch_is_accepted() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = existing_primary(dir.path())?;
-        let mut bundle = sample_bundle("acme");
-        bundle.max_epoch = NonZeroU64::new(2);
-        let err = write_config(
-            &path,
-            &bundle,
-            &hex64("cd"),
-            &["github.com/acme".to_owned()],
-        )
-        .expect_err("a stale top-level max_epoch must be refused");
-        assert!(
-            format!("{err:#}").contains("max_epoch = 2"),
-            "names the exact edit: {err:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn append_with_covering_max_epoch_is_accepted() -> anyhow::Result<()> {
-        // An existing max_epoch at or above the bundle's already bootstraps
-        // the rotated epochs — no conflict.
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("hippius-mem.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "max_epoch = 5\nteam = \"primary\"\nbucket = \"b1\"\naccess_key_id = \"AK1\"\n\
-                 secret = \"s1\"\nteam_key_hex = \"{key}\"\nauthor_seed_hex = \"{seed}\"\n",
-                key = hex64("11"),
-                seed = hex64("22"),
-            ),
-        )?;
         let mut bundle = sample_bundle("acme");
         bundle.max_epoch = NonZeroU64::new(2);
         write_config(
@@ -1090,7 +1050,7 @@ mod tests {
             &["github.com/acme".to_owned()],
         )?;
         let cfg = Config::from_toml_str(&std::fs::read_to_string(&path)?)?;
-        assert_eq!(cfg.max_epoch, 5);
+        assert_eq!(cfg.max_epoch, 0);
         assert_eq!(cfg.teams[0].name, "acme");
         Ok(())
     }

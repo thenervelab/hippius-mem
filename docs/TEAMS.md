@@ -180,9 +180,8 @@ the config **0600**:
 - **Fresh machine** (no config yet): the bundle becomes the primary profile at
   `$HIPPIUS_MEM_CONFIG` (or `${XDG_CONFIG_HOME:-~/.config}/hippius-mem/hippius-mem.toml`).
 - **Existing config**: the bundle is appended as an org-routed `[[teams]]` profile —
-  pass `--orgs github.com/acme` so repos route to it. A conflicting profile name, a
-  different `s3_endpoint`, or a too-low top-level `max_epoch` is **refused with
-  guidance**, never silently overwritten.
+  pass `--orgs github.com/acme` so repos route to it. A conflicting profile name or a
+  different `s3_endpoint` is **refused with guidance**, never silently overwritten.
 
 When `HIPPIUS_MEM_MNEMONIC` is set it also publishes the member key (the same thing
 the bare `hippius-mem join` does) so the founder can `provision` wrapped epoch keys.

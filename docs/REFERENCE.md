@@ -419,8 +419,8 @@ stated plainly.
 - **`join [--bundle [<path|->] [--orgs <host/org,...>]]` / `provision` / `members`** — the
   onboarding flow. `join --bundle` consumes a founder's invite bundle, writing the local
   config (a fresh machine's primary profile, or an org-routed `[[teams]]` profile on an
-  existing config with `--orgs`); a conflicting profile name, `s3_endpoint`, or too-low
-  `max_epoch` is refused with guidance, never silently overwritten. Easiest path: run
+  existing config with `--orgs`); a conflicting profile name or `s3_endpoint` is refused with
+  guidance, never silently overwritten. Easiest path: run
   `hippius-mem join --bundle` with no path, PASTE the bundle at the prompt, then press
   Ctrl-D on an empty line to finish; with
   stdin piped instead of a terminal, no-path `--bundle` reads to EOF exactly like
