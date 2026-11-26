@@ -13,7 +13,8 @@
 //! (gone); `link`/`history`/`redact` on a pair of notes; omitted-`k`
 //! recall using the production window; `refresh` across two machines;
 //! omitted/`""` `repo` with a bound `default_repo`; `force` and
-//! `expected_version`; `reconcile` on a clean vault; `token_budget` on
+//! `expected_version`, on one machine and against a teammate's newer version;
+//! `reconcile` on a clean vault; `token_budget` on
 //! recall; `brief` of a stored convention; `get`'s handler-error path; and
 //! one made-up tool name. Every advertised tool now has at least one
 //! `tools/call` path here.
@@ -661,6 +662,63 @@ async fn force_and_expected_version_through_call_tool() -> Result<(), Box<dyn st
     assert!(
         after.contains("ulid keys stay"),
         "the matching version must apply the edit, got {after}"
+    );
+    Ok(())
+}
+
+/// An edit that names a teammate's newer version and omits the body keeps the
+/// teammate's body: omitted fields come from the version the swap compares
+/// against, not from this machine's older copy.
+#[tokio::test]
+async fn edit_with_a_teammates_version_keeps_their_body() -> Result<(), Box<dyn std::error::Error>>
+{
+    let blob: std::sync::Arc<dyn hippius_mem_core::BlobStore> =
+        std::sync::Arc::new(hippius_mem_core::MemoryBlobStore::default());
+    let a = harness::session_over(harness::store_over(blob.clone(), [5_u8; 32]), None).await?;
+    let b = harness::session_over(harness::store_over(blob, [6_u8; 32]), None).await?;
+
+    let stored = ok_call(
+        &a,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "summary": "pelican-queue drops acks on rebalance",
+            "body": "body from machine a",
+        }),
+    )
+    .await?;
+    let id = extract_mem_id(&stored)?;
+    // A reads the note now, so its index holds the first version when B edits.
+    ok_call(&a, "get", json!({ "id": id })).await?;
+
+    ok_call(&b, "refresh", json!({})).await?;
+    ok_call(
+        &b,
+        "edit",
+        json!({ "id": id, "body": "body from machine b" }),
+    )
+    .await?;
+    let got: serde_json::Value =
+        serde_json::from_str(&ok_call(&b, "get", json!({ "id": id })).await?)?;
+    let version = got["version"].as_str().ok_or("get must carry version")?;
+
+    ok_call(
+        &a,
+        "edit",
+        json!({ "id": id, "tags": ["kafka"], "expected_version": version }),
+    )
+    .await?;
+
+    let after: serde_json::Value =
+        serde_json::from_str(&ok_call(&a, "get", json!({ "id": id })).await?)?;
+    assert_eq!(
+        after["body"], "body from machine b",
+        "the omitted body must come from the version the edit named, got {after}"
+    );
+    assert_eq!(
+        after["tags"],
+        json!(["kafka"]),
+        "the edit must apply, got {after}"
     );
     Ok(())
 }

@@ -1432,8 +1432,26 @@ impl MemoryServer {
     async fn logic_edit(&self, params: EditParams) -> Result<EditOutput, HandlerError> {
         self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
+        // Parse the optional CAS token at the boundary: a malformed hex version is
+        // bad input, surfaced before the store is touched.
+        let precondition = match params.expected_version.as_deref() {
+            None => None,
+            Some(hex) => Some(
+                Blake3Hash::from_hex(hex).map_err(|err| HandlerError::BadInput {
+                    field: "expected_version",
+                    detail: err.to_string(),
+                })?,
+            ),
+        };
         // Waits for warmup: `edit` reads the current note via the index (see `logic_forget`).
         self.await_warm().await;
+        // The store syncs a teammate's newer version before its compare-and-swap.
+        // Omitted fields are filled from the note read below, so that read must see
+        // the same version: filled from a stale note, an edit naming the teammate's
+        // version would pass the swap and write back the stale body or summary.
+        if precondition.is_some() {
+            self.store.refresh_now().await?;
+        }
         let current = self.store.hydrate(id).await?;
         let input = RememberInput {
             force: false,
@@ -1445,17 +1463,6 @@ impl MemoryServer {
             },
             summary: params.summary.unwrap_or(current.summary),
             body: params.body.unwrap_or(current.body),
-        };
-        // Parse the optional CAS token at the boundary: a malformed hex version is
-        // bad input, surfaced before the store is touched.
-        let precondition = match params.expected_version.as_deref() {
-            None => None,
-            Some(hex) => Some(
-                Blake3Hash::from_hex(hex).map_err(|err| HandlerError::BadInput {
-                    field: "expected_version",
-                    detail: err.to_string(),
-                })?,
-            ),
         };
         // Precompute the summary embedding on the blocking pool, then commit through
         // the runtime-free `edit_offloaded`. Besides keeping the ONNX embed off the
