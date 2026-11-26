@@ -116,7 +116,7 @@ fn a_rotated_team_joined_without_a_mnemonic_is_told_to_publish_later() -> anyhow
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("ROTATED its key: to receive wrapped epoch keys, set"),
+        stdout.contains("ROTATED its key: to receive its epoch keys, set"),
         "{stdout}"
     );
     assert!(!stdout.contains("your member key is published"), "{stdout}");

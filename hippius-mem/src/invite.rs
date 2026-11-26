@@ -163,9 +163,9 @@ fn render_bundle(bundle: &InviteBundle) -> anyhow::Result<String> {
     let rotated_note = if bundle.max_epoch.is_some() {
         "#\n\
          # This team has ROTATED its key (see max_epoch below): run\n\
-         # `hippius-mem join` and have the founder run `provision` so the\n\
-         # newer epoch keys are wrapped to you — without them, notes sealed\n\
-         # after the rotation silently never appear on your machine.\n"
+         # `hippius-mem join` and have the founder run `provision`, which\n\
+         # wraps every epoch key the founder holds to you; without them,\n\
+         # `recall` leaves out the notes sealed after the rotation.\n"
     } else {
         ""
     };

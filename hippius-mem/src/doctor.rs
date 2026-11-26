@@ -381,6 +381,17 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         Some(_) | None => None,
     };
 
+    // A store of its own, because loading the rotated keys changes the ring and
+    // write epoch the key probes below run against.
+    if let Ok(reader) = key_probe_store(cfg, profile).await {
+        if let Some(mnemonic) = mnemonic.as_deref() {
+            crate::admin::bootstrap_epochs(&reader, mnemonic, cfg.max_epoch).await;
+        }
+        for line in keyless_epoch_lines(&reader, &author, mnemonic.is_some()).await {
+            tracing::warn!("{line}");
+        }
+    }
+
     probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store, epoch).await?;
     if let Some(line) = newest_epoch {
         bail!("{line}");
@@ -448,6 +459,44 @@ async fn newest_epoch_key_line(
     Some(format!(
         "FAIL: team {team:?} epoch {epoch}: the wrap addressed to this machine ({author}) {cause}"
     ))
+}
+
+/// One warning line per epoch whose notes `store` leaves out because it holds
+/// no key for that epoch, after a sync, each naming the fix. `store` holds
+/// every key this machine can load (the caller bootstrapped it when
+/// `has_mnemonic`), so an epoch named here is one whose notes this machine's
+/// server does not show. A failed sync yields no lines: the storage probe
+/// reports it.
+///
+/// Costs one full sync: the op-log read and a GET per note this machine has
+/// not cached.
+async fn keyless_epoch_lines(
+    store: &MemoryStore,
+    author: &Ss58,
+    has_mnemonic: bool,
+) -> Vec<String> {
+    if store.sync().await.is_err() {
+        return Vec::new();
+    }
+    let team = store.team();
+    let author = author.as_str();
+    let remedy = if has_mnemonic {
+        "run `hippius-mem join` here if this machine has not, then ask the founder to run \
+         `hippius-mem provision`, which wraps every epoch the founder holds"
+    } else {
+        "set HIPPIUS_MEM_MNEMONIC to this member's mnemonic, which loads the epochs wrapped \
+         to it, and run `hippius-mem doctor` again"
+    };
+    store
+        .keyless_notes()
+        .into_iter()
+        .map(|(epoch, notes)| {
+            format!(
+                "WARN: team {team:?}: {notes} note(s) are sealed under epoch {epoch}, which this \
+                 machine ({author}) holds no key for, so its server does not show them; {remedy}"
+            )
+        })
+        .collect()
 }
 
 /// The failure line when `key`, the key this machine loaded for the rotated
@@ -1262,10 +1311,10 @@ mod tests {
 
     use super::{
         PROBE_KEY_PREFIX, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key,
-        config_for_key_probe, create_only_line, head_regression_lines, newest_epoch_key_line,
-        offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
-        probe_storage_then_team_key, quarantine_lines, removed_member_still_holds_key_lines,
-        resolve_profile_for_remote, suppressed_tail_lines,
+        config_for_key_probe, create_only_line, head_regression_lines, keyless_epoch_lines,
+        newest_epoch_key_line, offline_report_lines, op_log_integrity_lines,
+        probe_encryption_boundary, probe_live, probe_storage_then_team_key, quarantine_lines,
+        removed_member_still_holds_key_lines, resolve_profile_for_remote, suppressed_tail_lines,
         unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
@@ -2036,6 +2085,55 @@ mod tests {
             team.to_owned(),
             1,
         ))
+    }
+
+    /// A machine without the key of an epoch that holds notes is told, with the
+    /// epoch, the count and the fix; a machine that holds every key is told
+    /// nothing. `doctor` used to pass a member that could not read an older
+    /// epoch as long as it held the newest one.
+    #[tokio::test]
+    async fn keyless_epoch_lines_name_each_epoch_this_machine_cannot_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = key_store(&blob, TEAM, [41_u8; 32], [7_u8; 32])?;
+        founder
+            .join_as_member(&derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        for summary in ["one under epoch one", "two under epoch one"] {
+            founder
+                .remember(RememberInput {
+                    note_type: NoteType::Decision,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: summary.to_owned(),
+                    body: "body".to_owned(),
+                    force: true,
+                })
+                .await?;
+        }
+        let author = Sr25519Signer::from_seed_with_prefix(&[41_u8; 32], NetworkPrefix::HIPPIUS)?
+            .author_ss58();
+
+        let lagging = key_store(&blob, TEAM, [42_u8; 32], [7_u8; 32])?;
+        let lines = keyless_epoch_lines(&lagging, &author, true).await;
+        let [line] = lines.as_slice() else {
+            return Err(format!("one line expected: {lines:?}").into());
+        };
+        assert!(
+            line.contains("2 note(s) are sealed under epoch 1")
+                && line.contains("ask the founder to run `hippius-mem provision`"),
+            "{line}"
+        );
+        assert!(
+            keyless_epoch_lines(&founder, &author, true)
+                .await
+                .is_empty()
+        );
+        Ok(())
     }
 
     /// A store that refuses every request, as a gateway does for a wrong secret.

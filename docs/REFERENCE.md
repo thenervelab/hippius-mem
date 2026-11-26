@@ -422,8 +422,9 @@ stated plainly.
   stdin piped instead of a terminal, no-path `--bundle` reads to EOF exactly like
   `--bundle -`. Bare `join` (requires
   `HIPPIUS_MEM_MNEMONIC`) only publishes this member's signed key. The founder runs
-  `provision` to wrap the current-epoch team key to every published, manifest-authorized
-  member key. Only the founder (or the manifest's recovery key) may run it: anyone else is
+  `provision` to wrap every epoch key it holds (the founding key, and each rotated epoch its
+  `HIPPIUS_MEM_MNEMONIC` loads) to every published, manifest-authorized member key, so a member
+  who joins after a rotation reads the older epochs too. Only the founder (or the manifest's recovery key) may run it: anyone else is
   refused before anything is written, because readers refuse a wrap they signed. It never
   replaces a wrap a reader accepts, so a re-run writes only the missing wraps; a member who
   re-joined with another mnemonic keeps the old wrap until the next `rotate`. `members` prints the founder-signed membership (one SS58 per line, or a note

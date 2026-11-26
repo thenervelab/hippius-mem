@@ -8074,9 +8074,15 @@ impl MemoryStore {
             .unwrap_or_default())
     }
 
-    /// Founder action: wrap this team's CURRENT-epoch key to every published member
-    /// key the founder-signed manifest authorizes, so those members can decrypt
-    /// notes.
+    /// Founder action: wrap every epoch key this store's ring holds to every
+    /// published member key the founder-signed manifest authorizes, so those
+    /// members can decrypt the notes of every epoch, not only the current one.
+    ///
+    /// The manifest is the entitlement: a current member receives every epoch
+    /// the founder holds, including epochs minted before they joined (the team
+    /// shares its history with members, as epoch 0 always did); a removed member
+    /// is not listed and receives nothing new. An epoch the ring does not hold
+    /// (the caller did not bootstrap it) is not wrapped.
     ///
     /// Only a signer a reader accepts wraps from may run it: the live manifest's
     /// founder or its trusted recovery key; with no manifest, the pinned founder
@@ -8099,27 +8105,29 @@ impl MemoryStore {
     /// # Errors
     ///
     /// [`MemError::Unauthorized`] if this signer may not provision (see above),
-    /// [`MemError::KeyUnavailable`] if this store's key-ring lacks the current
-    /// epoch's key, or whatever [`load_manifest`] / [`load_member_keys`] / the
-    /// wrap reads and writes report.
+    /// or whatever [`load_manifest`] / [`load_member_keys`] / the wrap reads and
+    /// writes report.
     pub async fn provision_members(&self) -> Result<Provisioned, MemError> {
         let manifest = self.current_manifest().await?;
         self.require_provisioner(manifest.as_ref())?;
 
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
-        let epoch = self.current_epoch();
-        let team_key = self.key_for_epoch(epoch)?;
-        // This store's own signer is the provisioner: it signs every wrap this
-        // call produces, recorded in each `WrappedKey` as proof of who sealed it.
-        let wraps = seal_wraps(
-            &self.team,
-            &team_key,
-            epoch,
-            &member_keys,
-            manifest.as_ref(),
-            self.founder.as_ref(),
-            self.signer.as_ref(),
-        )?;
+        let mut wraps = Vec::new();
+        for epoch in self.held_epochs() {
+            let team_key = self.key_for_epoch(epoch)?;
+            // This store's own signer is the provisioner: it signs every wrap
+            // this call produces, recorded in each `WrappedKey` as proof of who
+            // sealed it.
+            wraps.extend(seal_wraps(
+                &self.team,
+                &team_key,
+                epoch,
+                &member_keys,
+                manifest.as_ref(),
+                self.founder.as_ref(),
+                self.signer.as_ref(),
+            )?);
+        }
         provision_wraps(
             self.blob.as_ref(),
             wraps,
@@ -11654,6 +11662,47 @@ mod tests {
             before,
             "no wrap changed"
         );
+        Ok(())
+    }
+
+    /// A member who joins after two rotations is wrapped every epoch the
+    /// founder holds, so it reads the notes sealed under each. `provision` used
+    /// to wrap the current epoch only, so the newcomer never read epoch 1.
+    #[tokio::test]
+    async fn provision_wraps_every_epoch_the_founder_holds_to_a_late_member() -> TestResult {
+        const LATE_PHRASE: &str =
+            "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (founder, member) = founder_and_member_after_a_rotation(&blob).await?;
+        member.set_current_epoch(1);
+        let sealed_at_1 = member.remember(numbered_input(1)).await?;
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 2);
+
+        let late = store_over(Arc::clone(&blob), [23_u8; 32])?;
+        let late_identity = crate::derive_identity(LATE_PHRASE, NetworkPrefix::HIPPIUS)?;
+        late.join_as_member(&late_identity).await?;
+        founder
+            .publish_membership(BTreeSet::from([member.author.clone(), late.author.clone()]))
+            .await?;
+        let provisioned = founder.provision_members().await?;
+        let late_epochs: Vec<u64> = provisioned
+            .written
+            .iter()
+            .filter(|(_, recipient)| recipient == &late.author)
+            .map(|(epoch, _)| *epoch)
+            .collect();
+        assert_eq!(late_epochs, [0, 1, 2], "{provisioned:?}");
+
+        let restarted = store_over(Arc::clone(&blob), [23_u8; 32])?;
+        let epochs = restarted.wrapped_epochs().await?;
+        assert_eq!(
+            restarted
+                .bootstrap_epoch_keys(&late_identity, &epochs)
+                .await?,
+            3
+        );
+        restarted.sync().await?;
+        assert_eq!(restarted.get(sealed_at_1).await?.summary, "numbered note 1");
         Ok(())
     }
 

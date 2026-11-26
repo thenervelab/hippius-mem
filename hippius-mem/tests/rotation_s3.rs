@@ -536,3 +536,72 @@ async fn a_members_provision_changes_no_wrap_and_the_founder_keeps_reading() -> 
     clear_team(&bucket, PROVISION_TEAM).await;
     Ok(())
 }
+
+/// The team namespace the late-member test owns.
+const LATE_TEAM: &str = "rw-late-member-live";
+
+/// A member who joins after two rotations is first told by `doctor` which
+/// epochs it cannot read, and after the founder's `provision` reads the notes
+/// of every epoch. `provision` used to wrap only the current epoch, and
+/// `doctor` passed while the epoch-1 notes stayed unreadable.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_member_who_joins_after_two_rotations_reads_every_epoch() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, LATE_TEAM).await;
+
+    let founder = Machine::new(
+        51,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        52,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let late = Machine::new(
+        53,
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member, &late] {
+        machine.write_config(&live, LATE_TEAM, &founder_address)?;
+    }
+    founder.run(&["join"])?;
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+    let mut ids = Vec::new();
+    for summary in ["sealed under epoch one", "sealed under epoch two"] {
+        founder.run(&["rotate"])?;
+        let mut session = Server::spawn(&member, Mnemonic::Set)?;
+        ids.push(session.remember_id(summary)?);
+    }
+
+    late.run(&["join"])?;
+    let roster = [member.address()?, late.address()?].join(",");
+    founder.run(&["publish-membership", "--members", &roster])?;
+    let doctor = late.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_err.contains("1 note(s) are sealed under epoch 1, which this machine"),
+        "doctor names the epoch the late member cannot read: {doctor_err}"
+    );
+
+    founder.run(&["provision", "--no-recovery"])?;
+    let mut session = Server::spawn(&late, Mnemonic::Set)?;
+    for id in &ids {
+        let (failed, text) = session.call("get", &json!({ "id": id }))?;
+        assert!(!failed, "the late member reads {id}: {text}");
+    }
+    drop(session);
+    let doctor = late.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor.status.success() && !doctor_err.contains("holds no key for"),
+        "doctor passes once every epoch is wrapped: {doctor_err}"
+    );
+
+    clear_team(&bucket, LATE_TEAM).await;
+    Ok(())
+}

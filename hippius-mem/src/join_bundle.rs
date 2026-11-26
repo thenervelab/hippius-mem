@@ -739,14 +739,16 @@ fn print_next_steps(bundle: &InviteBundle, published: bool) {
             let _ = writeln!(
                 out,
                 "3. This team has ROTATED its key: your member key is published — ask the\n\
-                    founder to run `hippius-mem provision` so the newer epoch keys reach you."
+                    founder to run `hippius-mem provision`, which wraps every epoch key the\n\
+                    founder holds to you."
             );
         } else {
             let _ = writeln!(
                 out,
-                "3. This team has ROTATED its key: to receive wrapped epoch keys, set\n\
+                "3. This team has ROTATED its key: to receive its epoch keys, set\n\
                     HIPPIUS_MEM_MNEMONIC and run `hippius-mem join`, then ask the founder\n\
-                    to run `hippius-mem provision`."
+                    to run `hippius-mem provision`, which wraps every epoch key the founder\n\
+                    holds to you."
             );
         }
     }

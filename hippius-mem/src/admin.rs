@@ -55,8 +55,8 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `provision [--no-recovery]`: as the founder, wrap the current-epoch
-/// team key to every published member key the founder-signed manifest
+/// Run `provision [--no-recovery]`: as the founder, wrap every epoch key this
+/// machine holds to every published member key the founder-signed manifest
 /// authorizes, then — by default — name a fresh recovery key on the team
 /// manifest.
 ///
@@ -90,8 +90,8 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     let store = cfg.build_store().await?;
 
     // Load this founder's full epoch key-ring BEFORE wrapping the team key to
-    // members. `build_store` starts at epoch 0, but on a team that has rotated,
-    // `provision_members` must wrap the CURRENT epoch key — otherwise a member
+    // members. `build_store` starts at epoch 0, and `provision_members` wraps
+    // only the epochs the ring holds: without the rotated ones a member
     // provisioned after a rotation receives only the founding-epoch key and would
     // then WRITE under epoch 0, the key a removed member still holds. This is the
     // recorded `bootstrap_epochs` gotcha (a new entry point that builds a store
