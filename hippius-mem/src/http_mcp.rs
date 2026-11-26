@@ -598,8 +598,14 @@ mod tests {
         });
         let (app, server) = warm_app(Arc::<GatedBlob>::clone(&blob));
 
-        let request = tokio::spawn(app.oneshot(remember_request(Some("secret"))));
-        blob.entered.notified().await;
+        let mut request = tokio::spawn(app.oneshot(remember_request(Some("secret"))));
+        // A request that ends before its first `put` never parks; it fails the
+        // test here instead of leaving it waiting for the gate.
+        let parked = tokio::select! {
+            ended = &mut request => Err(ended),
+            () = blob.entered.notified() => Ok(()),
+        };
+        parked.expect("the request parks at its first put");
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
 
