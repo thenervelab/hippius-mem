@@ -214,11 +214,14 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     #[cfg(not(feature = "http-mcp"))]
     let launch = mcp::McpLaunch::resolve(&home);
     // The daemon check runs even when an agent was skipped, so it matches the
-    // entries the other agents' configs now hold.
+    // entries the other agents' configs now hold. The skipped agents' error is
+    // reported first: it lists what to fix.
     let configured = configure_global_with_launch(&home, &flags, hermes_env.as_deref(), &launch);
     #[cfg(feature = "http-mcp")]
-    retire_unused_daemon(&home)?;
+    let retired = retire_unused_daemon(&home);
     configured?;
+    #[cfg(feature = "http-mcp")]
+    retired?;
     tracing::info!(home = %home.display(), "hippius-mem install complete");
     Ok(())
 }
@@ -912,10 +915,13 @@ fn configure_global_with_launch(
             ),
             other => other.unregister(home),
         });
-        if selected.contains(&agents::AgentId::Claude) {
-            instructions::remove_md_section(&home.join(".claude"), "CLAUDE.md")?;
-        }
-        return fail_on_skipped(&skipped, "uninstall");
+        let removed = if selected.contains(&agents::AgentId::Claude) {
+            instructions::remove_md_section(&home.join(".claude"), "CLAUDE.md")
+        } else {
+            Ok(())
+        };
+        fail_on_skipped(&skipped, "uninstall")?;
+        return removed;
     }
     if selected.contains(&agents::AgentId::Claude) {
         let claude_dir = home.join(".claude");
