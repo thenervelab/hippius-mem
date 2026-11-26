@@ -99,7 +99,7 @@
 )]
 
 use std::io::{BufRead as _, Write as _};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -156,6 +156,28 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// How long a child the test asked to stop gets to exit before the test kills
+/// it and fails. Arbitrary: a clean exit, the exit flush included (bounded at
+/// 4 s), takes well under it, and the margin absorbs a loaded CI runner.
+const EXIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Wait for `child` to exit. Past [`EXIT_DEADLINE`], kill and reap it and fail,
+/// so a child that never exits fails the test instead of hanging the suite.
+fn wait_or_kill(child: &mut Child, what: &str) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= EXIT_DEADLINE {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("{what} did not exit within {EXIT_DEADLINE:?}; killed it").into());
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -454,12 +476,12 @@ impl StdioSession {
 
     /// Close the child's stdin, the way a client ends a session, and wait for
     /// the child to exit on its own.
-    fn close_stdin_and_wait(self) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
+    fn close_stdin_and_wait(self) -> Result<ExitStatus, Box<dyn std::error::Error>> {
         let Self {
             mut child, stdin, ..
         } = self;
         drop(stdin);
-        Ok(child.0.wait()?)
+        wait_or_kill(&mut child.0, "the server after stdin closed")
     }
 
     fn recv_json(&mut self, what: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

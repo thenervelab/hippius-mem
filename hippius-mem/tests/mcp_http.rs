@@ -17,11 +17,11 @@
 mod support;
 
 use std::io::BufRead as _;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -36,6 +36,28 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// How long a child the test asked to stop gets to exit before the test kills
+/// it and fails. Arbitrary: a clean exit, the exit flush included (bounded at
+/// 4 s), takes well under it, and the margin absorbs a loaded CI runner.
+const EXIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Wait for `child` to exit. Past [`EXIT_DEADLINE`], kill and reap it and fail,
+/// so a child that never exits fails the test instead of hanging the suite.
+fn wait_or_kill(child: &mut Child, what: &str) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= EXIT_DEADLINE {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("{what} did not exit within {EXIT_DEADLINE:?}; killed it").into());
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -869,7 +891,7 @@ fn serve_anchors_its_last_writes_on_sigterm() -> Result<(), Box<dyn std::error::
     let pid = daemon.child.0.id().to_string();
     let killed = Command::new("kill").args(["-TERM", &pid]).status()?;
     assert!(killed.success(), "kill -TERM failed");
-    let status = daemon.child.0.wait()?;
+    let status = wait_or_kill(&mut daemon.child.0, "serve after SIGTERM")?;
     assert!(status.success(), "serve exits cleanly on SIGTERM: {status}");
 
     let anchors = daemon
