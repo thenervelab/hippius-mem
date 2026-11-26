@@ -11064,16 +11064,38 @@ mod tests {
         Ok(())
     }
 
-    /// Plants an object at the key of the second create-only wrap write, just
-    /// before it: another rotation at the same epoch winning that slot while
-    /// this one writes its wraps.
-    struct SecondWrapTaken {
+    /// What the store does at the second create-only wrap write.
+    #[derive(Debug, Clone, Copy)]
+    enum SecondWrap {
+        /// Another rotation at the same epoch wins the slot just before it.
+        TakenByAnother,
+        /// The write is stored, then answered `AlreadyExists`: a create whose
+        /// response was lost and whose retry found its own object.
+        StoredThenTaken,
+        /// The write is stored, then answered with an error: every attempt's
+        /// response was lost.
+        StoredThenFails,
+    }
+
+    /// A [`MemoryBlobStore`] that does `second` at the second wrap write.
+    struct SecondWrapStore {
         inner: MemoryBlobStore,
+        second: SecondWrap,
         wraps_written: AtomicUsize,
     }
 
+    impl SecondWrapStore {
+        fn new(second: SecondWrap) -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                second,
+                wraps_written: AtomicUsize::new(0),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
-    impl BlobStore for SecondWrapTaken {
+    impl BlobStore for SecondWrapStore {
         async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
             self.inner.put(key, bytes).await
         }
@@ -11083,12 +11105,25 @@ mod tests {
             key: &str,
             bytes: Vec<u8>,
         ) -> Result<CreateOutcome, MemError> {
-            if key.contains("/_keys/") && self.wraps_written.fetch_add(1, Ordering::Relaxed) == 1 {
-                self.inner
-                    .put(key, b"the other machine's wrap".to_vec())
-                    .await?;
+            if !key.contains("/_keys/") || self.wraps_written.fetch_add(1, Ordering::Relaxed) != 1 {
+                return self.inner.put_if_absent(key, bytes).await;
             }
-            self.inner.put_if_absent(key, bytes).await
+            match self.second {
+                SecondWrap::TakenByAnother => {
+                    self.inner
+                        .put(key, b"the other machine's wrap".to_vec())
+                        .await?;
+                    self.inner.put_if_absent(key, bytes).await
+                }
+                SecondWrap::StoredThenTaken => {
+                    self.inner.put_if_absent(key, bytes).await?;
+                    Ok(CreateOutcome::AlreadyExists)
+                }
+                SecondWrap::StoredThenFails => {
+                    self.inner.put_if_absent(key, bytes).await?;
+                    Err(MemError::Storage("response lost".into()))
+                }
+            }
         }
 
         async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
@@ -11104,6 +11139,21 @@ mod tests {
         }
     }
 
+    /// A founder and one member, both with published member keys, over a
+    /// store that does `second` at the second wrap write.
+    async fn founder_and_member_over(
+        second: SecondWrap,
+    ) -> Result<(Arc<dyn BlobStore>, MemoryStore), Box<dyn std::error::Error>> {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(SecondWrapStore::new(second));
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        founder.join_as_member(&identity).await?;
+        member.join_as_member(&identity).await?;
+        Ok((blob, founder))
+    }
+
     /// A rotation that loses one wrap slot to another rotation at the same
     /// epoch fails with `EpochTaken`, leaves the other machine's wrap as it
     /// was, and deletes the wraps it had already written. Those were
@@ -11112,16 +11162,7 @@ mod tests {
     /// while the members they reached sealed notes under that key.
     #[tokio::test]
     async fn a_rotation_that_loses_a_wrap_slot_leaves_no_wrap_of_its_own() -> TestResult {
-        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let blob: Arc<dyn BlobStore> = Arc::new(SecondWrapTaken {
-            inner: MemoryBlobStore::default(),
-            wraps_written: AtomicUsize::new(0),
-        });
-        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
-        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
-        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
-        founder.join_as_member(&identity).await?;
-        member.join_as_member(&identity).await?;
+        let (blob, founder) = founder_and_member_over(SecondWrap::TakenByAnother).await?;
 
         let refused = founder.rotate_key(0).await;
 
@@ -11135,6 +11176,44 @@ mod tests {
             blob.get(&left[0]).await?,
             b"the other machine's wrap".to_vec()
         );
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
+        assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        Ok(())
+    }
+
+    /// A wrap write answered `AlreadyExists` for the wrap it stored itself
+    /// counts as written, so the rotation completes with both wraps. It used
+    /// to fail with `EpochTaken` and leave that founder-signed wrap behind,
+    /// so the epoch counted as provisioned under a key the founder dropped.
+    #[tokio::test]
+    async fn a_rotation_whose_retried_wrap_finds_itself_completes() -> TestResult {
+        let (blob, founder) = founder_and_member_over(SecondWrap::StoredThenTaken).await?;
+
+        let rotated = founder.rotate_key(0).await?;
+
+        assert_eq!(rotated.new_epoch, 1);
+        assert_eq!(rotated.wrapped.len(), 2, "both members: {rotated:?}");
+        let stored = blob.list(&format!("{TEAM}/_keys/{:020}/", 1)).await?;
+        assert_eq!(stored.len(), 2, "{stored:?}");
+        assert_eq!(founder.current_epoch(), 1);
+        Ok(())
+    }
+
+    /// A wrap write that fails after the store kept it fails the rotation and
+    /// deletes that wrap with the others, so the epoch is not left
+    /// provisioned under a key the founder dropped.
+    #[tokio::test]
+    async fn a_rotation_whose_failed_wrap_was_stored_leaves_no_wrap() -> TestResult {
+        let (blob, founder) = founder_and_member_over(SecondWrap::StoredThenFails).await?;
+
+        let refused = founder.rotate_key(0).await;
+
+        assert!(
+            matches!(&refused, Err(MemError::Storage(msg)) if msg == "response lost"),
+            "got {refused:?}"
+        );
+        let left = blob.list(&format!("{TEAM}/_keys/{:020}/", 1)).await?;
+        assert!(left.is_empty(), "no wrap of this rotation: {left:?}");
         assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
         assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
         Ok(())

@@ -220,7 +220,9 @@ field.
   are create-only writes where the gateway enforces them; one that loses a
   wrap slot to a concurrent rotation fails (`MemError::EpochTaken`) and
   deletes the wraps it had written, so no member receives the key it
-  discards.
+  discards. A wrap write that reports a conflict or an error is read back
+  first: a retried write that finds its own wrap counts as written, and a
+  failed write whose wrap was stored is deleted with the others.
 - The founder's `rotate`, `remove`, `provision`, `members` and recovery
   commands use the same manifest rollback protection as `sync`. They read
   the bucket's manifest directly, so when the newest manifest object was

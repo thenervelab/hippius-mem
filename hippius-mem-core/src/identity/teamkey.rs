@@ -523,13 +523,18 @@ pub(crate) async fn put_wraps(
 /// Write `wraps` of `team`'s `epoch` create-only, and return the recipients.
 /// The write [`rotate_team_key`] does.
 ///
+/// A write that reports [`CreateOutcome::AlreadyExists`] or fails is followed
+/// by a GET of its key, because a retried create can report either after its
+/// first attempt stored the wrap: bytes equal to this wrap's mean this call
+/// wrote it (sealing is randomized, so no other call produces those bytes).
+///
 /// # Errors
 ///
-/// [`MemError::EpochTaken`] at the first wrap that already exists, or whatever
-/// the store reports. Either way the wraps this call created are deleted first
-/// (best effort): they are founder-signed wraps of a key the caller is about
-/// to discard, and left behind they would mark the epoch provisioned and hand
-/// part of the team that key.
+/// [`MemError::EpochTaken`] at the first wrap that already exists and is not
+/// this call's, or whatever the store reports. Either way the wraps this call
+/// stored are deleted first (best effort): they are founder-signed wraps of a
+/// key the caller is about to discard, and left behind they would mark the
+/// epoch provisioned and hand part of the team that key.
 pub(crate) async fn create_wraps(
     blob: &dyn BlobStore,
     team: &str,
@@ -539,17 +544,27 @@ pub(crate) async fn create_wraps(
     let mut wrapped_to = BTreeSet::new();
     let mut created = Vec::new();
     for wrap in wraps {
-        let failure = match blob.put_if_absent(&wrap.object_key, wrap.bytes).await {
-            Ok(CreateOutcome::Created) => {
-                wrapped_to.insert(wrap.recipient);
-                created.push(wrap.object_key);
-                continue;
-            }
-            Ok(CreateOutcome::AlreadyExists) => MemError::EpochTaken {
+        let written = match blob
+            .put_if_absent(&wrap.object_key, wrap.bytes.clone())
+            .await
+        {
+            Ok(CreateOutcome::Created) => Ok(()),
+            Ok(CreateOutcome::AlreadyExists) if stores_wrap(blob, &wrap).await => Ok(()),
+            Ok(CreateOutcome::AlreadyExists) => Err(MemError::EpochTaken {
                 team: team.to_owned(),
                 epoch,
-            },
-            Err(err) => err,
+            }),
+            Err(err) => {
+                if stores_wrap(blob, &wrap).await {
+                    created.push(wrap.object_key.clone());
+                }
+                Err(err)
+            }
+        };
+        let Err(failure) = written else {
+            wrapped_to.insert(wrap.recipient);
+            created.push(wrap.object_key);
+            continue;
         };
         for key in &created {
             if let Err(err) = blob.delete(key).await {
@@ -563,6 +578,25 @@ pub(crate) async fn create_wraps(
         return Err(failure);
     }
     Ok(wrapped_to)
+}
+
+/// Whether the object at `wrap`'s key holds `wrap`'s bytes. A failed read
+/// counts as not, with a warning naming the key: deleting an object this call
+/// may not have written could remove another rotation's wrap.
+async fn stores_wrap(blob: &dyn BlobStore, wrap: &SealedWrap) -> bool {
+    match blob.get(&wrap.object_key).await {
+        Ok(stored) => stored == wrap.bytes,
+        Err(MemError::NotFound { .. }) => false,
+        Err(err) => {
+            tracing::warn!(
+                key = %wrap.object_key,
+                error = %err,
+                "could not read back a wrap of a failed rotation write; if it holds this \
+                 rotation's wrap, delete it by hand"
+            );
+            false
+        }
+    }
 }
 
 /// One sealed wrap, not yet written: its recipient, object key and bytes (a
