@@ -1057,13 +1057,15 @@ impl MemoryServer {
             .reinforcing
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        while reinforcing.try_join_next().is_some() {}
+        while let Some(joined) = reinforcing.try_join_next() {
+            warn_if_reinforcement_panicked(joined);
+        }
         reinforcing.spawn(async move { store.reinforce_use(id).await });
     }
 
-    /// Wait for the reinforcements still running. A task that panicked is
-    /// passed over: `reinforce_use` logs its own failures, and a lost
-    /// `Reinforce` op is re-emitted by the next qualifying read.
+    /// Wait for the reinforcements still running. `reinforce_use` logs its
+    /// own failures, a panicked task is warned, and a lost `Reinforce` op is
+    /// re-emitted by the next qualifying read.
     async fn finish_reinforcing(&self) {
         let mut running = std::mem::take(
             &mut *self
@@ -1071,7 +1073,9 @@ impl MemoryServer {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
-        while running.join_next().await.is_some() {}
+        while let Some(joined) = running.join_next().await {
+            warn_if_reinforcement_panicked(joined);
+        }
     }
 
     /// Anchor what this session buffered below the batch threshold, and this
@@ -1967,6 +1971,14 @@ fn into_call_result<T: Serialize>(result: Result<T, HandlerError>) -> CallToolRe
             ))]),
         },
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.to_string())]),
+    }
+}
+
+/// Warn about a background reinforcement that panicked; one that finished,
+/// with or without an error it logged itself, needs nothing.
+fn warn_if_reinforcement_panicked(joined: Result<(), tokio::task::JoinError>) {
+    if let Err(err) = joined {
+        tracing::warn!(error = %err, "a background reinforcement panicked");
     }
 }
 
