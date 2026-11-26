@@ -1207,6 +1207,9 @@ pub struct MemoryStore {
     // sync; it holds nothing a sync needs while it does.) See `sync`'s doc for
     // the full ordering argument.
     sync_gate: tokio::sync::Mutex<()>,
+    // How many times `sync` ran, for tests that bound a retry loop's syncs.
+    #[cfg(test)]
+    syncs: std::sync::atomic::AtomicUsize,
     /// The newest index checkpoint this store has loaded, reused while the bucket
     /// still lists it (see `checkpoint_cache`). Memory-only unless
     /// [`with_checkpoint_cache_file`](Self::with_checkpoint_cache_file) is set.
@@ -1436,6 +1439,8 @@ impl MemoryStore {
             auto_refresh: Mutex::new(AutoRefreshState::default()),
             // Unlocked: no rebuild in flight yet.
             sync_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            syncs: std::sync::atomic::AtomicUsize::new(0),
             checkpoints: CheckpointCache::new(None),
             // No durable manifest marker by default; `with_manifest_marker` opts in.
             manifest_marker: None,
@@ -2449,7 +2454,8 @@ impl MemoryStore {
         ),
         MemError,
     > {
-        for _ in 0..=EDIT_SYNC_ATTEMPTS {
+        // One more check than syncs: the last check has no sync after it.
+        for attempt in 0..=EDIT_SYNC_ATTEMPTS {
             let clock = self.writer.lock().await;
             let cross = self.lock_across_processes().await?;
             let current = match &cross {
@@ -2462,6 +2468,9 @@ impl MemoryStore {
 
             drop(cross);
             drop(clock);
+            if attempt == EDIT_SYNC_ATTEMPTS {
+                break;
+            }
             self.sync().await?;
         }
 
@@ -5743,6 +5752,9 @@ impl MemoryStore {
     /// signature/chain violation), or whatever the index reports on upsert/remove.
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
+        #[cfg(test)]
+        self.syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Single-flight the whole rebuild: held from before `read_and_filter`
         // through `replay_full`/`sync_incremental` (and the checkpoint write that
         // follows), so a second concurrent `sync` on this process queues here
@@ -17082,7 +17094,8 @@ mod tests {
     }
 
     /// An edit with a precondition that never sees the tip file settle gives up
-    /// with a typed error and appends nothing.
+    /// with a typed error after `EDIT_SYNC_ATTEMPTS` syncs and appends nothing.
+    /// It used to run one more sync, whose result it then discarded.
     #[tokio::test]
     async fn an_edit_that_never_sees_this_machine_settle_is_refused() -> TestResult {
         let fake = Arc::new(ChurningTipOnList {
@@ -17097,6 +17110,7 @@ mod tests {
         let version = store.current_version(id)?;
 
         *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = Some(lock);
+        let syncs_before = store.syncs.load(Ordering::Relaxed);
         let result = store
             .edit_with_precondition(id, numbered_input(1), Some(version))
             .await;
@@ -17106,6 +17120,12 @@ mod tests {
             "got {result:?}"
         );
         *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        // The precondition's refresh syncs once (this store never probed the
+        // heads), and the retry loop syncs `EDIT_SYNC_ATTEMPTS` times.
+        assert_eq!(
+            store.syncs.load(Ordering::Relaxed) - syncs_before,
+            1 + super::EDIT_SYNC_ATTEMPTS
+        );
         assert_eq!(
             store.oplog.read_all(TEAM).await?.len(),
             1,
