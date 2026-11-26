@@ -293,7 +293,14 @@ the shrunk membership already landed; the error says so and names `hippius-mem r
 - `hippius-mem doctor` independently flags a rotation that never finished: "removed
   member `<ss58>` still holds the current epoch key" warns whenever the live roster
   and the current epoch's wrapped-key recipients disagree, so a half-done removal
-  is caught even on a machine that never saw the original run's output.
+  is caught even on a machine that never saw the original run's output. While the team
+  is still at epoch 0 it also warns "`<ss58>` was removed from the roster, but the team
+  key was never rotated" for every member an earlier manifest listed: the founding key
+  reaches invite-bundle members as `team_key_hex`, not as a wrap, so the first check
+  cannot see them. A rotated epoch's key travels only in wraps, so the first check covers
+  every later epoch. Run `hippius-mem rotate` to clear either warning.
+- The closing banner says whether this run rotated. A run that did not (the target was
+  already off the roster) says so and names `hippius-mem rotate`.
 
 ## Repair an epoch the founder cannot read
 

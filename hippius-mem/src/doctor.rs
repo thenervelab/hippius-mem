@@ -12,8 +12,8 @@ use hippius_mem_core::{
     BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyCheckMatch, KeyProbe, MemError,
     MemoryStore, OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail,
     derive_identity, find_suppressed_tails, key_check_key, load_manifest,
-    matches_published_key_check, open, probe_create_only, read_heads, read_wrapped_key, seal,
-    wrapped_key_recipients,
+    matches_published_key_check, members_ever_listed, open, probe_create_only, read_heads,
+    read_wrapped_key, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -338,6 +338,9 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         let (blob, team) = (blob.as_ref(), profile.name.as_str());
         let removed = removed_member_still_holds_key_lines(blob, team, founder.as_ref(), epoch);
         for line in removed.await {
+            tracing::warn!("{line}");
+        }
+        for line in unrotated_removal_lines(blob, team, founder.as_ref(), epoch).await {
             tracing::warn!("{line}");
         }
         // Same best-effort placement and reasoning again: this check never
@@ -810,6 +813,46 @@ async fn removed_member_still_holds_key_lines(
             format!(
                 "WARN: removed member {ss58} still holds the current epoch key; run: \
                  hippius-mem rotate (then revoke their sub-token in the console)",
+                ss58 = ss58.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// One warning line per member an earlier manifest listed and the live one
+/// does not, when the team never rotated past epoch 0 (`epoch`, the newest
+/// epoch the founder provisioned, is 0).
+///
+/// The complement of [`removed_member_still_holds_key_lines`], for the case it
+/// cannot see. A rotated epoch's key reaches a member only as a wrap, so for an
+/// epoch above 0 a removed member who still holds it holds a wrap of it, which
+/// that check reports. The founding key also travels without one: `join
+/// --bundle` hands it over as `team_key_hex`, and a member who never joined
+/// appears in no wrap at all. So while the team is still at epoch 0, every
+/// member ever listed can read every note, and a removal that never rotated
+/// (a `remove` before 0.8.1 with nobody joined, or a rotation that failed after
+/// the roster shrank) leaves that open. Silent when any lookup fails.
+async fn unrotated_removal_lines(
+    blob: &dyn BlobStore,
+    team: &str,
+    founder: Option<&Ss58>,
+    epoch: u64,
+) -> Vec<String> {
+    if epoch != 0 {
+        return Vec::new();
+    }
+    let Ok(Some(manifest)) = load_manifest(blob, team, founder).await else {
+        return Vec::new();
+    };
+    let Ok(ever) = members_ever_listed(blob, team, &manifest).await else {
+        return Vec::new();
+    };
+    ever.difference(&manifest.members)
+        .map(|ss58| {
+            format!(
+                "WARN: {ss58} was removed from the roster, but the team key was never rotated, \
+                 so they still hold the key every note is sealed under; run: hippius-mem \
+                 rotate (then revoke their sub-token in the console)",
                 ss58 = ss58.as_str(),
             )
         })
@@ -1340,7 +1383,7 @@ mod tests {
         newest_epoch_key_line, offline_report_lines, op_log_integrity_lines,
         probe_encryption_boundary, probe_live, probe_storage_then_team_key, quarantine_lines,
         removed_member_still_holds_key_lines, resolve_profile_for_remote, suppressed_tail_lines,
-        unsigned_or_unauthorized_wrapped_key_lines,
+        unrotated_removal_lines, unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
     use crate::setup::hermes::HermesWiring;
@@ -3015,6 +3058,25 @@ mod tests {
             "a bundle-provisioned member is invisible to this _keys/-only check by \
              construction -- `remove`'s always-rotate-on-removal is the primary guard \
              against their stale key, not this doctor check: {lines:?}"
+        );
+
+        // The manifest history sees them: the team never rotated past epoch 0,
+        // so the removed member still holds the key every note is sealed under.
+        // Before, `doctor` passed this team silently.
+        let lines = unrotated_removal_lines(&blob, TEAM, None, 0).await;
+        assert_eq!(lines.len(), 1, "one line for the removed member: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains(bundle_identity.ss58.as_str())
+                && line.contains("never rotated")
+                && line.contains("run: hippius-mem rotate"),
+            "{line}"
+        );
+        assert!(
+            unrotated_removal_lines(&blob, TEAM, None, 1)
+                .await
+                .is_empty(),
+            "a rotated epoch's key travels only in wraps, which the other check covers"
         );
         Ok(())
     }

@@ -48,7 +48,7 @@ pub use console::{
 };
 #[cfg(feature = "console")]
 pub use console::{ConsoleClient, eth_signer_from_mnemonic};
-pub use manifest::{TeamManifest, load_manifest, publish_manifest};
+pub use manifest::{TeamManifest, load_manifest, members_ever_listed, publish_manifest};
 // Crate-internal, NOT part of the public API: the two signing-domain tags, so a
 // cross-type domain-separation test can assert against the REAL constants instead
 // of retyping their values. A test that hardcodes a sibling's tag stays green if

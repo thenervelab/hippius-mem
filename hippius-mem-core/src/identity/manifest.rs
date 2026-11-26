@@ -543,6 +543,44 @@ pub async fn load_manifest(
     Ok(elect_live(valid, &trusted_founder))
 }
 
+/// Every member any stored manifest of `team` signed by `live`'s founder key
+/// ever listed, `live`'s own members included.
+///
+/// For a diagnosis (`doctor`) that asks whether someone was removed from the
+/// roster: the live manifest names only who is a member now. A manifest counts
+/// when it verifies, is bound to `team` and sits at the key its version
+/// designates (the checks [`load_manifest`] applies), and `live.founder_key`
+/// signed it. Manifests a former founder signed before a recovery do not
+/// count. One LIST and a GET per stored manifest; an object that cannot be
+/// fetched or decoded is skipped.
+///
+/// # Errors
+///
+/// Whatever the LIST reports.
+pub async fn members_ever_listed(
+    blob: &dyn BlobStore,
+    team: &str,
+    live: &TeamManifest,
+) -> Result<BTreeSet<Ss58>, MemError> {
+    let mut members = live.members.clone();
+    for key in blob.list(&manifest_prefix(team)).await? {
+        let Ok(bytes) = blob.get(&key).await else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<TeamManifest>(&bytes) else {
+            continue;
+        };
+        if manifest.founder_key == live.founder_key
+            && manifest.team == team
+            && key == manifest_key(team, manifest.version)
+            && manifest.verify()
+        {
+            members.extend(manifest.members);
+        }
+    }
+    Ok(members)
+}
+
 /// Which of the live manifest's two authorities permits a candidate to become
 /// the next link in the chain.
 ///

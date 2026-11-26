@@ -478,9 +478,28 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     // Only sub-token MINTING has a documented API (POST
     // /api/objectstore/sub-tokens/); no revoke endpoint is documented, so this
     // deliberately points at the console UI rather than inventing a path.
-    let mut out = std::io::stdout();
     let _ = writeln!(
-        out,
+        std::io::stdout(),
+        "{}",
+        manual_step_banner(&target, should_rotate)
+    );
+    Ok(())
+}
+
+/// The banner `remove` ends with: the sub-token revoke no CLI can do, and what
+/// the removed member can still do until then. `rotated` says whether this run
+/// rotated the key; a run that did not (the target was already off the roster)
+/// must not claim a rotation, and names the command that rotates.
+fn manual_step_banner(target: &Ss58, rotated: bool) -> String {
+    let exposure = if rotated {
+        "read and write the team bucket DIRECTLY — the rotation above\n\
+         only keeps notes sealed under the new epoch away from them."
+    } else {
+        "read and write the team bucket DIRECTLY. This run did not rotate\n\
+         the key: if no rotation followed their removal, they also still\n\
+         decrypt every new note; run `hippius-mem rotate`."
+    };
+    format!(
         "\n================== ONE MANUAL STEP LEFT ==================\n\
          Revoke the removed member's S3 sub-token in the hippius-console\n\
          (S3 -> Sub Tokens):\n\
@@ -488,16 +507,14 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
            {target}\n\
          \n\
          Until that sub-token is revoked, the removed member can still\n\
-         read and write the team bucket DIRECTLY — the rotation above\n\
-         only keeps notes sealed under the new epoch away from them.\n\
+         {exposure}\n\
          \n\
          If you onboarded them with `hippius-mem invite --name <label>`,\n\
          their sub-token carries that label in the console's list\n\
          (tokens minted without --name are labeled `hippius-mem-invite`).\n\
          ==========================================================",
         target = target.as_str()
-    );
-    Ok(())
+    )
 }
 
 /// Whether removing a member should rotate the team key: exactly when THIS

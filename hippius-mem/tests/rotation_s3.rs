@@ -840,3 +840,65 @@ async fn a_session_that_just_wrote_is_refused_after_a_removal() -> anyhow::Resul
     clear_team(&bucket, SESSION_TEAM).await;
     Ok(())
 }
+
+/// The team namespace the never-rotated removal test owns.
+const UNROTATED_TEAM: &str = "rw-unrotated-live";
+
+/// A roster that shrank while the team stayed at epoch 0 (what `remove` left
+/// when it could not rotate before 0.8.1) is flagged by `doctor`, a `remove`
+/// re-run says it did not rotate instead of pointing at "the rotation above",
+/// and `rotate` clears the warning. `doctor` used to pass such a team.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_removal_that_never_rotated_is_flagged_until_a_rotation() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, UNROTATED_TEAM).await;
+
+    let founder = Machine::new(
+        91,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let kept = Machine::new(
+        92,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let removed = Machine::new(
+        93,
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    )?;
+    let founder_address = founder.address()?;
+    founder.write_config(&live, UNROTATED_TEAM, &founder_address)?;
+    let removed_address = removed.address()?;
+    let both = [kept.address()?, removed_address.clone()].join(",");
+    founder.run(&["publish-membership", "--members", &both])?;
+    founder.run(&["publish-membership", "--members", &kept.address()?])?;
+
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_err.contains(&format!(
+            "{removed_address} was removed from the roster, but the team key was never rotated"
+        )),
+        "doctor flags the unrotated removal: {doctor_err}"
+    );
+
+    let removal = founder.run(&["remove", &removed_address])?;
+    assert!(
+        removal.contains("already excludes")
+            && removal.contains("This run did not rotate")
+            && !removal.contains("the rotation above"),
+        "the banner does not claim a rotation: {removal}"
+    );
+
+    founder.run(&["rotate"])?;
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        !doctor_err.contains("was removed from the roster"),
+        "a rotation clears the warning: {doctor_err}"
+    );
+
+    clear_team(&bucket, UNROTATED_TEAM).await;
+    Ok(())
+}

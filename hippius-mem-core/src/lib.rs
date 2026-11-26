@@ -80,9 +80,9 @@ pub use identity::{
     ChallengeResp, DEFAULT_CONSOLE_BASE_URL, FileManifestMarker, Identity, ManifestMarker,
     MemberKey, MnemonicChallengeReq, Provisioned, S3Creds, SessionData, SubTokenReq, SubTokenResp,
     TeamManifest, VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key,
-    load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
-    read_wrapped_key, rotate_team_key, signer_from_mnemonic, ss58_decode, ss58_encode,
-    unwrap_team_key, wrap_team_key, wrapped_key_key, wrapped_key_recipients,
+    load_manifest, load_member_keys, members_ever_listed, provision_team_key, publish_manifest,
+    publish_member_key, read_wrapped_key, rotate_team_key, signer_from_mnemonic, ss58_decode,
+    ss58_encode, unwrap_team_key, wrap_team_key, wrapped_key_key, wrapped_key_recipients,
 };
 #[cfg(feature = "console")]
 pub use identity::{ConsoleClient, eth_signer_from_mnemonic};
