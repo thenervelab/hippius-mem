@@ -14,6 +14,8 @@
 #      the MAIN repo path in ~/.claude.json         -> BLOCK (main-root probe)
 #   5. fresh recall token, a note tied to the file  -> ALLOW carrying the note
 #      on the first edit of the file, and not again on the second
+#   6. no binary on PATH, server registered by `url` (the HTTP daemon) in
+#      ~/.claude.json                               -> BLOCK (url wiring counts)
 #
 # The hook is copied into a sandbox fake-repo so repo_root resolves to a throwaway
 # tree (the hook derives it from its own location), HOME points at an empty dir
@@ -328,4 +330,22 @@ if ! grep -q 'quokka rebuild needs the lock' "$WORK/out-up"; then
 fi
 echo "PASS: a failed lookup is retried on the next edit of the file"
 
-echo "PASS: recall-preflight gate fails open when absent, blocks when present, honors bypass, sees MAIN-root registration from a worktree, and delivers path notes once"
+# --- Case 6: url wiring, no binary on PATH -> BLOCK ------------------------------
+# `install` wires Claude Code to the loopback HTTP daemon with a `url` entry and
+# no `command`. The gate used to read only `command`, so a session wired this way
+# with the binary off the hook's PATH failed open and never asked for a recall.
+URL_HOME="$WORK/url-home"
+mkdir -p "$URL_HOME"
+"$JQ_BIN" -n '{mcpServers: {"hippius-mem": {type: "http", url: "http://127.0.0.1:17432/mcp"}}}' \
+  > "$URL_HOME/.claude.json"
+_json=$(make_json "sess-url")
+if printf '%s' "$_json" | env -i HOME="$URL_HOME" PATH="$BASE_BIN" \
+    "$BASH_BIN" "$FAKE_HOOK" >"$WORK/out-url" 2>&1
+then status=0; else status=$?; fi
+if [ "$status" -ne 0 ] || ! grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' "$WORK/out-url"; then
+  echo "FAIL: a url-wired server with no binary on PATH did not BLOCK"
+  cat "$WORK/out-url"; exit 1
+fi
+echo "PASS: a url-wired server counts as registered"
+
+echo "PASS: recall-preflight gate fails open when absent, blocks when present, honors bypass, sees MAIN-root registration from a worktree, delivers path notes once, and counts url wiring"
