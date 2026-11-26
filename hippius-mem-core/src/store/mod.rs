@@ -2852,7 +2852,12 @@ impl MemoryStore {
             "completed an op a previous write on this machine did not confirm (its process \
              stopped, or the gateway did not answer); chaining to it"
         );
-        self.queue_anchor_leaf(op.hash(), op.lamport);
+        // Another author's op (two seeds sharing one state directory) stays out
+        // of this author's batch: this author's records cover only its own ops,
+        // and the other author's own requeue anchors it.
+        if op.author_key == self.author_key() {
+            self.queue_anchor_leaf(op.hash(), op.lamport);
+        }
 
         Ok(AuthorTip {
             committed: SharedTip {
@@ -16959,6 +16964,55 @@ mod tests {
             .map(|record| record.leaves.len())
             .sum();
         assert_eq!(leaves, 2, "the completed op and the new one");
+        Ok(())
+    }
+
+    /// An edit that completes another author's pending op (two seeds sharing
+    /// one state directory) keeps that op out of its own anchor batch. It used
+    /// to queue it, so this author signed a record covering an op it did not
+    /// write, and its batch's Lamport range took the other author's.
+    #[tokio::test]
+    async fn another_authors_completed_op_stays_out_of_this_authors_batch() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let other =
+            store_over(Arc::clone(&blob), OTHER_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let this = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::new(RecordingAnchor::new()),
+            NO_ANCHOR_THRESHOLD,
+        )?
+        .with_writer_lock(Some(lock));
+        fake.arm();
+        assert!(other.remember(numbered_input(0)).await.is_err());
+        fake.disarm();
+        let id = this.remember(numbered_input(1)).await?;
+        let version = this.current_version(id)?;
+
+        this.edit_with_precondition(id, numbered_input(2), Some(version))
+            .await?;
+        this.flush_anchors().await?;
+
+        assert_eq!(
+            other.oplog.read_all(TEAM).await?.len(),
+            3,
+            "the op was completed"
+        );
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(leaves, 2, "this author's remember and edit only");
+        other.flush_anchors().await?;
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(leaves, 3, "the other author's own flush anchors its op");
         Ok(())
     }
 
