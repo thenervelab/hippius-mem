@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use super::mcp::{DEFAULT_HTTP_PORT, McpLaunch, health_response_is_ours, token_proof_request};
+use super::mcp::{
+    DEFAULT_HTTP_PORT, McpLaunch, health_response_is_ours, token_proof_body, token_proof_request,
+};
 
 /// Label / unit name. Stable so a re-install updates rather than duplicates.
 const SERVICE_NAME: &str = "ai.hippius.mem";
@@ -312,10 +314,7 @@ fn loopback_token_proof(port: u16, nonce: &str) -> Option<String> {
         .ok()?;
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
-    let text = String::from_utf8(buf).ok()?;
-    let (head, body) = text.split_once("\r\n\r\n")?;
-    head.starts_with("HTTP/1.1 200")
-        .then(|| body.trim().to_owned())
+    token_proof_body(&buf)
 }
 
 /// Unauthenticated GET `/health` on the default loopback MCP port.

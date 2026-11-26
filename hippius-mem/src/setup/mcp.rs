@@ -165,6 +165,16 @@ pub(crate) fn token_proof_request(port: u16, nonce: &str) -> String {
     )
 }
 
+/// The proof in a raw HTTP/1.1 answer to [`token_proof_request`]: the trimmed
+/// body of a 200 answer, `None` for anything else.
+#[cfg(feature = "http-mcp")]
+pub(crate) fn token_proof_body(response: &[u8]) -> Option<String> {
+    let response = String::from_utf8_lossy(response);
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    head.starts_with("HTTP/1.1 200")
+        .then(|| body.trim().to_owned())
+}
+
 /// Whether a raw HTTP/1.1 answer to [`token_proof_request`] for `nonce` proves
 /// that the daemon holds `token`.
 ///
@@ -174,11 +184,8 @@ pub(crate) fn token_proof_request(port: u16, nonce: &str) -> String {
 #[cfg(feature = "http-mcp")]
 #[must_use]
 pub(crate) fn response_proves_token(response: &[u8], token: &str, nonce: &str) -> bool {
-    let response = String::from_utf8_lossy(response);
-    let Some((head, body)) = response.split_once("\r\n\r\n") else {
-        return false;
-    };
-    head.starts_with("HTTP/1.1 200") && body.trim() == hippius_mem_core::token_proof(token, nonce)
+    token_proof_body(response)
+        .is_some_and(|proof| proof == hippius_mem_core::token_proof(token, nonce))
 }
 
 /// Loopback streamable-HTTP MCP listen URL for `port`.
@@ -695,6 +702,25 @@ mod tests {
     fn mcp(dir: &TempDir) -> Value {
         let raw = std::fs::read_to_string(dir.path().join(".mcp.json")).expect(".mcp.json exists");
         serde_json::from_str(&raw).expect("valid JSON")
+    }
+
+    /// Only a 200 answer carries a proof, and its body is taken whole and
+    /// trimmed: a refusal's body (a 401 page that happens to hold the right
+    /// hex) is no proof, and a body that is not UTF-8 is compared lossily
+    /// rather than read as no answer.
+    #[cfg(feature = "http-mcp")]
+    #[test]
+    fn token_proof_body_takes_only_a_200_answers_body() {
+        use super::token_proof_body;
+
+        let ok = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n abcd\n";
+        assert_eq!(token_proof_body(ok).as_deref(), Some("abcd"));
+        let refused = b"HTTP/1.1 401 Unauthorized\r\n\r\nabcd";
+        assert_eq!(token_proof_body(refused), None);
+        assert_eq!(token_proof_body(b"HTTP/1.1 200 OK\r\nabcd"), None);
+        assert_eq!(token_proof_body(b"").as_deref(), None);
+        let lossy = b"HTTP/1.1 200 OK\r\n\r\nab\xffcd";
+        assert_eq!(token_proof_body(lossy).as_deref(), Some("ab\u{fffd}cd"));
     }
 
     #[test]
