@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -20,17 +21,23 @@ use crate::setup::mcp::{response_proves_token, token_proof_request};
 /// well under a millisecond or is refused at once; arbitrary headroom.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// The daemon's bearer token: the file beside the config `serve` loads.
+/// The token file a client reads: `--token-file` when given, as `serve`
+/// takes it, else the file beside the config `serve` loads.
+pub(crate) fn token_path(token_file: Option<&str>) -> PathBuf {
+    token_file.map_or_else(default_token_path_from_env, PathBuf::from)
+}
+
+/// The daemon's bearer token, read from `path` (see [`token_path`]).
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, which is what a machine
 /// without the daemon looks like.
-pub(crate) fn token() -> anyhow::Result<String> {
-    let path = default_token_path_from_env();
-    let token = std::fs::read_to_string(&path).with_context(|| {
+pub(crate) fn token(path: &Path) -> anyhow::Result<String> {
+    let token = std::fs::read_to_string(path).with_context(|| {
         format!(
-            "no daemon token at {}; `hippius-mem install` sets up the daemon",
+            "no daemon token at {}; `hippius-mem install` sets up the daemon, and \
+             `--token-file` names a token `serve` was given elsewhere",
             path.display()
         )
     })?;

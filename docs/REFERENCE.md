@@ -497,7 +497,7 @@ stated plainly.
   the op is included under that root. For a root anchored on-chain the output names the block and
   extrinsic to compare it with; for a locally recorded root it says the check is
   internal consistency only. It does not contact a chain and does not check signatures.
-- **`path-notes --repo-root <dir> --file <path> [--port <n>]`** — prints the notes tied
+- **`path-notes --repo-root <dir> --file <path> [--port <n>] [--token-file <path>]`** — prints the notes tied
   to one file by a `path:<file or directory>` tag, for the edit hook to inject (see
   [Teams § Using it day to day](TEAMS.md)). The repository name comes from the git
   remote of `--repo-root`. It asks the shared HTTP daemon's bearer-protected
@@ -505,9 +505,10 @@ stated plainly.
   0 when the question was answered (with notes or none) and non-zero when the daemon
   could not be asked (not running, still syncing, no or wrong token), so the hook asks
   again on the next edit. It looks for the daemon on the default port and for its token
-  beside the config `HIPPIUS_MEM_CONFIG` names (or the default config): a daemon started
-  with another `--port` or `--token-file` is not found. Builds without `http-mcp` accept
-  the command and print nothing.
+  beside the config `HIPPIUS_MEM_CONFIG` names (or the default config); for a daemon
+  started with another `--port` or `--token-file`, pass the same `--port` and
+  `--token-file`. `recall`, `get`, `remember` and `call` take both flags too. Builds
+  without `http-mcp` accept the command and print nothing.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
   the same predecessor; the losing branch lost convergence and is removable) versus

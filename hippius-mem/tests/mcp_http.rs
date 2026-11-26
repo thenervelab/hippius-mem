@@ -1083,6 +1083,84 @@ fn the_cli_remembers_recalls_and_gets_through_the_daemon() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// The daemon clients read the token file `--token-file` names, as `serve`
+/// takes one, instead of only the file beside the config: a daemon started
+/// with `serve --token-file <elsewhere>` was unreachable from them.
+#[test]
+fn the_cli_and_path_notes_read_the_token_file_they_are_given()
+-> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let elsewhere = daemon.dir.path().join("elsewhere-token");
+    std::fs::rename(daemon.dir.path().join("mcp-token"), &elsewhere)?;
+    let elsewhere = elsewhere.to_string_lossy().into_owned();
+
+    let without = cli(&daemon, &["recall", "anything", "--repo", "widget"])?;
+    assert!(
+        !without.status.success()
+            && String::from_utf8_lossy(&without.stderr).contains("no daemon token at"),
+        "without the flag the default file is read: {}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+    let found = cli_json(
+        &daemon,
+        &[
+            "recall",
+            "anything",
+            "--repo",
+            "widget",
+            "--token-file",
+            &elsewhere,
+        ],
+    )?;
+    assert_eq!(found["returned"], 0, "{found}");
+
+    let checkout = widget_checkout(daemon.dir.path(), "checkout")?;
+    let port = daemon
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("daemon url has no port")?;
+    let output = support::binary()
+        .args([
+            "path-notes",
+            "--port",
+            port,
+            "--token-file",
+            &elsewhere,
+            "--repo-root",
+        ])
+        .arg(&checkout)
+        .arg("--file")
+        .arg(checkout.join("src/lib.rs"))
+        .env(
+            "HIPPIUS_MEM_CONFIG",
+            daemon.dir.path().join("hippius-mem.toml"),
+        )
+        .env("HOME", daemon.dir.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "path-notes reads the named token file: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = support::binary()
+        .args(["path-notes", "--port", port, "--repo-root"])
+        .arg(&checkout)
+        .arg("--file")
+        .arg(checkout.join("src/lib.rs"))
+        .env(
+            "HIPPIUS_MEM_CONFIG",
+            daemon.dir.path().join("hippius-mem.toml"),
+        )
+        .env("HOME", daemon.dir.path())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "without the flag path-notes asks the daemon with no token"
+    );
+    Ok(())
+}
+
 /// A failure is an exit status and the tool's own message, never a JSON
 /// document on stdout that a script would take for a result.
 #[test]

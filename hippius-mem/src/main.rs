@@ -126,7 +126,8 @@ Usage:
   hippius-mem call <tool> [<json> | -]
                                        the memory tools from a command line, as
                                        JSON, through the serve daemon; `call`
-                                       reaches all eleven (--features http-mcp)
+                                       reaches all eleven; each takes [--port <n>]
+                                       [--token-file <path>] (--features http-mcp)
   hippius-mem verify-history <file | ->
                                        check the anchor proofs in a saved `history`
                                        result; offline, needs no config
