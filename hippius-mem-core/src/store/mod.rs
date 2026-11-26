@@ -18938,20 +18938,30 @@ mod tests {
         let second = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 1)?
             .with_writer_lock(Some(Arc::clone(&lock)));
 
-        // Three concurrent branches, joined on one task: `first`'s write (which
-        // will block mid-anchor-persist), `second`'s write (which must run WHILE
+        // Three concurrent branches on one task: `first`'s write (which will
+        // block mid-anchor-persist), `second`'s write (which must run WHILE
         // `first` is blocked to reproduce two overlapping processes), and a
         // release trigger kept independent of `second` completing — nesting the
         // release inside `second`'s continuation would deadlock once the fix
-        // makes `second` wait on the very lock `first` is holding.
-        let (first_result, second_result, ()) = tokio::join!(
-            first.remember(sample_input()),
-            second.remember(sample_input()),
-            async {
-                gate.entered.notified().await;
-                gate.release.notify_one();
+        // makes `second` wait on the very lock `first` is holding. Writes that
+        // both end before reaching the persist never trip the gate; they fail
+        // the test here instead of leaving it waiting for the gate.
+        let writes = async {
+            tokio::join!(
+                first.remember(sample_input()),
+                second.remember(sample_input())
+            )
+        };
+        tokio::pin!(writes);
+        let (first_result, second_result) = tokio::select! {
+            ended = &mut writes => {
+                return Err(format!("both writes ended before the anchor persist: {ended:?}").into());
             }
-        );
+            () = gate.entered.notified() => {
+                gate.release.notify_one();
+                writes.await
+            }
+        };
         let id_first = first_result?;
         let id_second = second_result?;
 
