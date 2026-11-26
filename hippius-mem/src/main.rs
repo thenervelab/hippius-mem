@@ -297,19 +297,26 @@ async fn main() -> anyhow::Result<()> {
         }
         () = terminated() => {}
     }
-    // A flush that anchors on chain has no time bound, since one cancelled
-    // after submission can land on chain with no record of it. A SIGTERM or
-    // Ctrl-C during the flush ends it, so an operator can still stop a
-    // session whose chain node hangs; the handler installed above means the
-    // signal no longer ends the process by itself.
+    flush_until_signal(&runtime.server).await;
+    Ok(())
+}
+
+/// Run [`MemoryServer::flush_on_exit`] until it ends or the process receives
+/// SIGTERM or Ctrl-C, for both `serve` paths.
+///
+/// A flush that anchors on chain has no time bound, since one cancelled after
+/// submission can land on chain with no record of it. A signal during the
+/// flush ends it, so an operator can still stop a session whose chain node
+/// hangs: the handler [`terminated`] installed for the signal that ended the
+/// session stays installed, so a signal no longer ends the process by itself.
+async fn flush_until_signal(server: &MemoryServer) {
     tokio::select! {
-        () = runtime.server.flush_on_exit() => {}
+        () = server.flush_on_exit() => {}
         () = terminated() => tracing::warn!(
             "stopped anchoring the session's last ops at exit on a signal; the next session \
              anchors them"
         ),
     }
-    Ok(())
 }
 
 /// Resolves when the process receives SIGTERM (or Ctrl-C), the signals a
@@ -542,7 +549,7 @@ async fn run_http_serve(args: &[String]) -> anyhow::Result<()> {
 
     let runtime = boot_serve(ServeKind::Daemon).await?;
     http_mcp::serve(bound, runtime.server.clone(), terminated()).await?;
-    runtime.server.flush_on_exit().await;
+    flush_until_signal(&runtime.server).await;
     Ok(())
 }
 

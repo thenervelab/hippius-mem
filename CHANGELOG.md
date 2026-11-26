@@ -402,8 +402,8 @@ field.
   last stderr lines again. Shutdown closed the stderr pipe as soon as the
   child exited, which could drop lines still in the pipe, the boot error
   among them; it now waits up to 5 s for both pipes to drain.
-- A SIGTERM or Ctrl-C while a stdio session anchors its last ops at exit
-  now ends that flush. With on-chain anchoring the flush has no time bound,
+- A SIGTERM or Ctrl-C while a stdio session or `serve` anchors its last ops
+  at exit now ends that flush. With on-chain anchoring the flush has no time bound,
   and the session's signal handler swallowed every later signal, so a hung
   chain node kept the process alive until SIGKILL.
 

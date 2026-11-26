@@ -44,7 +44,7 @@ struct HttpDaemon {
     child: ChildGuard,
     url: String,
     token: String,
-    _stderr: StderrDrain,
+    stderr: StderrDrain,
 }
 
 struct StderrDrain {
@@ -74,6 +74,7 @@ impl HttpDaemon {
             .current_dir(dir.path())
             .env("HOME", dir.path())
             .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("HIPPIUS_MEM_STATE_DIR", dir.path().join("state"))
             .env("HIPPIUS_MEM_CONFIG", &config_path)
             .env_remove("XDG_CACHE_HOME")
             .env_remove("RUST_LOG")
@@ -90,7 +91,7 @@ impl HttpDaemon {
             child,
             url,
             token: TOKEN.to_owned(),
-            _stderr: drain,
+            stderr: drain,
         })
     }
 
@@ -882,6 +883,78 @@ fn serve_anchors_its_last_writes_on_sigterm() -> Result<(), Box<dyn std::error::
         records += std::fs::read_dir(entry.path()).map_or(0, Iterator::count);
     }
     assert_eq!(records, 1, "one batch record under {}", anchors.display());
+    Ok(())
+}
+
+/// A signal during `serve`'s exit flush ends the flush. Here the flush cannot
+/// finish: the test holds the daemon's cross-process writer lock, which the
+/// anchor record's write waits for. `serve` used to await the flush with no
+/// signal arm, so a stop waited the flush out, which has no bound when the
+/// store anchors on chain.
+#[cfg(unix)]
+#[test]
+fn a_signal_during_serves_exit_flush_ends_it() -> Result<(), Box<dyn std::error::Error>> {
+    let mut daemon = HttpDaemon::spawn()?;
+    let session = handshake(&daemon)?;
+    let (_, remembered) = daemon.rpc(
+        Some(&session),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remember",
+                "arguments": {
+                    "note_type": "gotcha",
+                    "repo": "global",
+                    "summary": "heron-http flush meets a held lock",
+                    "body": "body"
+                }
+            }
+        }),
+    )?;
+    assert_ne!(
+        remembered["result"]["isError"].as_bool(),
+        Some(true),
+        "{remembered}"
+    );
+    let lock = std::fs::OpenOptions::new().read(true).write(true).open(
+        daemon
+            .dir
+            .path()
+            .join("state/hippius-mem/state/trial/writer.lock"),
+    )?;
+    lock.try_lock()?;
+
+    // The first signal ends the session. Which later one lands inside the
+    // flush is not observable from here, so one is sent every 100 ms until
+    // the process exits; the flush's own bound is 4 s.
+    let pid = daemon.child.0.id().to_string();
+    let status = loop {
+        let killed = Command::new("kill").args(["-TERM", &pid]).status()?;
+        assert!(killed.success(), "kill -TERM failed");
+        thread::sleep(Duration::from_millis(100));
+        if let Some(status) = daemon.child.0.try_wait()? {
+            break status;
+        }
+    };
+    drop(lock);
+
+    assert!(status.success(), "serve exits cleanly: {status}");
+    let stderr = daemon
+        .stderr
+        .buf
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    assert!(
+        stderr.contains("stopped anchoring the session's last ops at exit on a signal"),
+        "the signal ended the flush: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not finish before exit"),
+        "the flush did not run to its time bound: {stderr}"
+    );
     Ok(())
 }
 
