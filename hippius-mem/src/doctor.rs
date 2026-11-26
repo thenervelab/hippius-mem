@@ -578,12 +578,13 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 /// A published check of another key fails. With no usable check published, a
 /// key that fails to open most of the notes tried ([`KeyProbe::FailsToOpen`])
 /// fails too, unless the team has rotated past epoch 0 (`epoch`, the newest
-/// epoch the founder provisioned; `None` when that lookup failed). A check that matches decides, and a failing probe
-/// beside it is warned: when epoch 0's oldest notes were sealed under another
-/// key, the right key fails the probe too. Keys for rotated epochs come from
-/// founder-signed wraps, not from this configuration, and
-/// [`newest_epoch_key_line`] checks the newest epoch's. No usable published check is otherwise warned,
-/// not failed, with the command that publishes one.
+/// epoch the founder provisioned; `None` when that lookup failed). A check
+/// that matches decides, and a failing probe beside it is warned: when epoch
+/// 0's oldest notes were sealed under another key, the right key fails the
+/// probe too. Keys for rotated epochs come from founder-signed wraps, not from
+/// this configuration, and [`newest_epoch_key_line`] checks the newest
+/// epoch's. No usable published check is otherwise warned, not failed, with
+/// the command that publishes one.
 ///
 /// # Errors
 ///
