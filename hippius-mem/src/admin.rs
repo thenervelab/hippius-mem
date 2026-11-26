@@ -784,18 +784,19 @@ async fn publish_and_rotate(
         let _ = writeln!(out, "  {}", member.as_str());
     }
     match outcome.key_check {
-        Some(KeyCheckPublished::Published { .. } | KeyCheckPublished::AlreadyPublished) => {}
-        Some(KeyCheckPublished::Refused) => tracing::warn!(
+        Ok(KeyCheckPublished::Published { .. } | KeyCheckPublished::AlreadyPublished) => {}
+        Ok(KeyCheckPublished::Refused) => tracing::warn!(
             "a key check for the new epoch already exists and is not this key's; run \
              `hippius-mem admin keycheck publish --replace` from this machine"
         ),
-        Some(KeyCheckPublished::KeyFailsOnNotes) => tracing::warn!(
+        Ok(KeyCheckPublished::KeyFailsOnNotes) => tracing::warn!(
             "no team-key check was published for the new epoch: this machine's new key \
              opens fewer than half of that epoch's oldest notes it tried; run \
              `hippius-mem doctor`, or `hippius-mem admin keycheck publish` from a machine \
              whose key opens those notes"
         ),
-        None => tracing::warn!(
+        Err(err) => tracing::warn!(
+            error = %err,
             "could not publish the new epoch's team-key check; run `hippius-mem admin \
              keycheck publish` from this machine"
         ),

@@ -1335,19 +1335,18 @@ impl fmt::Debug for MemoryStore {
 /// material), so a CLI can print it verbatim. `wrapped` is the authoritative
 /// post-rotation read set: an address absent here holds no wrap of the new
 /// epoch and cannot read notes sealed under it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[must_use = "the caller must tell the team to restart with their mnemonics, or their servers refuse writes and miss the new epoch's notes"]
 pub struct RotationOutcome {
     /// The freshly minted epoch new writes now seal under.
     pub new_epoch: u64,
     /// The addresses wrapped the new epoch's key — the post-rotation read set.
     pub wrapped: BTreeSet<Ss58>,
-    /// What publishing the new epoch's key check did, or `None` when that
-    /// publish itself failed. The rotation is already durable in either case;
-    /// `None`, [`KeyCheckPublished::KeyFailsOnNotes`] and
-    /// [`KeyCheckPublished::Refused`] mean the operator still needs
-    /// `admin keycheck publish`.
-    pub key_check: Option<KeyCheckPublished>,
+    /// What publishing the new epoch's key check did, or why that publish
+    /// failed. The rotation is already durable in either case; an error,
+    /// [`KeyCheckPublished::KeyFailsOnNotes`] and [`KeyCheckPublished::Refused`]
+    /// mean the operator still needs `admin keycheck publish`.
+    pub key_check: Result<KeyCheckPublished, MemError>,
 }
 
 /// Outcome of a [`MemoryStore::sweep_orphan_blobs`] pass — plain counts a CLI can
@@ -8216,16 +8215,7 @@ impl MemoryStore {
         // the caller tells the operator once.
         let key_check = self
             .publish_team_key_check(new_epoch, PublishKeyCheck::IfAbsent)
-            .await
-            .inspect_err(|err| {
-                tracing::debug!(
-                    team = %self.team,
-                    new_epoch,
-                    error = %err,
-                    "could not publish the new epoch's team-key check"
-                );
-            })
-            .ok();
+            .await;
 
         Ok(RotationOutcome {
             new_epoch,
@@ -11217,6 +11207,66 @@ mod tests {
         assert!(left.is_empty(), "no wrap of this rotation: {left:?}");
         assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
         assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        Ok(())
+    }
+
+    /// A [`MemoryBlobStore`] whose key-check reads and writes fail, as a
+    /// gateway refusing that prefix would; listings work.
+    struct KeyCheckUnreachable(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for KeyCheckUnreachable {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            if key.contains("/_keycheck/") {
+                return Err(MemError::Storage("key check refused".into()));
+            }
+            self.0.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains("/_keycheck/") {
+                return Err(MemError::Storage("key check refused".into()));
+            }
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// A rotation whose key-check publish fails still completes, and its
+    /// outcome carries the publish error, so `admin rotate` can say why the
+    /// check is missing instead of only that it is.
+    #[tokio::test]
+    async fn a_rotation_reports_why_its_key_check_was_not_published() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(KeyCheckUnreachable(MemoryBlobStore::default()));
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .join_as_member(&crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+
+        let rotated = founder.rotate_key(0).await?;
+
+        assert_eq!(rotated.new_epoch, 1);
+        assert!(
+            matches!(&rotated.key_check, Err(MemError::Storage(msg)) if msg == "key check refused"),
+            "{:?}",
+            rotated.key_check
+        );
         Ok(())
     }
 

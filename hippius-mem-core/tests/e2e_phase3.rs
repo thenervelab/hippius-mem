@@ -1071,7 +1071,7 @@ async fn rotate_key_honours_the_known_max_epoch_floor() -> Result<(), BoxError> 
     );
     assert_eq!(founder.current_epoch(), 4);
     assert!(
-        matches!(outcome.key_check, Some(KeyCheckPublished::Published { .. })),
+        matches!(outcome.key_check, Ok(KeyCheckPublished::Published { .. })),
         "a new empty epoch should publish its check: {:?}",
         outcome.key_check
     );
@@ -1106,10 +1106,10 @@ async fn rotate_key_reports_when_the_new_epoch_notes_do_not_open() -> Result<(),
 
     let outcome = founder.rotate_key(0).await?;
     assert_eq!(outcome.new_epoch, EPOCH_1);
-    assert_eq!(
-        outcome.key_check,
-        Some(KeyCheckPublished::KeyFailsOnNotes),
-        "a silent Ok(_) would hide that the new epoch has no published check"
+    assert!(
+        matches!(outcome.key_check, Ok(KeyCheckPublished::KeyFailsOnNotes)),
+        "a silent Ok(_) would hide that the new epoch has no published check: {:?}",
+        outcome.key_check
     );
     Ok(())
 }
