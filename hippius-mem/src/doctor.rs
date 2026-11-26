@@ -1175,11 +1175,16 @@ async fn probe_encryption_boundary(
     // Read back first, then delete unconditionally: the probe must never leave
     // its object behind, even when a check below fails and returns early. Delete
     // is idempotent and best-effort, so its failure must not fail the probe — but
-    // a genuine transport/permission fault leaves the sentinel object behind, so
-    // log it (MemError is secret-free) to aid diagnosis.
+    // a genuine transport/permission fault leaves the object behind, and each run
+    // uses a new key, so it is warned with the key for the operator to delete
+    // (MemError is secret-free).
     let fetched = blob.get(&object_key).await;
     if let Err(err) = blob.delete(&object_key).await {
-        tracing::debug!(%err, "probe cleanup delete failed; sentinel object may remain");
+        tracing::warn!(
+            key = %object_key,
+            %err,
+            "could not delete doctor's probe object; delete it by hand"
+        );
     }
     let fetched = fetched.context("fetching the probe ciphertext back failed")?;
 
