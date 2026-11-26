@@ -902,3 +902,95 @@ async fn a_removal_that_never_rotated_is_flagged_until_a_rotation() -> anyhow::R
     clear_team(&bucket, UNROTATED_TEAM).await;
     Ok(())
 }
+
+/// The primary profile's namespace in the routing test.
+const ROUTING_PRIMARY: &str = "rw-routing-primary-live";
+
+/// The `[[teams]]` profile's namespace in the routing test.
+const ROUTING_TEAM: &str = "rw-routing-team-live";
+
+/// A team command run from a checkout whose remote routes to a `[[teams]]`
+/// profile acts on that profile, as `doctor` and the server do. Team commands
+/// used to act on the primary profile wherever they ran, so a founder of an
+/// org-routed team published its roster into the personal namespace.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_team_command_acts_on_the_profile_the_remote_routes_to() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    for team in [ROUTING_PRIMARY, ROUTING_TEAM] {
+        clear_team(&bucket, team).await;
+    }
+
+    let founder = Machine::new(
+        95,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    // Both profiles share the bucket, credentials, key and seed; only the
+    // namespace tells them apart.
+    let profile = format!(
+        "bucket = \"{bucket}\"\naccess_key_id = \"{access}\"\nsecret = \"{secret}\"\n\
+         team_key_hex = \"{TEAM_KEY_HEX}\"\nauthor_seed_hex = \"{seed}\"\n\
+         founder_ss58 = \"{founder}\"\n",
+        bucket = live.bucket,
+        access = live.access_key_id,
+        secret = live.secret,
+        seed = hippius_mem_core::hex::encode(founder.seed),
+        founder = founder.address()?,
+    );
+    std::fs::write(
+        founder.config_path(),
+        format!(
+            "s3_endpoint = \"{endpoint}\"\ns3_region = \"{region}\"\nsemantic_embeddings = false\n\
+             team = \"{ROUTING_PRIMARY}\"\n{primary}\n[[teams]]\nname = \"{ROUTING_TEAM}\"\n\
+             orgs = [\"github.com/acme\"]\n{routed}",
+            endpoint = live.endpoint,
+            region = live.region,
+            primary = profile,
+            routed = profile,
+        ),
+    )?;
+    let checkout = founder.home.path().join("app");
+    std::fs::create_dir_all(&checkout)?;
+    for args in [
+        &["init", "-q"][..],
+        &["remote", "add", "origin", "git@github.com:acme/app.git"][..],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&checkout)
+            .status()?;
+        assert!(status.success(), "git {}", args.join(" "));
+    }
+
+    let output = founder
+        .command(Mnemonic::Set)
+        .current_dir(&checkout)
+        .args(["publish-membership", "--members", &founder.address()?])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        bucket
+            .list(&format!("{ROUTING_TEAM}/_manifest/"))
+            .await?
+            .len(),
+        1,
+        "the routed profile's roster is published"
+    );
+    assert!(
+        bucket
+            .list(&format!("{ROUTING_PRIMARY}/_manifest/"))
+            .await?
+            .is_empty(),
+        "the primary profile is untouched"
+    );
+
+    for team in [ROUTING_PRIMARY, ROUTING_TEAM] {
+        clear_team(&bucket, team).await;
+    }
+    Ok(())
+}

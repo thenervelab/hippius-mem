@@ -293,6 +293,10 @@ team_key_hex = "…64 hex…"
 author_seed_hex = "…64 hex…"
 ```
 
+- **Team commands route the same way.** `join`, `provision`, `publish-membership`, `members`,
+  `rotate`, `remove`, `recover` and the `admin` commands act on the profile the current
+  directory's git remote routes to, as `doctor` and the server do: run them from a checkout of
+  that team's repository. `invite` still uses the primary profile.
 - **`name` is the note namespace** (the object-key prefix). A flat config's namespace is its
   `team` value, so upgrading a flat config to `[[teams]]` leaves existing notes in place.
 - **`orgs`** entries are the **bare** `host/org` (a whole org) or `host/org/repo` (one repo),

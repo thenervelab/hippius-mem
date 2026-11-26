@@ -17,7 +17,7 @@ use hippius_mem_core::{
 };
 use zeroize::Zeroizing;
 
-use crate::config::Config;
+use crate::config::{Config, TeamProfile};
 use crate::join_bundle::generate_seed_hex;
 
 /// SS58 network prefix for Hippius / generic Substrate identities (Bittensor),
@@ -43,12 +43,12 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
     let count = members.len();
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let store = cfg.build_store().await?;
+    let (_profile, store) = routed_store(&cfg).await?;
     store.publish_membership(members).await?;
 
     tracing::info!(
         members = count,
-        team = %cfg.team,
+        team = %store.team(),
         "published team membership manifest"
     );
 
@@ -85,9 +85,8 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     let generate_recovery = parse_provision_args(args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    crate::config::require_s3(&cfg.primary_profile(), "provision")?;
-
-    let store = cfg.build_store().await?;
+    let (profile, store) = routed_store(&cfg).await?;
+    crate::config::require_s3(&profile, "provision")?;
 
     // Load this founder's full epoch key-ring BEFORE wrapping the team key to
     // members. `build_store` starts at epoch 0, and `provision_members` wraps
@@ -109,7 +108,7 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     tracing::info!(
         written = provisioned.written.len(),
         kept = provisioned.kept,
-        team = %cfg.team,
+        team = %store.team(),
         "provisioned the team key to authorized published member keys (kept every wrap a \
          reader already accepts)"
     );
@@ -132,7 +131,7 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     }
 
     if generate_recovery {
-        generate_and_print_recovery_key(&store, &cfg.team).await?;
+        generate_and_print_recovery_key(&store, store.team()).await?;
     }
 
     Ok(())
@@ -319,21 +318,22 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
     // not asked to produce a mnemonic for a command that could never
     // succeed.
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    crate::config::require_s3(&cfg.primary_profile(), "join")?;
+    let (profile, _launch_repo) = crate::resolve_profile(&cfg)?;
+    crate::config::require_s3(&profile, "join")?;
 
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
         .context("`join` requires HIPPIUS_MEM_MNEMONIC (the joining member's identity)")?;
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
-    let store = cfg.build_store().await?;
+    let store = profile.build_store(&cfg).await?;
     store.join_as_member(&identity).await?;
     // Pick up any epoch keys the founder already provisioned to this member.
     bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     // The member key, and so the founder's wrap, is under the author address,
     // not the mnemonic's (`join_as_member`).
-    let member = cfg.primary_profile().signer()?.author_ss58();
+    let member = profile.signer()?.author_ss58();
     tracing::info!(
-        team = %cfg.team,
+        team = %profile.name,
         member = %member.as_str(),
         "published member key; the founder can now `provision` the team key to it"
     );
@@ -356,9 +356,9 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
 /// full team memory, so skipping the bootstrap would silently pin it to the
 /// founding epoch (the recorded `bootstrap_epochs` gotcha).
 ///
-/// Scope: like `provision` and `join`, this operates on the PRIMARY (flat,
-/// top-level) profile only — `[[teams]]` profiles are not routed here, so
-/// rotate a secondary team from a config whose primary IS that team.
+/// Scope: like every team command, this operates on the profile the current
+/// directory's git remote routes to (see [`routed_store`]), so a `[[teams]]`
+/// team is rotated from a checkout of one of its repositories.
 ///
 /// Open-team caveat: on a team with no `founder_ss58` pin and no published
 /// manifest, whoever runs `rotate --members` first publishes the genesis
@@ -650,8 +650,23 @@ fn plan_removal(
     Ok(RemovalStep::Publish(members))
 }
 
+/// The team profile the current directory's git remote routes to, and its
+/// store. Every team command picks its team this way, as `doctor` and the MCP
+/// server do, so on a config with `[[teams]]` profiles an operator runs it from
+/// a checkout of that team's repository.
+///
+/// # Errors
+///
+/// When the repository routes to no profile (memory is disabled here), or the
+/// store cannot be built.
+async fn routed_store(cfg: &Config) -> anyhow::Result<(TeamProfile, MemoryStore)> {
+    let (profile, _launch_repo) = crate::resolve_profile(cfg)?;
+    let store = profile.build_store(cfg).await?;
+    Ok((profile, store))
+}
+
 /// Shared preamble of the rotation-driving commands (`rotate`, `remove`): load
-/// the primary-profile config, build its store, run the epoch bootstrap, and
+/// the config, build the routed profile's store, run the epoch bootstrap, and
 /// publish this founder's member key when it is missing.
 ///
 /// `HIPPIUS_MEM_MNEMONIC` is required, and checked before anything else: the
@@ -678,7 +693,7 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the founder identity from HIPPIUS_MEM_MNEMONIC failed")?;
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let store = cfg.build_store().await?;
+    let (_profile, store) = routed_store(&cfg).await?;
 
     bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     if store.ensure_joined(&identity).await? == Joined::Now {
@@ -722,7 +737,7 @@ async fn publish_and_rotate(
         store.publish_membership(members).await?;
         tracing::info!(
             members = count,
-            team = %cfg.team,
+            team = %store.team(),
             "published team membership manifest before rotating"
         );
     }
@@ -756,7 +771,8 @@ async fn publish_and_rotate(
     let _ = writeln!(
         out,
         "rotated team `{}` to epoch {}",
-        cfg.team, outcome.new_epoch
+        store.team(),
+        outcome.new_epoch
     );
     let _ = writeln!(
         out,
@@ -823,9 +839,8 @@ pub(crate) async fn recover(args: &[String]) -> anyhow::Result<()> {
     reject_recover_args(args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    crate::config::require_s3(&cfg.primary_profile(), "recover")?;
-
-    let store = cfg.build_store().await?;
+    let (profile, store) = routed_store(&cfg).await?;
+    crate::config::require_s3(&profile, "recover")?;
 
     let seed_hex = read_recovery_seed()?;
     let recovery_signer = sr25519_signer_from_hex_seed(&seed_hex)?;
@@ -855,7 +870,7 @@ pub(crate) async fn recover(args: &[String]) -> anyhow::Result<()> {
          longer the trusted recovery key",
     )?;
     tracing::info!(
-        team = %cfg.team,
+        team = %store.team(),
         new_founder = %manifest.founder.as_str(),
         "recovered the team founder through the recovery key"
     );
@@ -1041,7 +1056,7 @@ pub(crate) async fn members(args: &[String]) -> anyhow::Result<()> {
 
     reject_args("members", args)?;
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let store = cfg.build_store().await?;
+    let (_profile, store) = routed_store(&cfg).await?;
     let members = store.members().await?;
     // Write to the stdout handle directly: this is operator-facing output, but the
     // workspace denies the `print!` family; `writeln!` on the handle is allowed.
@@ -1200,7 +1215,7 @@ async fn share_epoch_keys(args: &[String]) -> anyhow::Result<()> {
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let store = cfg.build_store().await?;
+    let (_profile, store) = routed_store(&cfg).await?;
 
     let shared = store.share_epoch_keys(&identity).await?;
     let mut out = std::io::stdout();
@@ -1249,7 +1264,7 @@ async fn keycheck(args: &[String]) -> anyhow::Result<()> {
     let mode = parse_keycheck_args(args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let store = cfg.build_store().await?;
+    let (_profile, store) = routed_store(&cfg).await?;
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
@@ -1403,7 +1418,7 @@ async fn resign_anchors(args: &[String]) -> anyhow::Result<()> {
     reject_args("admin resign-anchors", args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let store = cfg.build_store().await?;
+    let (_profile, store) = routed_store(&cfg).await?;
     let report = store.resign_anchor_records().await?;
 
     tracing::info!(
@@ -1411,7 +1426,7 @@ async fn resign_anchors(args: &[String]) -> anyhow::Result<()> {
         already_signed = report.already_signed,
         invalid_skipped = report.invalid_skipped,
         other_author = report.other_author,
-        team = %cfg.team,
+        team = %store.team(),
         "re-signed this author's legacy anchor records (every resigned record verified \
          to read back validly signed)"
     );
@@ -1481,7 +1496,7 @@ async fn quarantine(args: &[String]) -> anyhow::Result<()> {
     let parsed = parse_quarantine_args(args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let store = cfg.build_store().await?;
+    let (_profile, store) = routed_store(&cfg).await?;
 
     match parsed.remove {
         None => inspect_and_report(&store).await,

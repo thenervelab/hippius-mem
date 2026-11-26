@@ -153,9 +153,8 @@ Usage:
                                        founder: publish the signed membership manifest
   hippius-mem rotate [--members <ss58,...>]
                                        founder: rotate the team key to a new epoch
-                                       (needs HIPPIUS_MEM_MNEMONIC; primary profile
-                                       only; --members publishes a shrunk membership
-                                       first)
+                                       (needs HIPPIUS_MEM_MNEMONIC; --members
+                                       publishes a shrunk membership first)
   hippius-mem remove <ss58>            founder: remove a member — publish the roster
                                        without them, rotate the team key, and print
                                        the manual sub-token revoke step
