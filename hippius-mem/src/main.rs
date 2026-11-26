@@ -307,8 +307,9 @@ async fn main() -> anyhow::Result<()> {
 /// A flush that anchors on chain has no time bound, since one cancelled after
 /// submission can land on chain with no record of it. A signal during the
 /// flush ends it, so an operator can still stop a session whose chain node
-/// hangs: the handler [`terminated`] installed for the signal that ended the
-/// session stays installed, so a signal no longer ends the process by itself.
+/// hangs: the session's earlier [`terminated`] installed the SIGTERM and
+/// Ctrl-C handlers, and Tokio keeps them for the life of the process, so a
+/// signal no longer ends the process by itself.
 async fn flush_until_signal(server: &MemoryServer) {
     tokio::select! {
         () = server.flush_on_exit() => {}

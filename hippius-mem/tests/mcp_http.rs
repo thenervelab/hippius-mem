@@ -945,8 +945,8 @@ fn a_signal_during_serves_exit_flush_ends_it() -> Result<(), Box<dyn std::error:
         .stderr
         .buf
         .lock()
-        .map(|s| s.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     assert!(
         stderr.contains("stopped anchoring the session's last ops at exit on a signal"),
         "the signal ended the flush: {stderr}"
