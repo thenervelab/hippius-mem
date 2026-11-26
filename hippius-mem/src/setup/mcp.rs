@@ -1108,6 +1108,27 @@ mod tests {
         assert!(!health_response_is_ours(b"garbage with no header break"));
     }
 
+    /// `install` pins into client configs the token that `serve` of the same
+    /// config loads (the `mcp-token` beside the config), so the clients it
+    /// points at the daemon are accepted.
+    #[cfg(feature = "http-mcp")]
+    #[test]
+    fn the_standing_token_is_the_one_serve_of_that_config_loads() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("hippius-mem.toml");
+        std::fs::write(tmp.path().join("mcp-token"), "serves-this-token\n").expect("seed");
+        let launch = McpLaunch {
+            command: "hippius-mem".to_owned(),
+            config_path,
+            http: None,
+        };
+
+        assert_eq!(
+            launch.standing_token().expect("the token file reads"),
+            "serves-this-token"
+        );
+    }
+
     #[test]
     fn load_or_create_token_reuses_existing_and_mints_missing() {
         let tmp = TempDir::new().expect("tempdir");
