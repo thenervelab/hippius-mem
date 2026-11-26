@@ -909,6 +909,20 @@ pub trait MemoryIndex: Send + Sync {
     /// a persistent backend can report a storage failure.
     fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError>;
 
+    /// Record that note `from` now asserts `link`, replacing any relation `from`
+    /// held to the same target: the latest-wins-per-target rule convergence
+    /// applies. A no-op when `from` is not indexed.
+    ///
+    /// For a write path that has just appended the op, so recall reflects it
+    /// before the next sync. A later sync rebuilds relations from the op-log and
+    /// supersedes whatever this set.
+    ///
+    /// # Errors
+    ///
+    /// This in-memory implementation never errors; the signature is fallible so
+    /// a persistent backend can report a storage failure.
+    fn set_relation(&self, from: NoteId, link: TypedLink) -> Result<(), MemError>;
+
     /// The last reinforcement time of note `id`, if `author` is already one of
     /// its reinforcers; `None` when the note is unknown, was never reinforced,
     /// or `author` is not among those who did.
@@ -1559,7 +1573,10 @@ impl MemoryIndex for InMemoryIndex {
             let similarity = if semantic {
                 cosine(&query_vec, &entry.embedding)
             } else {
-                jaccard(&query_tokens, &doc_tokens(&entry.record))
+                // The stored side is the summary alone, like the candidate: with
+                // the tags added, a re-sent note whose record carries tags scores
+                // below the threshold against itself.
+                jaccard(&query_tokens, &tokenize(&entry.record.summary))
             };
             // NaN-safe skip: a misbehaving dense model can emit NaN components, and
             // a bare `similarity < threshold` would let NaN THROUGH (NaN < t is
@@ -1620,6 +1637,18 @@ impl MemoryIndex for InMemoryIndex {
             cid: entry.record.cid,
             key_epoch: entry.record.key_epoch,
         }))
+    }
+
+    fn set_relation(&self, from: NoteId, link: TypedLink) -> Result<(), MemError> {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = guard.entries.get_mut(&from) {
+            let relations = &mut entry.record.relations;
+            relations.retain(|held| held.to != link.to);
+            // Kept sorted, the order a sync materializes from its `BTreeSet`.
+            let at = relations.partition_point(|held| *held < link);
+            relations.insert(at, link);
+        }
+        Ok(())
     }
 
     fn last_reinforced_with(
@@ -2110,6 +2139,69 @@ mod tests {
             last_reinforced: None,
             embedding: None,
         })
+    }
+
+    /// A new relation to a target replaces the held one to that target and
+    /// leaves the others, kept sorted, as convergence keeps one relation per
+    /// target.
+    #[test]
+    fn set_relation_keeps_one_relation_per_target_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::oplog::{LinkRel, TypedLink};
+        use std::sync::PoisonError;
+
+        let index = InMemoryIndex::new(Arc::new(HashEmbedder::default()));
+        let source = record("team", RepoScope::Global, NoteType::Decision, "source", 1)?;
+        let from = source.note_id;
+        index.upsert(source)?;
+        let (low, high) = {
+            let (a, b) = (NoteId::new(), NoteId::new());
+            if a < b { (a, b) } else { (b, a) }
+        };
+
+        index.set_relation(
+            from,
+            TypedLink {
+                to: high,
+                rel: LinkRel::Supersedes,
+            },
+        )?;
+        index.set_relation(
+            from,
+            TypedLink {
+                to: low,
+                rel: LinkRel::Contradicts,
+            },
+        )?;
+        index.set_relation(
+            from,
+            TypedLink {
+                to: high,
+                rel: LinkRel::Refines,
+            },
+        )?;
+
+        let held = index
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .get(&from)
+            .map(|entry| entry.record.relations.clone())
+            .ok_or("the source is indexed")?;
+        let mut expected = vec![
+            TypedLink {
+                to: low,
+                rel: LinkRel::Contradicts,
+            },
+            TypedLink {
+                to: high,
+                rel: LinkRel::Refines,
+            },
+        ];
+        expected.sort();
+        assert_eq!(held, expected);
+        Ok(())
     }
 
     fn query(text: &str, repo: RepoScope, k: usize, now: i64) -> Query {

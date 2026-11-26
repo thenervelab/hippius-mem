@@ -3,11 +3,12 @@
 //! Compiled only under `http-mcp`. N agent sessions share one process, one
 //! ONNX embedder, and one op-log writer. The security boundary is loopback
 //! bind + a standing bearer token (file next to the config, 0600) on every
-//! route but `/health`, plus rmcp's Host allow-list on `/mcp`. `/path-notes`
+//! route but `/health` and `/token-proof`, plus rmcp's Host allow-list on `/mcp`. `/path-notes`
 //! and `/call/{tool}` have the token alone: a web page cannot send the
 //! `Authorization` header cross-origin without a preflight this server never
 //! answers. The dashboard is a different HTTP surface (browse UI); this module
 //! is the MCP data plane.
+use std::future::IntoFuture as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,11 +29,11 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::secret_token::constant_time_eq;
 use crate::setup::mcp::{
-    DEFAULT_HTTP_PORT, HEALTH_BODY, default_token_path, health_response_is_ours, http_listen_url,
-    load_or_create_token,
+    DEFAULT_HTTP_PORT, HEALTH_BODY, default_token_path, http_listen_url, load_or_create_token,
+    response_proves_token, token_proof_request,
 };
 
-/// How long a `/health` probe may block before we treat the occupant as not us.
+/// How long a token-proof probe may block before we treat the occupant as not us.
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Retries after `AddrInUse` so a dying previous job can release the port
 /// before we take the exit-0 "already listening" shortcut.
@@ -66,14 +67,16 @@ pub(crate) struct BoundListener {
 
 /// Parse `serve` arguments, load the bearer token, and bind loopback.
 ///
-/// `Ok(None)` means a healthy hippius-mem daemon already owns the port: the
+/// `Ok(None)` means a daemon holding this token already owns the port: the
 /// caller exits 0 so the user service (`SuccessfulExit=false`) does not
 /// crash-loop.
 ///
 /// # Errors
 ///
 /// Returns an error if arguments are unknown, the token cannot be loaded, or
-/// the loopback socket cannot be bound.
+/// the loopback socket cannot be bound, including when the process holding the
+/// port does not prove it holds this token (another user's daemon on a shared
+/// host, an older `serve`, or another program).
 pub(crate) async fn bind(args: &[String]) -> anyhow::Result<Option<BoundListener>> {
     let ServeArgs { port, token_file } = parse_args(args)?;
     let token_path = match token_file {
@@ -82,7 +85,7 @@ pub(crate) async fn bind(args: &[String]) -> anyhow::Result<Option<BoundListener
     };
     let token = load_or_create_token(&token_path)?;
 
-    let Some(listener) = bind_loopback(port).await? else {
+    let Some(listener) = bind_loopback(port, &token).await? else {
         tracing::info!(
             url = %http_listen_url(port),
             "hippius-mem MCP already listening"
@@ -112,10 +115,16 @@ pub(crate) async fn bind(args: &[String]) -> anyhow::Result<Option<BoundListener
 /// ONNX / op-log). The caller's vault lock must stay alive for the listen
 /// lifetime — this function does not hold it.
 ///
+/// Returns once `shutdown` resolves and the open connections have finished.
+///
 /// # Errors
 ///
 /// Returns an error if the HTTP server itself fails.
-pub(crate) async fn serve(bound: BoundListener, server: MemoryServer) -> anyhow::Result<()> {
+pub(crate) async fn serve(
+    bound: BoundListener,
+    server: MemoryServer,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let BoundListener {
         listener,
         token,
@@ -123,11 +132,31 @@ pub(crate) async fn serve(bound: BoundListener, server: MemoryServer) -> anyhow:
     } = bound;
 
     let router = router(server, token, port);
-    axum::serve(listener, router)
-        .await
-        .context("MCP HTTP server error")?;
+    let (drain, drained) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = drained.await;
+        })
+        .into_future();
+    tokio::pin!(serving);
+    tokio::select! {
+        finished = &mut serving => return finished.context("MCP HTTP server error"),
+        () = shutdown => {}
+    }
+    let _ = drain.send(());
+    // A long-lived SSE stream would hold the graceful drain open past the
+    // supervisor's patience, and its SIGKILL would skip the caller's exit work
+    // (anchoring the last ops). So the drain is bounded.
+    if let Ok(drained) = tokio::time::timeout(SHUTDOWN_DRAIN, serving).await {
+        return drained.context("MCP HTTP server error");
+    }
+    tracing::warn!("open MCP connections did not close within the shutdown window");
     Ok(())
 }
+
+/// How long `serve` waits for open connections after a shutdown signal.
+/// Arbitrary, well under systemd's default 90 s stop timeout.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
 
 /// The bearer-token file `serve` uses when `--token-file` is not given: the
 /// sibling of the config it loads. `path-notes` reads the same file.
@@ -173,61 +202,64 @@ fn is_loopback_addr(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-/// Bind `127.0.0.1:port`. `None` means a healthy peer already owns the port
-/// (exit 0 so the user service `SuccessfulExit=false` does not crash-loop).
-async fn bind_loopback(port: u16) -> anyhow::Result<Option<tokio::net::TcpListener>> {
-    let mut last_err = None;
-    for attempt in 1..=BIND_ATTEMPTS {
-        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+/// Bind `127.0.0.1:port`. `None` means a peer holding `token` already owns the
+/// port (exit 0 so the user service `SuccessfulExit=false` does not
+/// crash-loop). Any other occupant is an error: exiting 0 there would leave
+/// this user's clients sending their token and tool calls to it, and stop the
+/// service from retrying the port.
+async fn bind_loopback(port: u16, token: &str) -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    let mut attempt = 1;
+    loop {
+        let err = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
             Ok(listener) => return Ok(Some(listener)),
-            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
-                last_err = Some(err);
-                if attempt == BIND_ATTEMPTS {
-                    if peer_is_our_daemon(port).await {
-                        return Ok(None);
-                    }
-                    break;
-                }
-                tokio::time::sleep(BIND_RETRY_PAUSE).await;
-            }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to bind loopback MCP port {port}"));
-            }
+            Err(err) => err,
+        };
+        if err.kind() != std::io::ErrorKind::AddrInUse || port == 0 {
+            return Err(err).with_context(|| format!("failed to bind loopback MCP port {port}"));
         }
+        if attempt < BIND_ATTEMPTS {
+            attempt += 1;
+            tokio::time::sleep(BIND_RETRY_PAUSE).await;
+            continue;
+        }
+        if peer_holds_token(port, token).await {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "loopback MCP port {port} is held by a process that does not prove it holds \
+                 this user's token (another user's hippius-mem serve, an older one, or another \
+                 program); stop it, or keep this user's clients on stdio"
+            )
+        });
     }
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::AddrInUse, "loopback MCP port in use")
-    }))
-    .with_context(|| format!("failed to bind loopback MCP port {port}"))
 }
 
-/// True when something already bound to `port` answers our unauthenticated
-/// `/health` with [`HEALTH_BODY`] within [`HEALTH_PROBE_TIMEOUT`].
+/// True when something already bound to `port` answers a fresh
+/// `/token-proof` challenge with the proof of `token` within
+/// [`HEALTH_PROBE_TIMEOUT`].
 ///
-/// The body names hippius-mem so an unrelated local service that happens to
-/// answer `/health` with `ok` is not mistaken for this daemon (which would
-/// make `serve` exit 0 and leave clients sending their bearer token to it).
-async fn peer_is_our_daemon(port: u16) -> bool {
+/// `/health` is not enough: every user's daemon on a shared host answers it
+/// alike, and an unrelated service can copy it.
+async fn peer_holds_token(port: u16, token: &str) -> bool {
     matches!(
-        tokio::time::timeout(HEALTH_PROBE_TIMEOUT, probe_health(port)).await,
+        tokio::time::timeout(HEALTH_PROBE_TIMEOUT, probe_token(port, token)).await,
         Ok(true)
     )
 }
 
-async fn probe_health(port: u16) -> bool {
-    let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+async fn probe_token(port: u16, token: &str) -> bool {
+    let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
         return false;
     };
-    let mut stream = stream;
-    let req =
-        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(req.as_bytes()).await.is_err() {
+    let nonce = hippius_mem_core::Ulid::new().to_string();
+    let request = token_proof_request(port, &nonce);
+    if stream.write_all(request.as_bytes()).await.is_err() {
         return false;
     }
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf).await;
-    health_response_is_ours(&buf)
+    response_proves_token(&buf, token, &nonce)
 }
 
 fn router(server: MemoryServer, token: String, port: u16) -> Router {
@@ -249,14 +281,25 @@ fn router(server: MemoryServer, token: String, port: u16) -> Router {
             // via GET + Last-Event-ID when it needs a long-lived stream.
             .with_sse_keep_alive(None),
     );
+    let token: Arc<str> = Arc::from(token);
+    let proof_token = Arc::clone(&token);
     let mcp_router = Router::new()
         .route("/path-notes", get(path_notes))
         .route("/call/{tool}", post(call_tool))
         .with_state(plain_server)
         .nest_service("/mcp", mcp)
-        .layer(from_fn_with_state(Arc::from(token), require_bearer));
+        .layer(from_fn_with_state(token, require_bearer));
     Router::new()
         .route("/health", get(health))
+        // Unauthenticated: it answers with a proof of the token, never the
+        // token, so `install` can tell this user's daemon from another's.
+        .route(
+            "/token-proof",
+            get(move |Query(query): Query<TokenProofQuery>| {
+                let token = Arc::clone(&proof_token);
+                async move { hippius_mem_core::token_proof(&token, &query.nonce) }
+            }),
+        )
         .merge(mcp_router)
 }
 
@@ -268,6 +311,12 @@ fn session_manager() -> LocalSessionManager {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, HEALTH_BODY)
+}
+
+/// Query of `GET /token-proof`: the challenge the caller picked.
+#[derive(Debug, serde::Deserialize)]
+struct TokenProofQuery {
+    nonce: String,
 }
 
 /// Query of `GET /path-notes`.
@@ -549,8 +598,14 @@ mod tests {
         });
         let (app, server) = warm_app(Arc::<GatedBlob>::clone(&blob));
 
-        let request = tokio::spawn(app.oneshot(remember_request(Some("secret"))));
-        blob.entered.notified().await;
+        let mut request = tokio::spawn(app.oneshot(remember_request(Some("secret"))));
+        // A request that ends before its first `put` never parks; it fails the
+        // test here instead of leaving it waiting for the gate.
+        let parked = tokio::select! {
+            ended = &mut request => Err(ended),
+            () = blob.entered.notified() => Ok(()),
+        };
+        parked.expect("the request parks at its first put");
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
 
@@ -629,12 +684,12 @@ mod tests {
         });
         let started = Instant::now();
         assert!(
-            !super::peer_is_our_daemon(port).await,
-            "a listener that never answers /health must not count as our daemon"
+            !super::peer_holds_token(port, "mine").await,
+            "a listener that never answers must not count as our daemon"
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
-            "the health probe must time out instead of hanging serve"
+            "the token probe must time out instead of hanging serve"
         );
     }
 }

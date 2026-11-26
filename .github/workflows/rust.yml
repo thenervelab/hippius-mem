@@ -249,11 +249,17 @@ jobs:
       - name: upgrade trial vault to a real bucket
         run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_round_trips --nocapture
 
+      - name: upgrade refuses a bucket another vault used
+        run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_refuses --nocapture
+
       - name: doctor's live probe against a real S3 profile
         run: cargo test -p hippius-mem --locked --test doctor_s3 -- --ignored --nocapture
 
       - name: gc's live sweep against a real S3 bucket
         run: cargo test -p hippius-mem --locked --test gc_s3 -- --ignored --nocapture
+
+      - name: a member removal through the binary against a real S3 bucket
+        run: cargo test -p hippius-mem --locked --test rotation_s3 -- --ignored --nocapture
 
       # `--bin hippius-mem`, NOT `--lib`: `config.rs` is a module of main.rs, so
       # its unit tests compile into the binary's test target. `--lib` here builds
@@ -261,7 +267,13 @@ jobs:
       # Swept by a bare `--ignored` scoped to that target, like the blob_contract
       # step above and unlike a name filter: a renamed test then fails loudly
       # here instead of silently matching nothing and reporting success.
+      # These tests run in-process, so they cannot redirect HOME; they clear
+      # their team's cache and state directories and refuse to run unless both
+      # overrides point at throwaway directories.
       - name: build_store's S3 branch against a real bucket
+        env:
+          HIPPIUS_MEM_CACHE_DIR: ${{ runner.temp }}/hm-cache
+          HIPPIUS_MEM_STATE_DIR: ${{ runner.temp }}/hm-state
         run: cargo test -p hippius-mem --locked --bin hippius-mem -- --ignored --nocapture
 
   # Supply-chain gate: advisories (RUSTSEC), license policy, and source

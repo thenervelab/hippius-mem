@@ -28,10 +28,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, Identity, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
-    MemoryStore, NetworkPrefix, NoopAnchor, Note, NoteType, OpLogStore, RecallInput, RememberInput,
-    RepoScope, SecretKey, Signer, Sr25519Signer, derive_identity, fetch_team_key, open,
-    provision_team_key, publish_member_key, rotate_team_key, signer_from_mnemonic,
+    BlobStore, HashEmbedder, Identity, InMemoryIndex, KeyCheckPublished, MemError, MemberKey,
+    MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, Note, NoteType, OpLogStore,
+    RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, derive_identity,
+    fetch_team_key, open, provision_team_key, publish_member_key, rotate_team_key,
+    signer_from_mnemonic,
 };
 
 /// The shared namespace every machine writes into.
@@ -655,6 +656,11 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
         EPOCH_1,
         "rotation advances the write epoch in the same call"
     );
+    assert_eq!(
+        founder.check_team_key().await?,
+        hippius_mem_core::TeamKeyCheck::Matches,
+        "rotation publishes the new epoch's team-key check"
+    );
 
     // The next write seals under the rotated epoch — no extra step needed.
     let post_rotation = founder
@@ -1064,5 +1070,46 @@ async fn rotate_key_honours_the_known_max_epoch_floor() -> Result<(), BoxError> 
         "the new epoch clears both the local ring and the configured max_epoch"
     );
     assert_eq!(founder.current_epoch(), 4);
+    assert!(
+        matches!(outcome.key_check, Ok(KeyCheckPublished::Published { .. })),
+        "a new empty epoch should publish its check: {:?}",
+        outcome.key_check
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotate_key_reports_when_the_new_epoch_notes_do_not_open() -> Result<(), BoxError> {
+    // Notes already exist at the epoch this rotation will mint, sealed under
+    // another key: a prior mint this machine's ring does not include. The
+    // rotation must still complete, and must report that it published no check.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    publish_member(&bucket, FOUNDER_MNEMONIC).await?;
+
+    let earlier = MemoryStore::new(
+        bucket.clone() as Arc<dyn BlobStore>,
+        Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+        OpLogStore::new(bucket.clone() as Arc<dyn BlobStore>),
+        Arc::new(NoopAnchor),
+        Arc::new(signer_from_mnemonic(FOUNDER_MNEMONIC, PREFIX)?),
+        std::collections::BTreeMap::from([(EPOCH_1, SecretKey::from_bytes(TEAM_KEY_EPOCH_1))]),
+        EPOCH_1,
+        TEAM.to_owned(),
+        ANCHOR_THRESHOLD,
+    );
+    earlier.remember(release_note()).await?;
+
+    let outcome = founder.rotate_key(0).await?;
+    assert_eq!(outcome.new_epoch, EPOCH_1);
+    assert!(
+        matches!(outcome.key_check, Ok(KeyCheckPublished::KeyFailsOnNotes)),
+        "a silent Ok(_) would hide that the new epoch has no published check: {:?}",
+        outcome.key_check
+    );
     Ok(())
 }

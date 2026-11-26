@@ -401,8 +401,8 @@ impl std::error::Error for InvalidBlake3Hex {}
 
 /// The object-key segment standing in for [`RepoScope::Global`].
 ///
-/// The single source of truth for the team-global sentinel: [`Scope::repo_segment`]
-/// mints it and `objkey` parses it back, so the two never drift. Because the word
+/// The single source of truth for the team-global sentinel: `objkey` mints it
+/// and parses it back, so the two never drift. Because the word
 /// is reserved, a repository literally named `"global"` is rejected when deriving
 /// an object key (otherwise `Repo("global")` and `Global` would both serialize to
 /// `.../global/...` and the round trip would be lossy).
@@ -429,23 +429,6 @@ pub struct Scope {
     pub team: String,
     /// Global or a specific repository.
     pub repo: RepoScope,
-}
-
-impl Scope {
-    /// The path segment used in object keys: [`GLOBAL_SEGMENT`] for
-    /// [`RepoScope::Global`], otherwise the repository name. This is the one place
-    /// the global sentinel string is minted, so keys stay consistent across the
-    /// codebase.
-    ///
-    /// `pub(crate)`: only the sibling `objkey` module mints object keys; this is
-    /// an internal layout helper, not part of the crate's public surface.
-    #[must_use]
-    pub(crate) fn repo_segment(&self) -> &str {
-        match &self.repo {
-            RepoScope::Global => GLOBAL_SEGMENT,
-            RepoScope::Repo(name) => name,
-        }
-    }
 }
 
 /// The kind of knowledge a note records.
@@ -677,20 +660,6 @@ mod tests {
             Ss58::new(bad),
             Err(InvalidSs58::IllegalChar { ch: '0' })
         ));
-    }
-
-    #[test]
-    fn scope_repo_segment_distinguishes_global() {
-        let global = Scope {
-            team: "team".to_owned(),
-            repo: RepoScope::Global,
-        };
-        assert_eq!(global.repo_segment(), "global");
-        let repo = Scope {
-            team: "team".to_owned(),
-            repo: RepoScope::Repo("hippius".to_owned()),
-        };
-        assert_eq!(repo.repo_segment(), "hippius");
     }
 
     proptest! {

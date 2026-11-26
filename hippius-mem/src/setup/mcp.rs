@@ -155,6 +155,39 @@ pub(crate) fn health_response_is_ours(response: &[u8]) -> bool {
     body.trim() == HEALTH_BODY
 }
 
+/// The `GET /token-proof` request that challenges the daemon on the loopback
+/// `port` with `nonce`.
+#[cfg(feature = "http-mcp")]
+pub(crate) fn token_proof_request(port: u16, nonce: &str) -> String {
+    format!(
+        "GET /token-proof?nonce={nonce} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Connection: close\r\n\r\n"
+    )
+}
+
+/// The proof in a raw HTTP/1.1 answer to [`token_proof_request`]: the trimmed
+/// body of a 200 answer, `None` for anything else.
+#[cfg(feature = "http-mcp")]
+pub(crate) fn token_proof_body(response: &[u8]) -> Option<String> {
+    let response = String::from_utf8_lossy(response);
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    head.starts_with("HTTP/1.1 200")
+        .then(|| body.trim().to_owned())
+}
+
+/// Whether a raw HTTP/1.1 answer to [`token_proof_request`] for `nonce` proves
+/// that the daemon holds `token`.
+///
+/// `/health` answers alike for every user's daemon on a shared host. Only a
+/// holder of the token computes [`hippius_mem_core::token_proof`] for a fresh
+/// nonce, and the token itself never leaves the caller.
+#[cfg(feature = "http-mcp")]
+#[must_use]
+pub(crate) fn response_proves_token(response: &[u8], token: &str, nonce: &str) -> bool {
+    token_proof_body(response)
+        .is_some_and(|proof| proof == hippius_mem_core::token_proof(token, nonce))
+}
+
 /// Loopback streamable-HTTP MCP listen URL for `port`.
 #[cfg(any(test, feature = "http-mcp"))]
 #[must_use]
@@ -273,23 +306,28 @@ impl McpLaunch {
         }
     }
 
-    /// Prepare loopback HTTP coordinates: reuse or mint the standing token
-    /// next to the config file, and point at [`DEFAULT_HTTP_PORT`].
-    ///
-    /// Does not start the daemon. `install` calls this so Claude/Grok/Codex
-    /// entries can be written before the user service is launched.
+    /// The standing bearer token next to the config file, minted when missing:
+    /// the token the `serve` daemon of this config loads.
     ///
     /// # Errors
     ///
     /// Returns an error if the token file cannot be created or read.
     #[cfg(feature = "http-mcp")]
-    pub(crate) fn prepare_http(&mut self) -> anyhow::Result<()> {
-        let token = load_or_create_token(&default_token_path(&self.config_path))?;
+    pub(crate) fn standing_token(&self) -> anyhow::Result<String> {
+        load_or_create_token(&default_token_path(&self.config_path))
+    }
+
+    /// Point the clients that speak HTTP at the daemon on
+    /// [`DEFAULT_HTTP_PORT`], authenticating with `token`.
+    ///
+    /// Starts and checks nothing: call it only once the daemon has proved it
+    /// holds `token` ([`super::daemon::install_and_start`]).
+    #[cfg(feature = "http-mcp")]
+    pub(crate) fn attach_http(&mut self, token: String) {
         self.http = Some(McpHttp {
             url: http_listen_url(DEFAULT_HTTP_PORT),
             token,
         });
-        Ok(())
     }
 
     /// Whether the entry written for a client with this transport preference
@@ -664,6 +702,25 @@ mod tests {
     fn mcp(dir: &TempDir) -> Value {
         let raw = std::fs::read_to_string(dir.path().join(".mcp.json")).expect(".mcp.json exists");
         serde_json::from_str(&raw).expect("valid JSON")
+    }
+
+    /// Only a 200 answer carries a proof, and its body is taken whole and
+    /// trimmed: a refusal's body (a 401 page that happens to hold the right
+    /// hex) is no proof, and a body that is not UTF-8 is compared lossily
+    /// rather than read as no answer.
+    #[cfg(feature = "http-mcp")]
+    #[test]
+    fn token_proof_body_takes_only_a_200_answers_body() {
+        use super::token_proof_body;
+
+        let ok = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n abcd\n";
+        assert_eq!(token_proof_body(ok).as_deref(), Some("abcd"));
+        let refused = b"HTTP/1.1 401 Unauthorized\r\n\r\nabcd";
+        assert_eq!(token_proof_body(refused), None);
+        assert_eq!(token_proof_body(b"HTTP/1.1 200 OK\r\nabcd"), None);
+        assert_eq!(token_proof_body(b"").as_deref(), None);
+        let lossy = b"HTTP/1.1 200 OK\r\n\r\nab\xffcd";
+        assert_eq!(token_proof_body(lossy).as_deref(), Some("ab\u{fffd}cd"));
     }
 
     #[test]
@@ -1049,6 +1106,27 @@ mod tests {
         );
         assert!(!health_response_is_ours(b""));
         assert!(!health_response_is_ours(b"garbage with no header break"));
+    }
+
+    /// `install` pins into client configs the token that `serve` of the same
+    /// config loads (the `mcp-token` beside the config), so the clients it
+    /// points at the daemon are accepted.
+    #[cfg(feature = "http-mcp")]
+    #[test]
+    fn the_standing_token_is_the_one_serve_of_that_config_loads() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("hippius-mem.toml");
+        std::fs::write(tmp.path().join("mcp-token"), "serves-this-token\n").expect("seed");
+        let launch = McpLaunch {
+            command: "hippius-mem".to_owned(),
+            config_path,
+            http: None,
+        };
+
+        assert_eq!(
+            launch.standing_token().expect("the token file reads"),
+            "serves-this-token"
+        );
     }
 
     #[test]

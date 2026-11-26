@@ -28,7 +28,10 @@ use std::sync::Arc;
 
 use futures_util::StreamExt as _;
 use hippius_mem_core::{
-    BlobStore, CachingBlobStore, FsBlobStore, MemError, MemoryBlobStore, S3BlobStore, SecretKey,
+    BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, FsBlobStore, HashEmbedder,
+    InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteType,
+    OpLogStore, RememberInput, RepoScope, S3BlobStore, SecretKey, Signer, Sr25519Signer,
+    probe_create_only,
 };
 
 /// The keys one contract run uses: two under a shared prefix, where `first`
@@ -101,6 +104,35 @@ async fn exercise_contract(store: Arc<dyn BlobStore>, keys: &Keyspace) {
     ));
 }
 
+/// The create-only write: it creates an absent key, refuses an existing one
+/// without changing it, and the probe reports the store enforces it. A backend
+/// that ignores the condition fails here, which is the point of running this
+/// against the live gateway.
+async fn exercise_create_only(store: &dyn BlobStore, keys: &Keyspace) {
+    assert_eq!(
+        store
+            .put_if_absent(&keys.first, vec![1])
+            .await
+            .expect("create"),
+        CreateOutcome::Created
+    );
+    assert_eq!(
+        store
+            .put_if_absent(&keys.first, vec![2])
+            .await
+            .expect("second create"),
+        CreateOutcome::AlreadyExists
+    );
+    assert_eq!(store.get(&keys.first).await.expect("get"), vec![1]);
+
+    let team = keys.prefix.split('/').next().expect("a prefix has a team");
+    assert_eq!(
+        probe_create_only(store, team).await.expect("probe"),
+        CreateOnly::Enforced
+    );
+    store.delete(&keys.first).await.expect("cleanup");
+}
+
 /// Remove every object under `prefix`, so a run against a persistent shared
 /// bucket neither sees a previous run's leftovers in its `list` assertion nor
 /// leaves its own behind.
@@ -126,6 +158,21 @@ fn caching_over(inner: Arc<dyn BlobStore>) -> (Arc<dyn BlobStore>, tempfile::Tem
 #[tokio::test]
 async fn memory_store_honors_the_contract() {
     exercise_contract(Arc::new(MemoryBlobStore::new()), &Keyspace::plain("team")).await;
+}
+
+#[tokio::test]
+async fn memory_fs_and_caching_stores_enforce_create_only_writes() {
+    exercise_create_only(&MemoryBlobStore::new(), &Keyspace::plain("team")).await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    exercise_create_only(
+        &FsBlobStore::new(dir.path().to_path_buf()),
+        &Keyspace::plain("team"),
+    )
+    .await;
+
+    let (cached, _cache_dir) = caching_over(Arc::new(MemoryBlobStore::new()));
+    exercise_create_only(cached.as_ref(), &Keyspace::cached("team")).await;
 }
 
 #[tokio::test]
@@ -167,11 +214,12 @@ async fn caching_store_over_the_fs_backend_honors_the_contract() {
 
 /// Build the S3 store from the same environment contract
 /// `hippius-mem/tests/upgrade_cli.rs` uses, so one `MinIO` job configures both.
-/// Only the bucket has no default: a wrong guess would write into a bucket the
-/// operator did not create for this test.
+/// The endpoint and the bucket have no default: a wrong guess would write into,
+/// and clear a prefix of, a server or bucket the operator did not set up for
+/// this test.
 fn s3_store_from_env() -> S3BlobStore {
     let endpoint = std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned());
+        .expect("set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint");
     let bucket = std::env::var("HIPPIUS_MEM_TEST_BUCKET")
         .expect("set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint");
     let access_key_id =
@@ -193,6 +241,61 @@ async fn s3_store_honors_the_contract() {
     clear_prefix(store.as_ref(), &keys.prefix).await;
     exercise_contract(Arc::clone(&store), &keys).await;
     clear_prefix(store.as_ref(), &keys.prefix).await;
+}
+
+/// A request the gateway refuses (here: signed with a wrong secret) fails with a
+/// short error naming the HTTP status and the S3 error code, and without the
+/// gateway's echo of the request. The error used to carry the whole SDK error
+/// chain: the access key id, the string the request signed, and any response
+/// body, however large.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_refused_request_fails_with_a_short_error() {
+    let endpoint = std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
+        .expect("set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint");
+    let bucket = std::env::var("HIPPIUS_MEM_TEST_BUCKET")
+        .expect("set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint");
+    let access_key_id =
+        std::env::var("HIPPIUS_MEM_TEST_ACCESS_KEY_ID").unwrap_or_else(|_| "test".to_owned());
+    let region =
+        std::env::var("HIPPIUS_MEM_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let store = S3BlobStore::new(
+        endpoint,
+        bucket,
+        access_key_id.clone(),
+        "not-the-secret".to_owned(),
+        region,
+    );
+
+    let err = store
+        .list("hippius-mem-contract-refused/")
+        .await
+        .expect_err("a request signed with a wrong secret must fail");
+    assert!(matches!(err, MemError::Storage(_)), "{err:?}");
+    let message = err.to_string();
+    assert!(message.contains("403"), "names the HTTP status: {message}");
+    assert!(
+        message.contains("SignatureDoesNotMatch"),
+        "names the S3 error code: {message}"
+    );
+    assert!(
+        !message.contains(&access_key_id),
+        "must not echo the access key id: {message}"
+    );
+    assert!(message.len() < 600, "{} bytes: {message}", message.len());
+}
+
+/// Whether the live endpoint enforces `If-None-Match: *` on `PutObject`. The
+/// Hippius gateway's support is not documented; versitygw 1.8.0 enforces it.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn s3_store_enforces_create_only_writes() {
+    let store = s3_store_from_env();
+    let keys = Keyspace::plain("hippius-mem-contract-create-only");
+
+    clear_prefix(&store, &keys.prefix).await;
+    exercise_create_only(&store, &keys).await;
+    clear_prefix(&store, &keys.prefix).await;
 }
 
 /// How many objects the pagination run puts under one prefix.
@@ -304,4 +407,93 @@ async fn caching_store_over_s3_honors_the_contract() {
     exercise_contract(store, &keys).await;
 
     clear_prefix(backend.as_ref(), &keys.prefix).await;
+}
+
+/// The team the live two-writer run owns in the bucket.
+const TWO_WRITERS_TEAM: &str = "hippius-mem-two-writers-live";
+
+/// A store for `team` over `blob` signing as `seed`, sealing with one fixed
+/// team key.
+fn live_store(blob: Arc<dyn BlobStore>, seed: u8) -> MemoryStore {
+    let signer: Arc<dyn Signer> = Arc::new(
+        Sr25519Signer::from_seed_with_prefix(&[seed; 32], NetworkPrefix::HIPPIUS)
+            .expect("a fixed seed is a valid key"),
+    );
+    MemoryStore::new(
+        Arc::clone(&blob),
+        Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+        OpLogStore::new(blob),
+        Arc::new(NoopAnchor),
+        signer,
+        std::collections::BTreeMap::from([(0, SecretKey::from_bytes([5; 32]))]),
+        0,
+        TWO_WRITERS_TEAM.to_owned(),
+        4,
+    )
+}
+
+/// Two writers under different seeds write at the same time against the real
+/// gateway; a fresh reader then sees every acknowledged note and `reconcile`
+/// reports a clean log. Every other multi-writer test in this crate runs over
+/// the in-memory store, whose operations are linearizable, so an interleaving
+/// only a real gateway produces (a listing that lags a PUT, concurrent PUTs to
+/// one prefix) never reached them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn two_writers_with_their_own_seeds_converge_on_the_live_gateway() {
+    let bucket: Arc<dyn BlobStore> = Arc::new(s3_store_from_env());
+    let prefix = format!("{TWO_WRITERS_TEAM}/");
+    clear_prefix(bucket.as_ref(), &prefix).await;
+
+    let writers = [11_u8, 12].map(|seed| Arc::new(live_store(Arc::clone(&bucket), seed)));
+    let tasks = writers.iter().enumerate().map(|(w, store)| {
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            let mut ids = Vec::new();
+            for n in 0..6 {
+                let id = store
+                    .remember(RememberInput {
+                        note_type: NoteType::Context,
+                        repo: RepoScope::Global,
+                        tags: std::collections::BTreeSet::new(),
+                        summary: format!("writer {w} note {n}"),
+                        body: "body".to_owned(),
+                        force: true,
+                    })
+                    .await
+                    .expect("a write against the live gateway succeeds");
+                ids.push(id);
+            }
+            ids
+        })
+    });
+    let mut acknowledged = Vec::new();
+    for task in tasks.collect::<Vec<_>>() {
+        acknowledged.extend(task.await.expect("a writer task does not panic"));
+    }
+    for writer in &writers {
+        writer
+            .flush_anchors()
+            .await
+            .expect("the last batch anchors");
+    }
+
+    let reader = live_store(Arc::clone(&bucket), 13);
+    reader.sync().await.expect("a fresh reader syncs");
+    let mut missing = Vec::new();
+    for id in &acknowledged {
+        if reader.get(*id).await.is_err() {
+            missing.push(*id);
+        }
+    }
+    let report = reader.reconcile().await.expect("reconcile runs");
+    clear_prefix(bucket.as_ref(), &prefix).await;
+
+    assert!(missing.is_empty(), "acknowledged writes lost: {missing:?}");
+    assert!(report.ok, "reconcile reports a clean log: {report:?}");
+    assert_eq!(
+        report.total_anchored_ops,
+        acknowledged.len(),
+        "every write is in an anchored batch: {report:?}"
+    );
 }

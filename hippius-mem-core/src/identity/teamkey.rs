@@ -54,6 +54,7 @@
 use std::collections::BTreeSet;
 
 use blake2::{Blake2b512, Digest};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -61,9 +62,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::crypto::{self, SecretKey};
 use crate::domain::{NetworkPrefix, Ss58};
 use crate::error::MemError;
-use crate::identity::manifest::load_manifest;
+use crate::identity::manifest::{TeamManifest, load_manifest};
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
-use crate::store::BlobStore;
+use crate::store::{BlobStore, CreateOutcome, get_in_order};
 
 use super::Identity;
 
@@ -490,9 +491,143 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
     expected_founder: Option<&Ss58>,
     provisioner: &S,
 ) -> Result<BTreeSet<Ss58>, MemError> {
-    // Loaded once, outside the loop: every member is checked against the SAME
-    // manifest snapshot, so a manifest published mid-loop cannot admit one
-    // member under an old view and another under a new one.
+    // `expected_founder` must be the SAME operator pin `MemoryStore::sync` threads
+    // into its own `load_manifest`; see `seal_wraps`.
+    let manifest = load_manifest(blob, team, expected_founder).await?;
+    let wraps = seal_wraps(
+        team,
+        team_key,
+        epoch,
+        member_keys,
+        manifest.as_ref(),
+        expected_founder,
+        provisioner,
+    )?;
+    put_wraps(blob, wraps).await
+}
+
+/// Write `wraps`, replacing any wrap already at a key, and return the
+/// recipients. The write [`provision_team_key`] does.
+pub(crate) async fn put_wraps(
+    blob: &dyn BlobStore,
+    wraps: Vec<SealedWrap>,
+) -> Result<BTreeSet<Ss58>, MemError> {
+    let mut wrapped_to = BTreeSet::new();
+    for wrap in wraps {
+        blob.put(&wrap.object_key, wrap.bytes).await?;
+        wrapped_to.insert(wrap.recipient);
+    }
+    Ok(wrapped_to)
+}
+
+/// Write `wraps` of `team`'s `epoch` create-only, and return the recipients.
+/// The write [`rotate_team_key`] does.
+///
+/// A write that reports [`CreateOutcome::AlreadyExists`] or fails is followed
+/// by a GET of its key, because a retried create can report either after its
+/// first attempt stored the wrap: bytes equal to this wrap's mean this call
+/// wrote it (sealing is randomized, so no other call produces those bytes).
+///
+/// # Errors
+///
+/// [`MemError::EpochTaken`] at the first wrap that already exists and is not
+/// this call's, or whatever the store reports. Either way the wraps this call
+/// stored are deleted first (best effort): they are founder-signed wraps of a
+/// key the caller is about to discard, and left behind they would mark the
+/// epoch provisioned and hand part of the team that key.
+pub(crate) async fn create_wraps(
+    blob: &dyn BlobStore,
+    team: &str,
+    epoch: u64,
+    wraps: Vec<SealedWrap>,
+) -> Result<BTreeSet<Ss58>, MemError> {
+    let mut wrapped_to = BTreeSet::new();
+    let mut created = Vec::new();
+    for wrap in wraps {
+        let written = match blob
+            .put_if_absent(&wrap.object_key, wrap.bytes.clone())
+            .await
+        {
+            Ok(CreateOutcome::Created) => Ok(()),
+            Ok(CreateOutcome::AlreadyExists) if stores_wrap(blob, &wrap).await => Ok(()),
+            Ok(CreateOutcome::AlreadyExists) => Err(MemError::EpochTaken {
+                team: team.to_owned(),
+                epoch,
+            }),
+            Err(err) => {
+                if stores_wrap(blob, &wrap).await {
+                    created.push(wrap.object_key.clone());
+                }
+                Err(err)
+            }
+        };
+        let Err(failure) = written else {
+            wrapped_to.insert(wrap.recipient);
+            created.push(wrap.object_key);
+            continue;
+        };
+        for key in &created {
+            if let Err(err) = blob.delete(key).await {
+                tracing::warn!(
+                    key = %key,
+                    error = %err,
+                    "could not delete a wrap of an abandoned rotation; delete it by hand"
+                );
+            }
+        }
+        return Err(failure);
+    }
+    Ok(wrapped_to)
+}
+
+/// Whether the object at `wrap`'s key holds `wrap`'s bytes. A failed read
+/// counts as not, with a warning naming the key: deleting an object this call
+/// may not have written could remove another rotation's wrap.
+async fn stores_wrap(blob: &dyn BlobStore, wrap: &SealedWrap) -> bool {
+    match blob.get(&wrap.object_key).await {
+        Ok(stored) => stored == wrap.bytes,
+        Err(MemError::NotFound { .. }) => false,
+        Err(err) => {
+            tracing::warn!(
+                key = %wrap.object_key,
+                error = %err,
+                "could not read back a wrap of a failed rotation write; if it holds this \
+                 rotation's wrap, delete it by hand"
+            );
+            false
+        }
+    }
+}
+
+/// One sealed wrap, not yet written: its recipient, object key and bytes (a
+/// ciphertext of the team key, never the key itself).
+#[derive(Debug)]
+pub(crate) struct SealedWrap {
+    recipient: Ss58,
+    object_key: String,
+    bytes: Vec<u8>,
+}
+
+/// The wraps of `team_key` at `epoch` for every member of `member_keys` that
+/// verifies and that `manifest` authorizes. Reads and writes nothing: the
+/// caller resolves the manifest (the store through its rollback watermark,
+/// the free functions straight from the bucket) and picks the write
+/// ([`put_wraps`] or [`create_wraps`]).
+///
+/// With no `manifest`, every verified key is authorized when `expected_founder`
+/// is `None` (an open team), and none when a founder is pinned (fail-closed).
+pub(crate) fn seal_wraps<S: Signer + ?Sized>(
+    team: &str,
+    team_key: &SecretKey,
+    epoch: u64,
+    member_keys: &[MemberKey],
+    manifest: Option<&TeamManifest>,
+    expected_founder: Option<&Ss58>,
+    provisioner: &S,
+) -> Result<Vec<SealedWrap>, MemError> {
+    // One manifest for the whole loop: every member is checked against the SAME
+    // snapshot, so a manifest published mid-loop cannot admit one member under
+    // an old view and another under a new one.
     //
     // `expected_founder` must be the SAME operator pin `MemoryStore::sync` threads
     // into its own `load_manifest`. Provisioning grants READ access (a team-key
@@ -500,9 +635,7 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
     // pinned would let a genesis-overwrite attacker — blocked from writing — still
     // be elected a member here and receive the key. Passing the pin closes that
     // read-seizure; `None` keeps the backward-compatible trust-on-genesis.
-    let manifest = load_manifest(blob, team, expected_founder).await?;
-
-    let mut wrapped_to = BTreeSet::new();
+    let mut wraps = Vec::new();
     for member in member_keys {
         // Re-verify each member key before wrapping the team key TO it: an
         // unverified record's `x25519_public` is not bound to its `ss58`, so
@@ -527,7 +660,7 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
         // backward-compatible), but a PINNED team with no founder-signed manifest
         // is fail-closed — an attacker who destroyed or replaced the pin's manifest
         // must not thereby downgrade the team to open and be wrapped the key.
-        let authorized = match &manifest {
+        let authorized = match manifest {
             Some(manifest) => manifest.members.contains(&member.ss58),
             None => expected_founder.is_none(),
         };
@@ -540,11 +673,13 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
             continue;
         }
         let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch, provisioner)?;
-        let key = wrapped_key_key(team, epoch, member.ss58.as_str());
-        blob.put(&key, serde_json::to_vec(&wrapped)?).await?;
-        wrapped_to.insert(member.ss58.clone());
+        wraps.push(SealedWrap {
+            recipient: member.ss58.clone(),
+            object_key: wrapped_key_key(team, epoch, member.ss58.as_str()),
+            bytes: serde_json::to_vec(&wrapped)?,
+        });
     }
-    Ok(wrapped_to)
+    Ok(wraps)
 }
 
 /// Fetch and decode the raw [`WrappedKey`] record for `recipient_ss58` at
@@ -632,23 +767,38 @@ pub async fn fetch_team_key(
     // rejected on the cheaper crypto check first, and the manifest fetch below
     // is spent only on a wrap that already proved SOME key sealed it.
     let manifest = load_manifest(blob, team, expected_founder).await?;
-    let authorized = match &manifest {
+    if !provisioner_authorized(&wrapped, manifest.as_ref(), expected_founder) {
+        return Err(unauthorized_wrap(team, epoch, recipient_ss58));
+    }
+    Ok(secret)
+}
+
+/// Whether `manifest` authorizes the provisioner of `wrapped`, by
+/// [`fetch_team_key`]'s rules: the manifest's founder or trusted recovery key;
+/// with no manifest, any provisioner on an open team (`expected_founder` is
+/// `None`) and none on a pinned one. Checks no signature.
+pub(crate) fn provisioner_authorized(
+    wrapped: &WrappedKey,
+    manifest: Option<&TeamManifest>,
+    expected_founder: Option<&Ss58>,
+) -> bool {
+    match manifest {
         Some(manifest) => manifest.authorizes_provisioner(&wrapped.provisioner),
         // Pinned + no founder-signed manifest is fail-closed, matching
         // `provision_team_key`. Unpinned + no manifest is the open-team
         // fallback: any wrap that already unwrapped is accepted.
         None => expected_founder.is_none(),
-    };
-    if !authorized {
-        return Err(MemError::Unauthorized(format!(
-            "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner \
-             the current manifest does not authorize (neither its founder nor its named \
-             recovery key)",
-            recipient_ss58.as_str(),
-        )));
     }
+}
 
-    Ok(secret)
+/// The error for a wrap of `team`'s `epoch` to `recipient` that
+/// [`provisioner_authorized`] refuses.
+pub(crate) fn unauthorized_wrap(team: &str, epoch: u64, recipient: &Ss58) -> MemError {
+    MemError::Unauthorized(format!(
+        "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner the \
+         current manifest does not authorize (neither its founder nor its named recovery key)",
+        recipient.as_str(),
+    ))
 }
 
 /// Rotate the team key: provision `new_team_key` at `new_epoch` for the current
@@ -675,9 +825,17 @@ pub async fn fetch_team_key(
 /// signs every wrap of `new_team_key` with it — see that function's docs for
 /// what the signature does and does not (yet) prove.
 ///
+/// Unlike [`provision_team_key`], every wrap is a create-only write: a wrap
+/// already at `new_epoch` means that epoch was minted before, with another key,
+/// and overwriting it would strand the notes sealed under that key. On a
+/// gateway that does not enforce create-only writes (`doctor` reports it) the
+/// write replaces, and the caller's own check of the published epochs is the
+/// only guard.
+///
 /// # Errors
 ///
-/// Same as [`provision_team_key`].
+/// [`MemError::EpochTaken`] when a wrap already exists at `new_epoch` (the
+/// wraps written before it stay), otherwise the same as [`provision_team_key`].
 pub async fn rotate_team_key<S: Signer + ?Sized>(
     blob: &dyn BlobStore,
     team: &str,
@@ -687,16 +845,17 @@ pub async fn rotate_team_key<S: Signer + ?Sized>(
     expected_founder: Option<&Ss58>,
     provisioner: &S,
 ) -> Result<BTreeSet<Ss58>, MemError> {
-    provision_team_key(
-        blob,
+    let manifest = load_manifest(blob, team, expected_founder).await?;
+    let wraps = seal_wraps(
         team,
         new_team_key,
         new_epoch,
         current_member_keys,
+        manifest.as_ref(),
         expected_founder,
         provisioner,
-    )
-    .await
+    )?;
+    create_wraps(blob, team, new_epoch, wraps).await
 }
 
 /// Publish a member's signed x25519 key, after verifying it.
@@ -830,9 +989,8 @@ fn member_keys_prefix(team: &str) -> String {
 /// The object-key prefix under which `team`'s wrapped team keys live, one
 /// path segment up from [`wrapped_key_key`]'s per-epoch/per-member leaf.
 ///
-/// Shared by [`wrapped_key_key`] (writes) and [`highest_published_epoch`]
-/// (lists) so the two can never disagree about what a wrapped-key object key
-/// looks like.
+/// Shared by [`wrapped_key_key`] (writes) and the listings below so they can
+/// never disagree about what a wrapped-key object key looks like.
 fn wrapped_keys_prefix(team: &str) -> String {
     format!("{team}/_keys/")
 }
@@ -853,44 +1011,117 @@ pub fn wrapped_key_key(team: &str, epoch: u64, ss58: &str) -> String {
     format!("{}{epoch:020}/{ss58}", wrapped_keys_prefix(team))
 }
 
-/// Parse the `{epoch:020}` segment out of an object key listed under
-/// [`wrapped_keys_prefix`], the exact inverse of the format [`wrapped_key_key`]
-/// writes. `None` for a key that does not match that shape (foreign object
-/// under the prefix, or a listing bug) — the caller skips it rather than
-/// treating it as epoch 0.
-fn parse_epoch_segment(team: &str, object_key: &str) -> Option<u64> {
-    let rest = object_key.strip_prefix(&wrapped_keys_prefix(team))?;
-    let epoch_str = rest.split('/').next()?;
-    epoch_str.parse().ok()
-}
-
-/// The highest team-key epoch this team has actually published a wrapped key
-/// at, by listing the `_keys/` prefix `wrapped_key_key` writes under. `0`
-/// when the team has published nothing (a fresh or pre-provision team).
+/// The wrap keys of `team` at epochs above `floor`, newest epoch first, from
+/// one LIST. Only keys of exactly the shape [`wrapped_key_key`] writes count
+/// (a 20-digit epoch, then one address segment).
 ///
-/// This is the on-bucket epoch discovery [`crate::MemoryStore::bootstrap_epoch_keys`]'s
-/// docs call out as left to the caller: that method only tries the epochs it is
-/// TOLD about, with no way to see what actually exists on the bucket. This gives
-/// that visibility — in particular to the stale-`max_epoch` warning: a
-/// misconfigured, un-raised `max_epoch` silently hides every note sealed under a
-/// rotated epoch past it, so comparing this against the configured `max_epoch`
-/// is how that gets caught instead of rediscovered.
+/// The listing is unauthenticated: anyone with bucket write can add a key, so
+/// a caller decides nothing from these keys without
+/// [`first_provisioned_epoch`].
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] if the backend listing fails. A key present
-/// under the prefix that does not parse as `{epoch:020}/...` is skipped, not
-/// fatal (mirrors [`load_member_keys`]'s tolerance of a foreign object under
-/// its own prefix).
-pub async fn highest_published_epoch(blob: &dyn BlobStore, team: &str) -> Result<u64, MemError> {
+/// Whatever [`BlobStore::list`] reports.
+pub(crate) async fn wrap_keys_above(
+    blob: &dyn BlobStore,
+    team: &str,
+    floor: u64,
+) -> Result<Vec<(u64, String)>, MemError> {
     let prefix = wrapped_keys_prefix(team);
-    let keys = blob.list(&prefix).await?;
+    let mut keys: Vec<(u64, String)> = blob
+        .list(&prefix)
+        .await?
+        .into_iter()
+        .filter_map(|key| {
+            let (epoch, _) = parse_wrap_key(&prefix, &key)?;
+            (epoch > floor).then_some((epoch, key))
+        })
+        .collect();
+    keys.sort_by_key(|(epoch, _)| std::cmp::Reverse(*epoch));
+    Ok(keys)
+}
 
-    Ok(keys
+/// The epochs at which `team` holds a wrap key addressed to `recipient`,
+/// ascending, from one LIST. Unauthenticated like [`wrap_keys_above`]: a
+/// caller trusts a key only after [`fetch_team_key`]'s checks.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::list`] reports.
+pub(crate) async fn wrap_epochs_addressed_to(
+    blob: &dyn BlobStore,
+    team: &str,
+    recipient: &Ss58,
+) -> Result<Vec<u64>, MemError> {
+    let prefix = wrapped_keys_prefix(team);
+    let mut epochs: Vec<u64> = blob
+        .list(&prefix)
+        .await?
         .iter()
-        .filter_map(|key| parse_epoch_segment(team, key))
-        .max()
-        .unwrap_or(0))
+        .filter_map(|key| {
+            let (epoch, address) = parse_wrap_key(&prefix, key)?;
+            (address == recipient.as_str()).then_some(epoch)
+        })
+        .collect();
+    epochs.sort_unstable();
+    epochs.dedup();
+    Ok(epochs)
+}
+
+/// The epoch and address of `key` when it has exactly the shape
+/// [`wrapped_key_key`] writes under `prefix` (a 20-digit epoch, then one
+/// address segment).
+fn parse_wrap_key<'k>(prefix: &str, key: &'k str) -> Option<(u64, &'k str)> {
+    let (epoch, address) = key.strip_prefix(prefix)?.split_once('/')?;
+    let minted = epoch.len() == 20
+        && epoch.bytes().all(|byte| byte.is_ascii_digit())
+        && !address.is_empty()
+        && !address.contains('/');
+    let epoch: u64 = epoch.parse().ok().filter(|_| minted)?;
+    Some((epoch, address))
+}
+
+/// The first epoch in `candidates` (from [`wrap_keys_above`]) with a wrap the
+/// team's founder provisioned, or `None`.
+///
+/// A wrap counts when its provisioner signature verifies, it names the epoch
+/// its key does, and its provisioner is one `manifest` authorizes (its
+/// founder or trusted recovery key). With no manifest, any provisioner counts
+/// when `expected_founder` is `None` (an open team) and none when a founder is
+/// pinned. These are the rules [`fetch_team_key`] applies before installing a
+/// key, minus the decryption, which needs the recipient's secret.
+///
+/// The candidates are fetched in order ([`get_in_order`]), stopping at the
+/// first that counts: one GET when that is the first. A candidate that is
+/// missing or does not decode is skipped.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::get`] reports, except a missing key.
+pub(crate) async fn first_provisioned_epoch(
+    blob: &dyn BlobStore,
+    candidates: Vec<(u64, String)>,
+    manifest: Option<&TeamManifest>,
+    expected_founder: Option<&Ss58>,
+) -> Result<Option<u64>, MemError> {
+    let mut wraps = std::pin::pin!(get_in_order(blob, candidates));
+    while let Some((epoch, bytes)) = wraps.next().await {
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(MemError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
+        };
+        let Ok(wrapped) = serde_json::from_slice::<WrappedKey>(&bytes) else {
+            continue;
+        };
+        if wrapped.epoch == epoch
+            && provisioner_authorized(&wrapped, manifest, expected_founder)
+            && wrapped.verify()
+        {
+            return Ok(Some(epoch));
+        }
+    }
+    Ok(None)
 }
 
 /// The object-key prefix under which `team`'s wrapped keys for `epoch`
@@ -913,9 +1144,9 @@ fn wrapped_key_epoch_prefix(team: &str, epoch: u64) -> String {
 /// with [`MemError::NothingToRotate`] because no remaining member has
 /// published a [`MemberKey`] yet). Comparing this set against the live
 /// [`crate::TeamManifest`]'s members at the CURRENT epoch (the one
-/// [`highest_published_epoch`] reports) is exactly the check `hippius-mem
-/// doctor` runs to catch a half-completed removal that a later run never
-/// finished.
+/// [`crate::MemoryStore::newest_provisioned_epoch`] reports) is exactly the
+/// check `hippius-mem doctor` runs to catch a half-completed removal that a
+/// later run never finished.
 ///
 /// # Errors
 ///
@@ -961,6 +1192,25 @@ mod tests {
     const PHRASE_C: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
     const TEAM: &str = "team";
+
+    /// Only the key shape `wrapped_key_key` writes parses: a 20-digit epoch,
+    /// then one non-empty address segment. Each refused key below breaks one
+    /// part of that shape and nothing else.
+    #[test]
+    fn a_wrap_key_parses_only_in_the_shape_it_is_written_in() {
+        let prefix = wrapped_keys_prefix(TEAM);
+        let written = wrapped_key_key(TEAM, 3, "5Addr");
+        assert_eq!(parse_wrap_key(&prefix, &written), Some((3, "5Addr")));
+
+        for refused in [
+            format!("{prefix}3/5Addr"),
+            format!("{prefix}00000000000000000003/"),
+            format!("{prefix}00000000000000000003/5Addr/extra"),
+            format!("{prefix}+0000000000000000003/5Addr"),
+        ] {
+            assert_eq!(parse_wrap_key(&prefix, &refused), None, "{refused}");
+        }
+    }
 
     fn member_key_for(phrase: &str) -> Result<MemberKey, MemError> {
         let identity = derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
@@ -1944,6 +2194,38 @@ mod tests {
         Ok(())
     }
 
+    /// A rotation never replaces a wrap: the second mint of one epoch is
+    /// refused and the first key's wrap stays. With a plain put it overwrote
+    /// the wrap, and the first key was lost to every member.
+    #[tokio::test]
+    async fn a_second_rotation_to_one_epoch_is_refused() -> Result<(), MemError> {
+        let blob = MemoryBlobStore::new();
+        let provisioner = test_provisioner();
+        let key_alice = member_key_for(PHRASE_A)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let members = std::slice::from_ref(&key_alice);
+        let first = SecretKey::from_bytes([2u8; 32]);
+        rotate_team_key(&blob, TEAM, &first, 1, members, None, &provisioner).await?;
+
+        let second = SecretKey::from_bytes([3u8; 32]);
+        let refused = rotate_team_key(&blob, TEAM, &second, 1, members, None, &provisioner).await;
+        assert!(
+            matches!(refused, Err(MemError::EpochTaken { epoch: 1, .. })),
+            "{refused:?}"
+        );
+        let kept = fetch_team_key(
+            &blob,
+            TEAM,
+            1,
+            &key_alice.ss58,
+            &alice.x25519_secret(),
+            None,
+        )
+        .await?;
+        assert_eq!(kept.expose_bytes(), first.expose_bytes());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn rotate_excludes_removed_member() -> Result<(), MemError> {
         let blob = MemoryBlobStore::new();
@@ -2263,44 +2545,6 @@ mod tests {
              correlated with its input",
             floor = MEAN_FLOOR * PAIRS,
         );
-    }
-
-    #[tokio::test]
-    async fn highest_published_epoch_reads_the_epoch_objects() -> Result<(), MemError> {
-        let blob = MemoryBlobStore::new();
-
-        // A team with no wrapped-key objects at all has published nothing.
-        assert_eq!(
-            highest_published_epoch(&blob, TEAM).await?,
-            0,
-            "an empty store reports epoch 0"
-        );
-
-        // Publish wrapped keys for epochs 0, 1, 2 via the existing teamkey
-        // publish path (`provision_team_key`), exactly how a real rotation
-        // populates the `_keys/` prefix.
-        let member = member_key_for(PHRASE_A)?;
-        let provisioner = test_provisioner();
-        for epoch in 0..=2u64 {
-            let team_key = SecretKey::from_bytes([u8::try_from(epoch).unwrap_or(0); 32]);
-            provision_team_key(
-                &blob,
-                TEAM,
-                &team_key,
-                epoch,
-                std::slice::from_ref(&member),
-                None,
-                &provisioner,
-            )
-            .await?;
-        }
-
-        assert_eq!(
-            highest_published_epoch(&blob, TEAM).await?,
-            2,
-            "the highest epoch actually published on the bucket must be reported"
-        );
-        Ok(())
     }
 
     #[tokio::test]

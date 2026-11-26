@@ -335,7 +335,7 @@ async fn step_forget(store: &MemoryStore, state: &mut ScenarioState) -> Result<(
     let Some(id) = state.next_live_candidate() else {
         return Ok(());
     };
-    match store.forget(id).await {
+    match store.forget(id).await.map(|written| written.value) {
         Ok(()) => {
             state.forgotten.insert(id);
             Ok(())
@@ -431,7 +431,7 @@ async fn step_redact(store: &MemoryStore, state: &mut ScenarioState) -> Result<(
     let Some(id) = state.next_live_candidate() else {
         return Ok(());
     };
-    match store.redact(id).await {
+    match store.redact(id).await.map(|written| written.value) {
         Ok(()) => {
             state.redacted.insert(id);
             state.redacts += 1;
@@ -456,7 +456,11 @@ async fn exercise_relation(
         return Ok(());
     };
     stores[0].sync().await?;
-    match stores[0].relate(*from, *to, LinkRel::Supersedes).await {
+    match stores[0]
+        .relate(*from, *to, LinkRel::Supersedes)
+        .await
+        .map(|written| written.value)
+    {
         Ok(()) | Err(MemError::NotFound { .. }) => Ok(()),
         Err(other) => Err(other.into()),
     }

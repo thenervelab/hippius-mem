@@ -198,6 +198,20 @@ pub fn content_hash(bytes: &[u8]) -> Blake3Hash {
     Blake3Hash::new(blake3::hash(bytes).into())
 }
 
+/// Proof that the caller holds `token`, for `nonce`, as hex: a keyed BLAKE3 of
+/// `nonce` under a key derived from `token`.
+///
+/// The shared loopback daemon answers a challenge with this so a client can
+/// check the daemon holds its own token without sending the token to whoever
+/// listens on the port. Reveals nothing usable about `token`.
+#[must_use]
+pub fn token_proof(token: &str, nonce: &str) -> String {
+    let key = blake3::derive_key("hippius-mem daemon token proof v1", token.as_bytes());
+    blake3::keyed_hash(&key, nonce.as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 /// Derive a local-cache encryption key from the team key.
 ///
 /// Domain-separated via `blake3::derive_key`, so the cache key is cryptographically
@@ -214,6 +228,30 @@ pub fn derive_cache_key(team_key: &SecretKey) -> SecretKey {
     ))
 }
 
+/// The key-check value that identifies `team_key` as the key of `team`'s epoch
+/// `epoch`, without revealing it.
+///
+/// A BLAKE3 key derivation under its own context string over the key, the epoch
+/// and the team name: a pseudorandom function of the key, so publishing it in the
+/// bucket reveals nothing about the key, the note-sealing key or
+/// [`derive_cache_key`]'s output. Not a plain hash of the raw key: that value
+/// would be the same anywhere the key is hashed for another purpose, so
+/// publishing it would tie this check to any such use. Domain separation, as for
+/// every other use of the team key here, rules that out. Comparing two of these
+/// tells whether two parties hold the same key, which is the whole point; it is
+/// also what an offline guesser of the key could test against, exactly as with
+/// any sealed note in the bucket.
+#[must_use]
+pub(crate) fn key_check_value(team_key: &SecretKey, team: &str, epoch: u64) -> Blake3Hash {
+    let mut hasher = blake3::Hasher::new_derive_key("hippius-mem team-key check v1");
+    // Fixed-width fields first and the one variable-width field last, so no two
+    // (key, epoch, team) triples produce the same input.
+    hasher.update(team_key.expose_bytes());
+    hasher.update(&epoch.to_le_bytes());
+    hasher.update(team.as_bytes());
+    Blake3Hash::new(hasher.finalize().into())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -227,6 +265,50 @@ mod tests {
     // A representative object key, reused as AAD across the round-trip tests so
     // seal and open agree on the authenticated identity.
     const AAD: &[u8] = b"team/global/mem_01J/ver_1";
+
+    /// A known answer, computed outside this crate with a separate BLAKE3
+    /// implementation (single chunk, checked against BLAKE3's published hash
+    /// of the empty input): `derive_key` of the token under the proof's
+    /// context, then `keyed_hash` of the nonce. Pins the construction, so a
+    /// change to it (context string, which input is the key) breaks the
+    /// challenge between an old client and a new daemon, and fails here.
+    #[test]
+    fn token_proof_matches_its_known_answer() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            token_proof(TOKEN, "n0nce"),
+            "dd0a81180830398f7ffbaf6d0092cb919b5f4d3836b8655fe79c54877e1d3fbe"
+        );
+        assert_eq!(
+            token_proof(TOKEN, "01JABCDEFGHJKMNPQRSTVWXYZ0"),
+            "71d2fa8f32f4f2afb2174de6e05a2e0bf8da22be1fc2750edd83ff60683ab65a"
+        );
+    }
+
+    /// The proof is 64 lowercase hex characters, differs per token and per
+    /// nonce, and never contains the token, so a listener that relays or
+    /// replays one learns neither the token nor the proof for a fresh nonce.
+    #[test]
+    fn token_proof_binds_token_and_nonce_and_hides_the_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let proof = token_proof(token, "nonce-a");
+
+        assert_eq!(proof.len(), 64);
+        assert!(
+            proof
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{proof}"
+        );
+        assert!(!proof.contains(token));
+        assert_ne!(proof, token_proof(token, "nonce-b"), "per nonce");
+        assert_ne!(
+            proof,
+            token_proof("fedcba9876543210fedcba9876543210", "nonce-a"),
+            "per token"
+        );
+        assert_eq!(proof, token_proof(token, "nonce-a"), "deterministic");
+    }
 
     proptest! {
         #[test]

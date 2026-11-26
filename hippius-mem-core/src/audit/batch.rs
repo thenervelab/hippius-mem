@@ -8,7 +8,7 @@
 //! inclusion proof for any single op long after the batch was sealed — the root
 //! alone is an opaque commitment no reader could open.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -19,7 +19,7 @@ use crate::domain::Blake3Hash;
 use crate::error::MemError;
 use crate::framing::push_framed;
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
-use crate::store::BlobStore;
+use crate::store::{BlobStore, get_in_order};
 
 /// Bounded concurrency for the anchor-record fetch, matching the op-log read's
 /// `OPLOG_FETCH_CONCURRENCY`: the records are validated and then sorted, so fetch
@@ -260,11 +260,116 @@ pub async fn persist_anchor_record(
         .await
 }
 
+/// What `author_key`'s own anchor records say: which seqs their keys occupy,
+/// and the newest record this author signed.
+///
+/// Read by [`own_anchors`]. The bucket is writable by every member, so a key
+/// under this author's prefix proves nothing about who wrote it: only a record
+/// whose signature verifies under `author_key` sets the seq floor and the
+/// coverage watermark. A key that is not, at `u64::MAX` or anywhere else, is
+/// only stepped over.
+#[derive(Debug)]
+pub(crate) struct OwnAnchors {
+    /// Every seq a key of the minted shape occupies, whatever its body.
+    taken: BTreeSet<u64>,
+    /// The highest-seq record signed by this author: its seq, and the Lamport
+    /// value of the newest op it covers.
+    newest: Option<(u64, u64)>,
+}
+
+impl OwnAnchors {
+    /// The first seq above this author's newest signed record that no key
+    /// occupies.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Malformed`] when every seq up to `u64::MAX` above that
+    /// record is taken.
+    pub(crate) fn next_seq(&self) -> Result<u64, MemError> {
+        let exhausted = || {
+            MemError::Malformed(
+                "every anchor seq above this author's newest record is taken".into(),
+            )
+        };
+        let mut seq = match self.newest {
+            None => 0,
+            Some((seq, _)) => seq.checked_add(1).ok_or_else(exhausted)?,
+        };
+        while self.taken.contains(&seq) {
+            seq = seq.checked_add(1).ok_or_else(exhausted)?;
+        }
+        Ok(seq)
+    }
+
+    /// The Lamport value of the newest op this author's newest signed record
+    /// covers: the ops above it are the ones no record covers yet. `None` when
+    /// this author has no signed record.
+    pub(crate) fn anchored_through(&self) -> Option<u64> {
+        self.newest.map(|(_, lamport)| lamport)
+    }
+}
+
+/// Read [`OwnAnchors`] for `author_key`: one LIST of its own
+/// `{team}/_anchors/{author_key}/` prefix, then the keys from the highest seq
+/// down ([`get_in_order`]) until a record parses, names this author, seq and
+/// team, and carries a valid signature by `author_key`. The team counts
+/// because a copy of this author's record from another team's prefix is
+/// validly signed too, and its watermark is that team's. In steady state that
+/// is the first key, so one GET. Only keys exactly of the form [`anchor_record_key`]
+/// mints count. An author whose records all predate signing (legacy, unsigned)
+/// has no newest record until it persists its first signed one.
+///
+/// # Errors
+///
+/// Whatever [`BlobStore::list`] or [`BlobStore::get`] report, except a key that
+/// vanished between the two.
+pub(crate) async fn own_anchors(
+    blob: &Arc<dyn BlobStore>,
+    team: &str,
+    author_key: &VerifyingKey,
+) -> Result<OwnAnchors, MemError> {
+    let prefix = format!("{team}/_anchors/{}/", author_key.to_hex());
+    let taken: BTreeSet<u64> = blob
+        .list(&prefix)
+        .await?
+        .iter()
+        .filter_map(|key| key.strip_prefix(&prefix))
+        .filter_map(|suffix| {
+            let seq = suffix.parse::<u64>().ok()?;
+            (format!("{seq:020}") == suffix).then_some(seq)
+        })
+        .collect();
+    let newest_first = taken
+        .iter()
+        .rev()
+        .map(|&seq| (seq, anchor_record_key(team, author_key, seq)))
+        .collect();
+    let mut records = std::pin::pin!(get_in_order(blob.as_ref(), newest_first));
+    let mut newest = None;
+    while let Some((seq, bytes)) = records.next().await {
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(MemError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
+        };
+        if let Ok(record) = serde_json::from_slice::<AnchorRecord>(&bytes)
+            && record.author_key == *author_key
+            && record.seq == seq
+            && record.meta.team == team
+            && record.signature_state() == AnchorSignatureState::Valid
+        {
+            newest = Some((seq, record.meta.last_lamport));
+            break;
+        }
+    }
+    Ok(OwnAnchors { taken, newest })
+}
+
 /// Whether `author_key` already has a persisted anchor record at `seq`.
 ///
-/// `BlobStore` has no conditional/if-absent put, so this GET-before-PUT is what
-/// gives [`persist_anchor_record`]'s caller fail-on-exists semantics instead of
-/// the blind overwrite a bare `put` would perform. It is sound only under the
+/// [`persist_anchor_record`] writes with a plain `put`, so this GET-before-PUT
+/// is what gives its caller fail-on-exists semantics instead of the blind
+/// overwrite that `put` would perform. It is sound only under the
 /// caller's discipline: [`crate::store::MemoryStore`] calls this and the
 /// following `persist_anchor_record` under one continuously-held cross-process
 /// [`WriterLock`](crate::oplog::WriterLock) acquisition, so no other

@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor, SecretKey, Signer,
-    Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest, open,
-    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
+    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyCheckMatch, KeyProbe, MemError,
+    MemoryStore, OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail,
+    derive_identity, find_suppressed_tails, key_check_key, load_manifest,
+    matches_published_key_check, open, probe_create_only, read_heads, read_wrapped_key, seal,
+    wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -23,14 +25,26 @@ use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 /// assertion message and safe to round-trip through a real gateway.
 const PROBE_PLAINTEXT: &[u8] = b"hippius-mem doctor encryption-boundary probe";
 
-/// Object key the probe writes its sealed sentinel under.
+/// Start of the object key the probe writes its sealed sentinel under; each run
+/// appends a fresh ULID ([`probe_key`]).
 ///
 /// The leading `_doctor/` segment is disjoint from every real key by shape, not
 /// just by convention: note keys are `{team}/{repo}/{mem_id}/ver_{ulid}` (four
 /// segments) and op-log keys are `{team}/_oplog/...`, so even a team literally
-/// named `_doctor` cannot mint this exact two-segment key. The probe therefore
-/// cannot read or clobber a real note or op.
-const PROBE_KEY: &str = "_doctor/encryption-boundary-probe";
+/// named `_doctor` cannot mint a two-segment key starting with this. The probe
+/// therefore cannot read or clobber a real note or op.
+const PROBE_KEY_PREFIX: &str = "_doctor/encryption-boundary-probe-";
+
+/// A probe object key no other run uses.
+///
+/// The key is per run, not fixed, because one bucket serves many machines and
+/// teams: two `doctor` runs at once (two teammates, or an `upgrade` of another
+/// team into the same bucket) would otherwise overwrite and delete each other's
+/// sentinel, and one of them would fail with a missing object or a ciphertext
+/// sealed under another team's key.
+fn probe_key() -> String {
+    format!("{PROBE_KEY_PREFIX}{}", hippius_mem_core::Ulid::new())
+}
 
 /// Non-secret outcome of a successful encryption-boundary probe.
 ///
@@ -288,9 +302,7 @@ fn offline_report_lines(
 /// it — see [`TeamProfile::build_blob_store`]'s doc for both. Sharing the one
 /// function is what makes "probes the exact store the server would bind" true
 /// rather than aspirational. On success it logs a non-secret line carrying
-/// only the sealed byte count. Also checks (best-effort) whether this
-/// machine's configured `max_epoch` is stale against what the bucket has
-/// actually published — see [`stale_max_epoch_line`].
+/// only the sealed byte count.
 ///
 /// # Errors
 ///
@@ -306,32 +318,37 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         .build_blob_store(cfg, &key)
         .context("building the blob store for the resolved profile failed")?;
 
-    // A stale `max_epoch` is checked ahead of the encryption probe, and
-    // independently of its outcome: it needs no team key, only the bucket
-    // listing, so it should still be reported even when the probe below fails.
-    if let Some(line) = stale_max_epoch_line(blob.as_ref(), &profile.name, cfg.max_epoch).await {
-        tracing::warn!("{line}");
-    }
+    let store = key_probe_store(cfg, profile).await?;
+    // The team's current epoch: the newest one a wrap the founder or the
+    // recovery key signed names, as the server counts it, so an object anyone
+    // with bucket write can put under `_keys/` does not choose which epoch the
+    // checks below look at. `None` when the lookup fails: the checks that need
+    // it are then skipped, and the storage probe reports the fault.
+    let epoch = store
+        .newest_provisioned_epoch(0)
+        .await
+        .ok()
+        .map(|newest| newest.unwrap_or(0));
 
-    // Same reasoning as the stale-`max_epoch` check above: no team key
-    // needed, only manifest/bucket reads, so it runs and reports
-    // independently of the encryption probe's outcome below.
+    // Checked ahead of the encryption probe, and independently of its outcome:
+    // no team key needed, only manifest/bucket reads, so it is still reported
+    // when the probe below fails.
     let founder = profile.founder().ok().flatten();
-    for line in
-        removed_member_still_holds_key_lines(blob.as_ref(), &profile.name, founder.as_ref()).await
-    {
-        tracing::warn!("{line}");
-    }
-
-    // Same best-effort placement and reasoning again: this check never
-    // decrypts a wrap (no team key needed), only checks its provisioner
-    // signature and, against the live manifest, its authorization -- so it
-    // runs and reports independently of the encryption probe's outcome below.
-    for line in
-        unsigned_or_unauthorized_wrapped_key_lines(blob.as_ref(), &profile.name, founder.as_ref())
-            .await
-    {
-        tracing::warn!("{line}");
+    if let Some(epoch) = epoch {
+        let (blob, team) = (blob.as_ref(), profile.name.as_str());
+        let removed = removed_member_still_holds_key_lines(blob, team, founder.as_ref(), epoch);
+        for line in removed.await {
+            tracing::warn!("{line}");
+        }
+        // Same best-effort placement and reasoning again: this check never
+        // decrypts a wrap (no team key needed), only checks its provisioner
+        // signature and, against the live manifest, its authorization -- so it
+        // runs and reports independently of the encryption probe's outcome below.
+        let unsigned =
+            unsigned_or_unauthorized_wrapped_key_lines(blob, team, founder.as_ref(), epoch);
+        for line in unsigned.await {
+            tracing::warn!("{line}");
+        }
     }
 
     // Same best-effort placement and reasoning again: the op-log read needs no
@@ -349,50 +366,319 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         tracing::warn!("{line}");
     }
 
-    let report = probe_encryption_boundary(blob.as_ref(), &key).await?;
+    // Checked here, reported after the probes below, so a machine that cannot
+    // open the newest epoch still sees what else is wrong.
+    let author = profile
+        .signer()
+        .context("deriving the author identity from author_seed_hex failed")?
+        .author_ss58();
+    let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").ok();
+    let newest_epoch = match epoch {
+        Some(epoch) if epoch > 0 => {
+            let mnemonic = mnemonic.as_deref();
+            newest_epoch_key_line(blob.as_ref(), &store, epoch, &author, mnemonic).await
+        }
+        Some(_) | None => None,
+    };
+
+    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store, epoch).await?;
+    if let Some(line) = newest_epoch {
+        bail!("{line}");
+    }
+    Ok(())
+}
+
+/// The failure line when the team has rotated to `epoch` (above 0, the newest
+/// epoch the founder provisioned) and this machine cannot load that epoch's
+/// key, or loads one that the team's published key check for `epoch` names as
+/// another key; `None` when the key loads and the check matches or is absent.
+///
+/// A machine loads a rotated epoch's key only from the wrap under its author
+/// address `author`, signed by a provisioner the manifest in force authorizes,
+/// and opened with the x25519 key of `mnemonic` (`HIPPIUS_MEM_MNEMONIC`), as
+/// [`MemoryStore::open_epoch_key`] checks. Without it the machine reads no note
+/// sealed under that epoch, and its note writes are refused
+/// (`EpochSuperseded`); with a key the check names as another key's, its writes
+/// are refused too (`TeamKeyMismatch`). A listing or fetch fault yields `None`,
+/// like the other best-effort checks here; the storage probe reports those.
+async fn newest_epoch_key_line(
+    blob: &dyn BlobStore,
+    store: &MemoryStore,
+    epoch: u64,
+    author: &Ss58,
+    mnemonic: Option<&str>,
+) -> Option<String> {
+    let team = store.team();
+    let author = author.as_str();
+    let Some(mnemonic) = mnemonic else {
+        return Some(format!(
+            "FAIL: team {team:?} rotated to epoch {epoch}, and HIPPIUS_MEM_MNEMONIC is not set, \
+             so this machine cannot open that epoch's key; set it to this member's mnemonic"
+        ));
+    };
+    let identity = match derive_identity(mnemonic, crate::admin::HIPPIUS_SS58_PREFIX) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return Some(format!(
+                "FAIL: team {team:?} epoch {epoch}: HIPPIUS_MEM_MNEMONIC is not a valid mnemonic \
+                 ({err})"
+            ));
+        }
+    };
+    let cause = match store.open_epoch_key(&identity, epoch).await {
+        Err(MemError::NotFound { .. }) => {
+            return Some(format!(
+                "FAIL: team {team:?} rotated to epoch {epoch}, and no wrap of its key is \
+                 addressed to this machine ({author}); run `hippius-mem join` here, then ask \
+                 the founder to run `hippius-mem provision`"
+            ));
+        }
+        Err(err @ (MemError::Unauthorized(_) | MemError::Serialize(_))) => format!(
+            "is not a wrap the founder or the manifest's recovery key provisioned ({err}), so \
+             this machine's server refuses it; ask the founder to run `hippius-mem provision`"
+        ),
+        Err(err @ MemError::Crypto) => format!(
+            "does not open with HIPPIUS_MEM_MNEMONIC ({err}); check that it is the mnemonic \
+             this machine joined with"
+        ),
+        Ok(key) => return newest_epoch_key_check_line(blob, team, epoch, &key).await,
+        // A storage fault the storage probe reports.
+        Err(_) => return None,
+    };
+    Some(format!(
+        "FAIL: team {team:?} epoch {epoch}: the wrap addressed to this machine ({author}) {cause}"
+    ))
+}
+
+/// The failure line when `key`, the key this machine loaded for the rotated
+/// `epoch`, is not the one the team's published key check for `epoch` names;
+/// `None` when the check matches, is absent or unusable, or cannot be read
+/// (the storage probe reports read faults).
+///
+/// The key came from a founder-signed wrap, not from `team_key_hex`, so the fix
+/// is a new wrap or a new epoch, never an edit of this machine's configuration.
+async fn newest_epoch_key_check_line(
+    blob: &dyn BlobStore,
+    team: &str,
+    epoch: u64,
+    key: &SecretKey,
+) -> Option<String> {
+    match matches_published_key_check(blob, team, epoch, key).await {
+        Ok(KeyCheckMatch::Differs) => Some(format!(
+            "FAIL: team {team:?} epoch {epoch}: the key this machine opens from its wrap does \
+             not match the key check the team published at {}, or that check was replaced, so \
+             this machine's writes are refused. Compare `hippius-mem doctor` on a teammate's \
+             machine: if theirs matches, ask the founder to run `hippius-mem provision` for \
+             this machine; if no machine matches, the founder runs `hippius-mem rotate`",
+            key_check_key(team, epoch)
+        )),
+        Ok(KeyCheckMatch::Matches | KeyCheckMatch::Unpublished) | Err(_) => None,
+    }
+}
+
+/// Config used to build the store `doctor` probes with: never load an
+/// embedding model or open a chain connection.
+fn config_for_key_probe(cfg: &Config) -> Config {
+    Config {
+        semantic_embeddings: false,
+        chain_ws_url: None,
+        ..cfg.clone()
+    }
+}
+
+/// A store over `profile` for trying the team key on the team's notes: the
+/// production wiring ([`TeamProfile::build_store`]), so the probe applies the
+/// same founder pin and membership filter the server does, but with the
+/// lexical embedder and no chain anchor. The probe ranks and anchors nothing,
+/// and loading an embedding model (a download on a fresh machine) or
+/// connecting to a chain would make `doctor` slow, or fail it, for reasons
+/// that have nothing to do with the key.
+///
+/// # Errors
+///
+/// When the store cannot be built from the profile.
+async fn key_probe_store(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<MemoryStore> {
+    let cfg = config_for_key_probe(cfg);
+    profile
+        .build_store(&cfg)
+        .await
+        .context("building a store to try the team key on the team's notes failed")
+}
+
+/// The encryption-boundary probe, then the team-key comparison, in that order.
+///
+/// The probe's write is the step that proves the credential may store objects,
+/// and its error names it ("storing the probe ciphertext failed", with the
+/// gateway's refusal as the cause). Run first, the key check's GET would be the
+/// first call a wrong secret fails, and the report would read as a key-check
+/// problem that hides the credential fault. The key comparison only means
+/// something once storage access works.
+///
+/// # Errors
+///
+/// Whatever [`probe_encryption_boundary`], the key probe on `store`, or
+/// [`check_team_key`] report, in that order.
+async fn probe_storage_then_team_key(
+    blob: &dyn BlobStore,
+    team: &str,
+    key: &SecretKey,
+    store: &MemoryStore,
+    epoch: Option<u64>,
+) -> anyhow::Result<()> {
+    let report = probe_encryption_boundary(blob, key).await?;
 
     tracing::info!(
         bytes_written = report.bytes_written,
         "live encryption-boundary probe passed: the probe object was stored as ciphertext and round-tripped"
     );
+
+    if let Some(line) = create_only_line(blob, team).await {
+        tracing::warn!("{line}");
+    }
+
+    let probe = store
+        .probe_team_key(0)
+        .await
+        .context("trying the team key on the team's oldest notes failed")?;
+    check_team_key(blob, team, key, probe, epoch).await
+}
+
+/// The warning line for a store that does not enforce create-only writes, or
+/// `None` when it does.
+///
+/// Best-effort, like the other report lines: a failed probe is reported as a
+/// line too, never as a doctor failure, because the store works without the
+/// feature and only the guarantee in the line is lost.
+async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
+    match probe_create_only(blob, team).await {
+        Ok(CreateOnly::Enforced) => {
+            tracing::info!("the storage gateway enforces create-only writes (If-None-Match)");
+            None
+        }
+        Ok(CreateOnly::NotEnforced) => Some(
+            "WARN: the storage gateway accepts a second create-only write of one key \
+             (it ignores If-None-Match), so publishing the team-key check cannot tell \
+             whether another publisher wrote at the same moment; the check is read back \
+             after it is written, which catches every publish that is not concurrent"
+                .to_owned(),
+        ),
+        Err(err) => Some(format!(
+            "WARN: could not tell whether the storage gateway enforces create-only writes \
+             (If-None-Match): {err}"
+        )),
+    }
+}
+
+/// Fail when the configured team key is not the team's.
+///
+/// The encryption probe below seals and opens with the same local key, so it
+/// passes for any well-formed key. This compares the key against the team's
+/// published key check for epoch 0, the epoch `team_key_hex` holds the key of,
+/// and takes `probe`, the result of trying the key on epoch 0's oldest notes.
+/// A published check of another key fails. With no usable check published, a
+/// key that fails to open most of the notes tried ([`KeyProbe::FailsToOpen`])
+/// fails too, unless the team has rotated past epoch 0 (`epoch`, the newest
+/// epoch the founder provisioned; `None` when that lookup failed). A check
+/// that matches decides, and a failing probe beside it is warned: when epoch
+/// 0's oldest notes were sealed under another key, the right key fails the
+/// probe too. Keys for rotated epochs come from founder-signed wraps, not from
+/// this configuration, and [`newest_epoch_key_line`] checks the newest
+/// epoch's. No usable published check is otherwise warned, not failed, with
+/// the command that publishes one.
+///
+/// # Errors
+///
+/// When the key does not match the published check, when it fails to open
+/// most of the notes of an unrotated team with no check published, or when a
+/// read fails.
+async fn check_team_key(
+    blob: &dyn BlobStore,
+    team: &str,
+    key: &SecretKey,
+    probe: KeyProbe,
+    epoch: Option<u64>,
+) -> anyhow::Result<()> {
+    let published = matches_published_key_check(blob, team, 0, key)
+        .await
+        .context("reading the team-key check failed")?;
+
+    if published == KeyCheckMatch::Differs {
+        bail!(
+            "the configured team key is not team {team}'s key: it does not match the key check \
+             the team published at {}, or that check was replaced. Writes from this machine \
+             are refused until it is fixed. Compare with `hippius-mem doctor` on a teammate's \
+             machine before changing the key; then set the correct key in team_key_hex (or in \
+             HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) and run doctor again",
+            key_check_key(team, 0)
+        );
+    }
+
+    match probe {
+        // The published check decides when there is one: when epoch 0's
+        // oldest notes were sealed under another key, the right key fails
+        // this probe too, so doctor neither fails nor says which side is
+        // wrong. Nor after a rotation: epoch 0 is then history, and the probe
+        // is all `rotate` cannot change.
+        KeyProbe::FailsToOpen if published == KeyCheckMatch::Matches => tracing::warn!(
+            "WARN: the configured team key matches team {team}'s published key check, but opens \
+             fewer than half of epoch 0's oldest notes it tried. Either the check was published \
+             from a machine with another key, or those notes were sealed under another key; \
+             this run cannot tell which. Compare `hippius-mem doctor` on a teammate's machine \
+             before replacing anything; `hippius-mem rotate` moves the team to a new epoch"
+        ),
+        KeyProbe::FailsToOpen => {
+            let current = epoch.context("reading the team's newest key epoch failed")?;
+            if current == 0 {
+                bail!(
+                    "the configured team key opens fewer than half of team {team}'s oldest notes \
+                     it tried, so it is probably not the team's key: teammates cannot read what \
+                     this machine writes, and this machine cannot read their notes. Set the \
+                     correct key in team_key_hex (or in HIPPIUS_MEM_TEAM_KEY_HEX, which \
+                     overrides it when set) and run doctor again. Do not run `hippius-mem admin \
+                     keycheck publish` from this machine until then"
+                );
+            }
+            tracing::warn!(
+                "WARN: the configured team key opens fewer than half of epoch 0's oldest notes \
+                 it tried; team {team} has rotated to epoch {current}, so epoch 0's notes are \
+                 history and this does not fail the run"
+            );
+        }
+        KeyProbe::Opens => {
+            tracing::info!(
+                "the configured team key opens most of the team's oldest notes it tried"
+            );
+        }
+        KeyProbe::NoNotes => tracing::info!(
+            "the team has no notes under epoch 0 yet, so the configured team key was not tried on \
+             any"
+        ),
+        KeyProbe::Inconclusive => tracing::warn!(
+            "WARN: trying the configured team key on the team's oldest notes was inconclusive: no \
+             note could be tried, or as many opened as failed"
+        ),
+    }
+
+    if published == KeyCheckMatch::Matches {
+        tracing::info!("the configured team key matches the team's published key check");
+    } else {
+        tracing::warn!(
+            "WARN: team {team} has no usable team-key check for epoch 0, so this run cannot tell \
+             for certain whether the configured key is the team's, and a wrong key would not be \
+             refused; ask the founder to run `hippius-mem admin keycheck publish` from their \
+             machine"
+        );
+    }
     Ok(())
 }
 
-/// The stale-`max_epoch` report line for `team`, or `None` when nothing is
-/// stale.
-///
-/// Compares `configured_max_epoch` (this machine's bootstrap ceiling) against
-/// [`highest_published_epoch`]'s live read of the bucket's `_keys/` prefix: a
-/// stale `max_epoch` silently hides every note sealed under a rotated epoch
-/// past it (the recorded `bootstrap_epochs` gotcha's warning-side
-/// counterpart), so a doctor run is exactly where an operator should learn
-/// this before it bites.
-///
-/// Best-effort: a fetch failure (offline gateway, missing permissions) returns
-/// `None` silently rather than surfacing — this check exists to add a hint on
-/// top of the load-bearing live probe, never to become a new doctor failure
-/// mode of its own.
-async fn stale_max_epoch_line(
-    blob: &dyn BlobStore,
-    team: &str,
-    configured_max_epoch: u64,
-) -> Option<String> {
-    let published = highest_published_epoch(blob, team).await.ok()?;
-    if published <= configured_max_epoch {
-        return None;
-    }
-    Some(format!(
-        "WARN: max_epoch is stale (configured {configured_max_epoch}, bucket published epoch \
-         {published}): raise max_epoch to {published} at the TOP LEVEL of hippius-mem.toml -- \
-         it is a top-level setting, never a per-team profile field -- or new-epoch notes stay \
-         invisible"
-    ))
-}
-
 /// The "removed member still holds the current epoch key" report lines for
-/// `team`: every SS58 the CURRENT epoch's team key is wrapped to (per
-/// [`wrapped_key_recipients`] at [`highest_published_epoch`]) that the live
-/// membership manifest (per [`load_manifest`]) no longer lists.
+/// `team`: every SS58 the current `epoch`'s team key is wrapped to (per
+/// [`wrapped_key_recipients`]) that the live membership manifest (per
+/// [`load_manifest`]) no longer lists. The caller passes the newest epoch the
+/// founder provisioned, and skips the check when that lookup fails: falling
+/// back to epoch 0, whose recipients rotations superseded, would flag
+/// long-removed members on a healthy team.
 ///
 /// This is the read-side detector for the recorded `rotate --members`
 /// non-atomicity gotcha: `publish_membership` can land while `rotate_key`
@@ -406,7 +692,7 @@ async fn stale_max_epoch_line(
 /// catches it independent of whether that original run's output was ever
 /// seen.
 ///
-/// Best-effort, mirroring [`stale_max_epoch_line`]: an open team (no
+/// Best-effort: an open team (no
 /// manifest published — nothing to compare a wrap against) or any read
 /// failure yields no lines rather than becoming a new doctor failure mode.
 ///
@@ -434,17 +720,9 @@ async fn removed_member_still_holds_key_lines(
     blob: &dyn BlobStore,
     team: &str,
     founder: Option<&Ss58>,
+    epoch: u64,
 ) -> Vec<String> {
     let Ok(Some(manifest)) = load_manifest(blob, team, founder).await else {
-        return Vec::new();
-    };
-    // A listing failure here must NOT fall back to epoch 0: epoch 0's
-    // recipients are almost certainly stale (superseded by real rotations),
-    // so comparing them against the live manifest would flag long-since-
-    // removed members as a false "still holds the current epoch key"
-    // warning on an otherwise healthy team hitting a storage hiccup. Mirrors
-    // `stale_max_epoch_line`'s short-circuit exactly.
-    let Ok(epoch) = highest_published_epoch(blob, team).await else {
         return Vec::new();
     };
     let Ok(recipients) = wrapped_key_recipients(blob, team, epoch).await else {
@@ -466,8 +744,8 @@ async fn removed_member_still_holds_key_lines(
 
 /// The "wrap fails signature verification, or was sealed by an unauthorized
 /// provisioner" report lines for `team`: every `WrappedKey` published at the
-/// CURRENT (highest published) epoch that either fails `WrappedKey::verify`
-/// or whose `WrappedKey::provisioner` the live manifest does not authorize.
+/// current `epoch` (the newest the founder provisioned) that either fails
+/// `WrappedKey::verify` or whose `WrappedKey::provisioner` the live manifest does not authorize.
 ///
 /// This is the PROACTIVE, doctor-side counterpart of the authorization gate
 /// `fetch_team_key` enforces on the READ path: that gate only fires the
@@ -508,20 +786,18 @@ async fn removed_member_still_holds_key_lines(
 /// verifies is accepted — an unpinned, not-yet-founded team is open by
 /// design — so only a wrap failing `WrappedKey::verify` is reported.
 ///
-/// Best-effort, mirroring [`stale_max_epoch_line`] and
-/// [`removed_member_still_holds_key_lines`]: a listing/fetch failure at any
-/// stage (the epoch lookup, the recipient listing, an individual wrap fetch
-/// or decode, or the manifest load) is swallowed for that item rather than
+/// Best-effort, mirroring [`removed_member_still_holds_key_lines`]: a
+/// listing/fetch failure at any stage (the recipient listing, an individual
+/// wrap fetch or decode, or the manifest load) is
+/// swallowed for that item rather than
 /// becoming a new doctor failure mode — a bad wrap this run could not even
 /// read is a missed detection, the lesser fault, never a false accusation.
 async fn unsigned_or_unauthorized_wrapped_key_lines(
     blob: &dyn BlobStore,
     team: &str,
     founder: Option<&Ss58>,
+    epoch: u64,
 ) -> Vec<String> {
-    let Ok(epoch) = highest_published_epoch(blob, team).await else {
-        return Vec::new();
-    };
     let Ok(recipients) = wrapped_key_recipients(blob, team, epoch).await else {
         return Vec::new();
     };
@@ -589,9 +865,8 @@ async fn unsigned_or_unauthorized_wrapped_key_lines(
 /// tail. [`hippius_mem_core::reconcile`] takes the same two reads in the same
 /// order for the same reason; keep the two in step.
 ///
-/// Best-effort, mirroring [`stale_max_epoch_line`] and
-/// [`removed_member_still_holds_key_lines`]: any read failure yields no lines
-/// rather than becoming a new doctor failure mode. A failed HEAD read costs
+/// Best-effort, mirroring [`removed_member_still_holds_key_lines`]: any read
+/// failure yields no lines rather than becoming a new doctor failure mode. A failed HEAD read costs
 /// EVERYTHING that rests on the heads — the tail check, the head-regression check,
 /// AND the mark advance `watermarks.observe` performs — because all three sit
 /// inside the one `if let Ok(heads)` block below; only the quarantine lines
@@ -892,7 +1167,7 @@ fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
 ///
 /// `blob` is injected (rather than built inside) so this is a deterministic I/O
 /// seam: tests drive it against an in-memory store and against fault-injecting
-/// fakes with no live gateway. The probe binds [`PROBE_KEY`] as AAD on both
+/// fakes with no live gateway. The probe binds its object key as AAD on both
 /// `seal` and `open`, mirroring `MemoryStore::remember`: authenticating the key
 /// the bytes live under turns a relocated or swapped ciphertext into an
 /// authentication failure rather than a silent content swap.
@@ -911,7 +1186,8 @@ async fn probe_encryption_boundary(
     blob: &dyn BlobStore,
     key: &SecretKey,
 ) -> anyhow::Result<ProbeReport> {
-    let ciphertext = seal(key, PROBE_PLAINTEXT, PROBE_KEY.as_bytes())
+    let object_key = probe_key();
+    let ciphertext = seal(key, PROBE_PLAINTEXT, object_key.as_bytes())
         .context("sealing the probe plaintext failed")?;
 
     // Defensive guard against a future `seal` regression that forgets to
@@ -924,18 +1200,23 @@ async fn probe_encryption_boundary(
         "seal returned the plaintext unchanged: the encryption layer is a no-op"
     );
 
-    blob.put(PROBE_KEY, ciphertext.clone())
+    blob.put(&object_key, ciphertext.clone())
         .await
         .context("storing the probe ciphertext failed")?;
 
     // Read back first, then delete unconditionally: the probe must never leave
     // its object behind, even when a check below fails and returns early. Delete
     // is idempotent and best-effort, so its failure must not fail the probe — but
-    // a genuine transport/permission fault leaves the sentinel object behind, so
-    // log it (MemError is secret-free) to aid diagnosis.
-    let fetched = blob.get(PROBE_KEY).await;
-    if let Err(err) = blob.delete(PROBE_KEY).await {
-        tracing::debug!(%err, "probe cleanup delete failed; sentinel object may remain");
+    // a genuine transport/permission fault leaves the object behind, and each run
+    // uses a new key, so it is warned with the key for the operator to delete
+    // (MemError is secret-free).
+    let fetched = blob.get(&object_key).await;
+    if let Err(err) = blob.delete(&object_key).await {
+        tracing::warn!(
+            key = %object_key,
+            %err,
+            "could not delete doctor's probe object; delete it by hand"
+        );
     }
     let fetched = fetched.context("fetching the probe ciphertext back failed")?;
 
@@ -944,7 +1225,7 @@ async fn probe_encryption_boundary(
         "the gateway returned plaintext — only ciphertext must ever be stored"
     );
 
-    let opened = open(key, &fetched, PROBE_KEY.as_bytes())
+    let opened = open(key, &fetched, object_key.as_bytes())
         .context("decrypting the probe ciphertext failed")?;
     ensure!(
         opened.as_slice() == PROBE_PLAINTEXT,
@@ -972,18 +1253,20 @@ mod tests {
 
     use hippius_mem_core::{
         BlobStore, HashEmbedder, HeadPointer, HeadRegression, HeadWatermarks, InMemoryIndex,
-        MemError, MemberKey, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteType, Op,
-        OpContent, OpKind, OpLogStore, QuarantinedAuthor, RememberInput, RepoScope, SecretKey,
-        Signature, Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest, VerifyingKey,
-        WrappedKey, content_hash, derive_identity, provision_team_key, publish_manifest,
-        read_heads, seal, signer_from_mnemonic, wrapped_key_key,
+        KeyProbe, MemError, MemberKey, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor,
+        NoteType, Op, OpContent, OpKind, OpLogStore, QuarantinedAuthor, RememberInput, RepoScope,
+        SecretKey, Signature, Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest,
+        VerifyingKey, WrappedKey, content_hash, derive_identity, provision_team_key,
+        publish_manifest, read_heads, seal, signer_from_mnemonic, wrapped_key_key,
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, head_regression_lines,
+        PROBE_KEY_PREFIX, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key,
+        config_for_key_probe, create_only_line, head_regression_lines, newest_epoch_key_line,
         offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
-        quarantine_lines, removed_member_still_holds_key_lines, resolve_profile_for_remote,
-        stale_max_epoch_line, suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
+        probe_storage_then_team_key, quarantine_lines, removed_member_still_holds_key_lines,
+        resolve_profile_for_remote, suppressed_tail_lines,
+        unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
     use crate::setup::hermes::HermesWiring;
@@ -1579,6 +1862,290 @@ mod tests {
         }
     }
 
+    #[test]
+    fn config_for_key_probe_clears_embeddings_and_the_chain_url() {
+        let cfg = Config {
+            team: "keep-me".to_owned(),
+            semantic_embeddings: true,
+            chain_ws_url: Some("wss://example.invalid".to_owned()),
+            ..Config::default()
+        };
+        let probe = config_for_key_probe(&cfg);
+        assert!(!probe.semantic_embeddings);
+        assert!(probe.chain_ws_url.is_none());
+        assert_eq!(probe.team, "keep-me", "every other field is preserved");
+    }
+
+    /// `doctor` fails for a key other than the one the team's published key check
+    /// was made from, passes for the right one, and only warns before any check is
+    /// published. Regression test: doctor passed any well-formed key.
+    #[tokio::test]
+    async fn doctor_fails_for_a_team_key_that_is_not_the_teams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = SecretKey::from_bytes([7u8; 32]);
+        let wrong = SecretKey::from_bytes([8u8; 32]);
+        let right_store = key_store(&blob, TEAM, [9u8; 32], [7u8; 32])?;
+        let wrong_store = key_store(&blob, TEAM, [10u8; 32], [8u8; 32])?;
+        assert!(
+            check_team_key(
+                blob.as_ref(),
+                TEAM,
+                &wrong,
+                wrong_store.probe_team_key(0).await?,
+                Some(0),
+            )
+            .await
+            .is_ok(),
+            "with no notes and no published check doctor can only warn"
+        );
+
+        right_store
+            .remember(RememberInput {
+                note_type: NoteType::Decision,
+                repo: RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: "a note the right key opens".to_owned(),
+                body: "body".to_owned(),
+                force: true,
+            })
+            .await?;
+        // Booting publishes nothing; the founder's `admin keycheck publish` does.
+        right_store.check_team_key().await?;
+        let err = check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &wrong,
+            wrong_store.probe_team_key(0).await?,
+            Some(0),
+        )
+        .await
+        .err()
+        .ok_or("a key that does not open the team's notes must fail doctor")?;
+        assert!(
+            err.to_string()
+                .contains("opens fewer than half of team clientx's oldest notes"),
+            "unexpected message: {err}"
+        );
+        check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &right,
+            right_store.probe_team_key(0).await?,
+            Some(0),
+        )
+        .await?;
+
+        right_store
+            .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
+            .await?;
+        check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &right,
+            right_store.probe_team_key(0).await?,
+            Some(0),
+        )
+        .await?;
+        let err = check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &wrong,
+            wrong_store.probe_team_key(0).await?,
+            Some(0),
+        )
+        .await
+        .err()
+        .ok_or("a wrong key must fail doctor")?;
+        assert!(
+            err.to_string().contains("is not team clientx's key"),
+            "unexpected message: {err}"
+        );
+        Ok(())
+    }
+
+    /// A key that fails on epoch 0's notes passes doctor, with a warning, when
+    /// the team's published check is that key's, or when the team has rotated
+    /// past epoch 0; it fails when neither holds.
+    ///
+    /// Regression test: doctor failed every right-key machine for good once
+    /// epoch 0's oldest notes were sealed under another key, even after the
+    /// documented recovery (`rotate`), and with a matching check it told the
+    /// operator to replace the check from the other key's machine.
+    #[tokio::test]
+    async fn a_failing_probe_is_only_warned_beside_a_matching_check_or_after_a_rotation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let key = SecretKey::from_bytes([8u8; 32]);
+
+        let unrotated: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let err = check_team_key(
+            unrotated.as_ref(),
+            TEAM,
+            &key,
+            KeyProbe::FailsToOpen,
+            Some(0),
+        )
+        .await
+        .err()
+        .ok_or("no check and no rotation: the probe decides")?;
+        assert!(
+            err.to_string().contains("opens fewer than half"),
+            "unexpected message: {err}"
+        );
+
+        let rotated: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        check_team_key(rotated.as_ref(), TEAM, &key, KeyProbe::FailsToOpen, Some(1)).await?;
+
+        let published: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        key_store(&published, TEAM, [10u8; 32], [8u8; 32])?
+            .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
+            .await?;
+        check_team_key(
+            published.as_ref(),
+            TEAM,
+            &key,
+            KeyProbe::FailsToOpen,
+            Some(0),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A store over `blob` for `team`, signing with `seed` and holding the key
+    /// `key` for epoch 0.
+    fn key_store(
+        blob: &Arc<dyn BlobStore>,
+        team: &str,
+        seed: [u8; 32],
+        key: [u8; 32],
+    ) -> Result<MemoryStore, Box<dyn std::error::Error>> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        Ok(MemoryStore::new(
+            Arc::clone(blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes(key))]),
+            0,
+            team.to_owned(),
+            1,
+        ))
+    }
+
+    /// A store that refuses every request, as a gateway does for a wrong secret.
+    struct RefusingStore;
+
+    #[async_trait::async_trait]
+    impl BlobStore for RefusingStore {
+        async fn put(&self, _key: &str, _bytes: Vec<u8>) -> Result<(), MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+
+        async fn get(&self, _key: &str) -> Result<Vec<u8>, MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>, MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+    }
+
+    /// With the credential refused, doctor fails at the probe write and says so,
+    /// with the gateway's refusal in the chain. Regression test: the team-key
+    /// check ran first, so the report read "reading the team-key check failed"
+    /// and the live `doctor_fails_loudly_when_the_s3_credential_is_wrong` broke.
+    #[tokio::test]
+    async fn a_refused_credential_fails_at_the_probe_write_before_the_key_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key = SecretKey::from_bytes([7u8; 32]);
+        let refusing: Arc<dyn BlobStore> = Arc::new(RefusingStore);
+        let store = key_store(&refusing, "clientx", [9u8; 32], [7u8; 32])?;
+        let err = probe_storage_then_team_key(&RefusingStore, "clientx", &key, &store, None)
+            .await
+            .err()
+            .ok_or("a refusing store must fail doctor")?;
+        let report = format!("{err:#}");
+        assert!(
+            report.starts_with("storing the probe ciphertext failed"),
+            "the first failed step must be the probe write: {report}"
+        );
+        assert!(
+            report.contains("SignatureDoesNotMatch"),
+            "the cause must survive: {report}"
+        );
+        Ok(())
+    }
+
+    /// A gateway that accepts `If-None-Match` and ignores it.
+    struct IgnoresCreateOnly(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for IgnoresCreateOnly {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<hippius_mem_core::CreateOutcome, MemError> {
+            self.0.put(key, bytes).await?;
+            Ok(hippius_mem_core::CreateOutcome::Created)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// Doctor stays quiet about a store that enforces create-only writes,
+    /// names the lost guarantee for one that ignores the condition, and reports
+    /// a probe that fails.
+    #[tokio::test]
+    async fn doctor_reports_a_gateway_that_ignores_create_only_writes() {
+        assert_eq!(
+            create_only_line(&MemoryBlobStore::new(), "team").await,
+            None
+        );
+
+        let line = create_only_line(&IgnoresCreateOnly(MemoryBlobStore::new()), "team")
+            .await
+            .expect("a gateway that ignores the condition is reported");
+        assert!(line.contains("ignores If-None-Match"), "{line}");
+
+        let line = create_only_line(&RefusingStore, "team")
+            .await
+            .expect("a refused probe is reported");
+        assert!(line.contains("could not tell"), "{line}");
+    }
+
     /// The doctor-surface test for the head-regression check: the seeded-bucket
     /// wrapper and the shared marks file, not just the renderer.
     ///
@@ -1900,11 +2467,65 @@ mod tests {
             "probe must report the sealed byte count"
         );
         // The probe deletes its object regardless of outcome, so a clean store is
-        // empty again afterwards: a follow-up `get` must miss.
-        let leftover = blob.get(PROBE_KEY).await;
+        // empty again afterwards.
+        let leftover = blob.list("_doctor/").await.expect("listing a memory store");
         assert!(
-            matches!(leftover, Err(MemError::NotFound { .. })),
+            leftover.is_empty(),
             "probe must clean up its object, got {leftover:?}"
+        );
+    }
+
+    /// Runs a whole second probe, under another team key, against the inner
+    /// store the first time `get` is called: two `doctor` runs sharing a bucket,
+    /// interleaved at the worst point.
+    struct InterleavedProbeStore {
+        inner: MemoryBlobStore,
+        interleaved: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for InterleavedProbeStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if !self
+                .interleaved
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let other_team = SecretKey::from_bytes([8u8; 32]);
+                probe_encryption_boundary(&self.inner, &other_team)
+                    .await
+                    .map_err(|err| MemError::Malformed(format!("other probe: {err:#}")))?;
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn two_probes_in_one_bucket_at_once_both_pass() {
+        let blob = InterleavedProbeStore {
+            inner: MemoryBlobStore::default(),
+            interleaved: std::sync::atomic::AtomicBool::new(false),
+        };
+        let key = SecretKey::from_bytes([7u8; 32]);
+
+        probe_encryption_boundary(&blob, &key)
+            .await
+            .expect("another team's probe in the same bucket must not fail this one");
+        let leftover = blob.list("_doctor/").await.expect("listing a memory store");
+        assert!(
+            leftover.is_empty(),
+            "both probes clean up, got {leftover:?}"
         );
     }
 
@@ -1933,7 +2554,7 @@ mod tests {
         let key = SecretKey::from_bytes([7u8; 32]);
         // Seal a valid blob, then flip a tag byte so `open`'s authentication
         // fails — the corruption path, distinct from the plaintext-leak path.
-        let mut corrupted = seal(&key, PROBE_PLAINTEXT, PROBE_KEY.as_bytes())
+        let mut corrupted = seal(&key, PROBE_PLAINTEXT, PROBE_KEY_PREFIX.as_bytes())
             .expect("sealing the fixed probe plaintext is infallible here");
         let last = corrupted.len() - 1;
         corrupted[last] ^= 0xFF;
@@ -1976,9 +2597,34 @@ mod tests {
         // The probe cleans up after itself; the trial root gains only the
         // `_doctor/` directory the probe created, no leftover object.
         assert!(
-            !dir.path().join(PROBE_KEY).exists(),
+            std::fs::read_dir(dir.path().join("_doctor"))?
+                .next()
+                .is_none(),
             "the probe object must not remain on disk"
         );
+        Ok(())
+    }
+
+    /// An object anyone with bucket write can put under `_keys/` does not make
+    /// `doctor` report a rotation: only a wrap the founder signed moves the
+    /// team's epoch. It used to take the highest key's epoch and fail, naming
+    /// an epoch the team never rotated to.
+    #[tokio::test]
+    async fn a_planted_key_object_does_not_fail_doctor_as_a_rotation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg = Config {
+            team: "trial".to_owned(),
+            team_key_hex: "ab".repeat(32),
+            author_seed_hex: "cd".repeat(32),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let epoch_dir = dir.path().join("trial/_keys/00000000000000009999");
+        std::fs::create_dir_all(&epoch_dir)?;
+        std::fs::write(epoch_dir.join("planted"), b"not a wrap")?;
+
+        probe_live(&cfg, &cfg.primary_profile()).await?;
         Ok(())
     }
 
@@ -2043,53 +2689,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
-    /// The doctor-surface test for the stale-`max_epoch` warning: a store
-    /// holding an epoch-1 wrapped key against a configured `max_epoch = 0`
-    /// must produce a report line telling the operator to raise it to 1.
+    /// `doctor` fails on a team rotated past epoch 0 when this machine cannot
+    /// load the newest epoch's key: no wrap under its author address, no
+    /// mnemonic, or a wrap the server refuses (one the founder did not
+    /// provision, or one that does not decode). It used to exit 0 while the
+    /// machine read none of the rotated epoch's notes, and then passed a
+    /// planted or corrupt wrap that the server's bootstrap refuses.
     #[tokio::test]
-    async fn stale_max_epoch_line_warns_when_the_bucket_holds_a_newer_epoch() -> Result<(), MemError>
-    {
+    async fn newest_epoch_key_line_fails_without_a_loadable_wrap()
+    -> Result<(), Box<dyn std::error::Error>> {
         const TEAM: &str = "clientx";
         const PHRASE: &str =
             "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-
-        let blob = MemoryBlobStore::default();
-
-        // Publish a wrapped key at epoch 1 via the real teamkey publish path
-        // (`provision_team_key`), exactly how a rotation populates the bucket.
-        let signer = signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
         let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
-        let member = MemberKey::create_signed(&signer, &identity);
+        let author = Sr25519Signer::from_seed_with_prefix(&[4_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let founder = Sr25519Signer::from_seed_with_prefix(&[5_u8; 32], NetworkPrefix::HIPPIUS)?;
         let team_key = SecretKey::from_bytes([1u8; 32]);
-        provision_team_key(&blob, TEAM, &team_key, 1, &[member], None, &signer).await?;
+        let author_ss58 = author.author_ss58();
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let manifest = TeamManifest::create_signed(
+            &founder,
+            TEAM.to_owned(),
+            BTreeSet::from([author_ss58.clone()]),
+            0,
+        );
+        publish_manifest(blob.as_ref(), &manifest).await?;
+        let store = key_store(&blob, TEAM, [4u8; 32], [1u8; 32])?;
+        let line = |mnemonic: Option<&'static str>| {
+            newest_epoch_key_line(blob.as_ref(), &store, 1, &author_ss58, mnemonic)
+        };
 
-        // Configured max_epoch = 0 never bootstraps the epoch-1 rotation: the
-        // report must warn, naming the exact fix.
-        let line = stale_max_epoch_line(&blob, TEAM, 0)
+        // The wrap sits under the mnemonic's own address, not the machine's
+        // author address.
+        let mnemonic_signer = signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let elsewhere = MemberKey::create_signed(&mnemonic_signer, &identity);
+        provision_team_key(
+            blob.as_ref(),
+            TEAM,
+            &team_key,
+            1,
+            &[elsewhere],
+            None,
+            &founder,
+        )
+        .await?;
+        let no_wrap = line(Some(PHRASE))
             .await
-            .expect("a published epoch newer than max_epoch must produce a warning line");
-        assert!(
-            line.contains("raise max_epoch to 1"),
-            "report line must name the actionable fix: {line}"
-        );
-        // Finding #15: max_epoch is a TOP-LEVEL Config field; TeamProfile
-        // carries `#[serde(deny_unknown_fields)]`, so a message pointing at
-        // "[[teams]]" would send the operator to add max_epoch there and
-        // break parsing for every subsequent command.
-        assert!(
-            line.to_lowercase().contains("top level"),
-            "report line must point at the top level of the config: {line}"
-        );
-        assert!(
-            !line.contains("[[teams]]"),
-            "report line must not point at a [[teams]] profile: {line}"
-        );
+            .ok_or("no wrap under the author address")?;
+        assert!(no_wrap.contains("no wrap"), "{no_wrap}");
 
-        // A max_epoch that already covers the published epoch is not stale.
-        assert!(
-            stale_max_epoch_line(&blob, TEAM, 1).await.is_none(),
-            "max_epoch at or above the highest published epoch must not warn"
-        );
+        let here = wrapped_key_key(TEAM, 1, author_ss58.as_str());
+        let wrapped_by = |provisioner: &Sr25519Signer| {
+            hippius_mem_core::wrap_team_key(
+                TEAM,
+                &team_key,
+                &identity.x25519_public(),
+                1,
+                provisioner,
+            )
+        };
+        blob.put(&here, serde_json::to_vec(&wrapped_by(&author)?)?)
+            .await?;
+        let planted = line(Some(PHRASE)).await.ok_or("a self-provisioned wrap")?;
+        assert!(planted.contains("is not a wrap the founder"), "{planted}");
+        blob.put(&here, b"not a wrap".to_vec()).await?;
+        let corrupt = line(Some(PHRASE))
+            .await
+            .ok_or("a wrap that does not decode")?;
+        assert!(corrupt.contains("is not a wrap the founder"), "{corrupt}");
+
+        blob.put(&here, serde_json::to_vec(&wrapped_by(&founder)?)?)
+            .await?;
+        assert_eq!(line(Some(PHRASE)).await, None);
+        let unset = line(None).await.ok_or("no mnemonic")?;
+        assert!(unset.contains("HIPPIUS_MEM_MNEMONIC"), "{unset}");
         Ok(())
     }
 
@@ -2144,7 +2817,7 @@ mod tests {
             TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 1);
         publish_manifest(&blob, &manifest_v1).await?;
 
-        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None).await;
+        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None, 0).await;
         assert_eq!(
             lines.len(),
             1,
@@ -2213,7 +2886,7 @@ mod tests {
             TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 1);
         publish_manifest(&blob, &manifest_v1).await?;
 
-        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None).await;
+        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None, 0).await;
         assert!(
             lines.is_empty(),
             "a bundle-provisioned member is invisible to this _keys/-only check by \
@@ -2231,118 +2904,10 @@ mod tests {
     {
         let blob = MemoryBlobStore::default();
         assert!(
-            removed_member_still_holds_key_lines(&blob, "clientx", None)
+            removed_member_still_holds_key_lines(&blob, "clientx", None, 0)
                 .await
                 .is_empty(),
             "an open team (no manifest) must never be flagged"
-        );
-        Ok(())
-    }
-
-    /// A [`BlobStore`] wrapper whose `list` fails for exactly the TOP-LEVEL
-    /// `_keys/` prefix — what `highest_published_epoch` reads — while a
-    /// per-epoch `_keys/{epoch}/` listing (what `wrapped_key_recipients`
-    /// reads) and everything else delegate untouched. Deliberately does NOT
-    /// fail every `_keys/`-containing prefix: that would make
-    /// `wrapped_key_recipients` fail too, which would ALSO yield an empty
-    /// result via the function's second short-circuit regardless of whether
-    /// the first one (I1's fix) is present — masking the exact bug this
-    /// pins. Failing only the top-level listing isolates the one behavior
-    /// under test: does a failed EPOCH lookup fall back to a hardcoded `0`?
-    struct FailingTopLevelKeysListStore {
-        inner: MemoryBlobStore,
-        /// The exact prefix `highest_published_epoch` lists (`{team}/_keys/`);
-        /// only this one fails.
-        failing_prefix: String,
-    }
-
-    #[async_trait::async_trait]
-    impl BlobStore for FailingTopLevelKeysListStore {
-        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
-            self.inner.put(key, bytes).await
-        }
-
-        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-            self.inner.get(key).await
-        }
-
-        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
-            if prefix == self.failing_prefix {
-                return Err(MemError::Storage("simulated listing failure".to_owned()));
-            }
-            self.inner.list(prefix).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), MemError> {
-            self.inner.delete(key).await
-        }
-    }
-
-    /// I1 regression: a listing failure on the EPOCH lookup must not fall
-    /// back to comparing the manifest against epoch 0's recipients. This is
-    /// the precise reason that fallback is dangerous, not merely a
-    /// hypothetical: epoch 0 here holds a genuinely STALE member — one a
-    /// REAL prior rotation already excluded from epoch 1, the true current
-    /// epoch, which matches the live manifest exactly (a healthy team). If
-    /// the epoch lookup's failure were papered over with `0`, this stale,
-    /// properly-rotated-away member would be wrongly flagged as still
-    /// holding the CURRENT epoch key.
-    #[tokio::test]
-    async fn removed_member_still_holds_key_lines_is_silent_on_an_epoch_lookup_failure()
-    -> Result<(), MemError> {
-        const TEAM: &str = "clientx";
-        const FOUNDER_PHRASE: &str =
-            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-        const STALE_PHRASE: &str = "letter advice cage absurd amount doctor acoustic avoid \
-                                     letter advice cage above";
-
-        let blob = FailingTopLevelKeysListStore {
-            inner: MemoryBlobStore::default(),
-            failing_prefix: format!("{TEAM}/_keys/"),
-        };
-        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let founder_identity = derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let founder_key = MemberKey::create_signed(&founder_signer, &founder_identity);
-        let stale_signer = signer_from_mnemonic(STALE_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let stale_identity = derive_identity(STALE_PHRASE, NetworkPrefix::HIPPIUS)?;
-        let stale_key = MemberKey::create_signed(&stale_signer, &stale_identity);
-
-        // Epoch 0 (stale history): both wrapped. Epoch 1 (the TRUE current
-        // epoch, after a real prior rotation): the founder only.
-        provision_team_key(
-            &blob,
-            TEAM,
-            &SecretKey::from_bytes([1u8; 32]),
-            0,
-            &[founder_key.clone(), stale_key],
-            None,
-            &founder_signer,
-        )
-        .await?;
-        provision_team_key(
-            &blob,
-            TEAM,
-            &SecretKey::from_bytes([2u8; 32]),
-            1,
-            std::slice::from_ref(&founder_key),
-            None,
-            &founder_signer,
-        )
-        .await?;
-
-        // The live manifest matches epoch 1 exactly: a healthy team with
-        // nothing to flag, IF the epoch lookup succeeds.
-        let manifest =
-            TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 0);
-        publish_manifest(&blob, &manifest).await?;
-
-        assert!(
-            removed_member_still_holds_key_lines(&blob, TEAM, None)
-                .await
-                .is_empty(),
-            "an epoch-lookup failure must yield no lines -- falling back to epoch 0 would \
-             wrongly flag the STALE (properly-rotated-away) member as still holding the \
-             CURRENT epoch's key"
         );
         Ok(())
     }
@@ -2442,7 +3007,7 @@ mod tests {
         )
         .await?;
 
-        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None).await;
+        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0).await;
 
         assert_eq!(
             lines.len(),
@@ -2521,7 +3086,7 @@ mod tests {
         .await?;
 
         assert!(
-            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None)
+            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0)
                 .await
                 .is_empty(),
             "a wrap provisioned by the manifest's trusted recovery key must never be flagged"
@@ -2574,7 +3139,7 @@ mod tests {
         )
         .await?;
 
-        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None).await;
+        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0).await;
         assert_eq!(
             lines.len(),
             1,
@@ -2625,8 +3190,8 @@ mod tests {
     /// A wrap this run could list (so its recipient is enumerated) but then
     /// failed to FETCH must be silent, not flagged -- a read failure is a
     /// missed detection, the lesser fault, never a false accusation. Mirrors
-    /// the best-effort reasoning `stale_max_epoch_line` and
-    /// `removed_member_still_holds_key_lines` already rely on for their own
+    /// the best-effort reasoning `removed_member_still_holds_key_lines`
+    /// already relies on for their own
     /// listing failures.
     #[tokio::test]
     async fn unsigned_or_unauthorized_wrapped_key_lines_is_silent_on_a_wrap_fetch_failure()
@@ -2655,7 +3220,7 @@ mod tests {
         let blob = FailingGetStore { inner, failing_key };
 
         assert!(
-            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None)
+            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None, 0)
                 .await
                 .is_empty(),
             "a wrap this run could not fetch must not be flagged"

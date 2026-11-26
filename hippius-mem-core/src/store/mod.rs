@@ -16,15 +16,21 @@ mod copy;
 mod decoded;
 mod fs;
 mod instrumented;
+mod keycheck;
 mod snapshot;
 
-pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
+pub(crate) use blob::get_in_order;
+pub use blob::{
+    BlobStore, CreateOnly, CreateOutcome, MemoryBlobStore, S3BlobStore, probe_create_only,
+};
 pub use cache::CachingBlobStore;
 use checkpoint_cache::{CheckpointCache, Persist};
 pub use copy::copy_store;
 use decoded::DecodedLedger;
 pub use fs::FsBlobStore;
 pub use instrumented::{BlobStats, InstrumentedBlobStore, OpStats};
+pub use keycheck::{KeyCheckMatch, key_check_key, matches_published_key_check};
+use keycheck::{PublishedCheck, WriteMode, key_check_epochs, read_key_check, write_key_check};
 use snapshot::{
     FetchedSnapshot, fetch_newest_snapshot, open_record, prune_old_snapshots, seal_record,
     seal_snapshot, snapshot_prefix,
@@ -47,25 +53,27 @@ use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::{
     AnchorRecord, AnchorResignReport, AnchorSignatureState, UnsignedAnchorPolicy,
-    anchor_record_exists, persist_anchor_record, read_anchor_records,
-    read_anchor_records_with_policy, scan_anchor_records,
+    anchor_record_exists, own_anchors, persist_anchor_record, read_anchor_records_with_policy,
+    scan_anchor_records,
 };
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
-use crate::crypto::{SecretKey, content_hash, open, seal};
+use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
-use crate::error::MemError;
+use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
-    Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, highest_published_epoch,
-    load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
-    rotate_team_key,
+    Identity, ManifestMarker, MemberKey, TeamManifest, create_wraps, first_provisioned_epoch,
+    load_manifest, load_member_keys, next_free_manifest_version, provisioner_authorized,
+    publish_manifest, publish_member_key, put_wraps, read_wrapped_key, seal_wraps,
+    unauthorized_wrap, unwrap_team_key, wrap_epochs_addressed_to, wrap_keys_above,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
+use crate::oplog::{AuthorTip, OtherEndpointTip, TipSnapshot, TypedLink};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
     OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer,
     VerifiedHeads, VerifiedOps, VerifyingKey, WriterLock, WriterLockGuard, converge, lamport_tip,
-    publish_head, read_heads,
+    publish_head, read_heads, read_own_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -288,10 +296,25 @@ struct OpClock {
     my_last_lamport: u64,
     /// [`Op::hash`] of this author's most recent op — the next op's `prev_op_hash`.
     my_last_hash: Blake3Hash,
+    /// Ops of this author whose failed append this process reclaimed without
+    /// the cross-process lock. A sync whose unlocked op-log read ran before the
+    /// reclaim's delete may still list one; it must not become the head, or
+    /// every later op chains to a deleted op. Only grows on that rare path.
+    reclaimed: HashSet<Blake3Hash>,
 }
 
-/// Raise `clock` to the tip another process on this machine recorded, if that
-/// tip is ahead of ours.
+impl OpClock {
+    /// This author's chain head as this process holds it.
+    fn own_tip(&self) -> SharedTip {
+        SharedTip {
+            lamport: self.my_last_lamport,
+            tip_hash: self.my_last_hash,
+        }
+    }
+}
+
+/// Raise `clock` to `tip`, this author's newest durable op as recorded on this
+/// machine, if that tip is ahead of ours.
 ///
 /// # Why the comparison is on `my_last_lamport` and nothing else
 ///
@@ -309,11 +332,11 @@ struct OpClock {
 /// would fork the chain in the other direction. `lamport_tip` is raised with
 /// `max` rather than assigned, because a teammate's higher Lamport must survive
 /// adopting our own older-but-newer-to-us tip.
-fn adopt_shared_tip(clock: &mut OpClock, guard: &WriterLockGuard<'_>) {
-    let Some(tip) = guard.shared_tip() else {
-        return;
-    };
-
+///
+/// `tip` must be THIS author's op: [`MemoryStore::machine_tip`] only ever reads
+/// this author's own tip-file entry or head, which is what keeps one author from
+/// chaining to another author's op on a shared state directory.
+fn adopt_tip(clock: &mut OpClock, tip: SharedTip) {
     if tip.lamport <= clock.my_last_lamport {
         return;
     }
@@ -321,6 +344,47 @@ fn adopt_shared_tip(clock: &mut OpClock, guard: &WriterLockGuard<'_>) {
     clock.my_last_lamport = tip.lamport;
     clock.my_last_hash = tip.tip_hash;
     clock.lamport_tip = clock.lamport_tip.max(tip.lamport);
+}
+
+/// What an author's writer tip entries name in this bucket, after completing
+/// their pending ops ([`MemoryStore::resolve_entries`]).
+#[derive(Debug, Default)]
+struct ResolvedTip {
+    /// The newest committed op they name, with no pending op; `None` when no
+    /// entry was usable.
+    tip: Option<AuthorTip>,
+    /// Whether a usable entry had a pending op (completed, or ignored as
+    /// invalid), so an op this process did not index may now be durable.
+    had_pending: bool,
+    /// The other endpoints whose entries named this bucket's ops. The next
+    /// record drops them, because its entry carries their chain on.
+    absorbed: Vec<String>,
+}
+
+/// The highest Lamport `entry` names, pending op included.
+fn newest_lamport(entry: &AuthorTip) -> u64 {
+    entry
+        .pending
+        .as_ref()
+        .map_or(entry.committed.lamport, |op| op.lamport)
+        .max(entry.committed.lamport)
+}
+
+/// The committed op id to record with a new pending op: the id of the tip
+/// this write chained from, when the clock still names that tip.
+fn recorded_committed_op_id(tip: Option<&AuthorTip>, committed: SharedTip) -> Option<Ulid> {
+    tip.filter(|tip| tip.committed == committed)
+        .and_then(|tip| tip.committed_op_id)
+}
+
+/// `tip` as an entry with no pending op and no known op id: a tip read from a
+/// head pointer, or this process's clock.
+fn tip_without_op_id(tip: SharedTip) -> AuthorTip {
+    AuthorTip {
+        committed: tip,
+        committed_op_id: None,
+        pending: None,
+    }
 }
 
 /// One op buffered for the next anchor batch: its leaf hash and Lamport clock.
@@ -356,6 +420,12 @@ struct PendingLeaf {
 struct AnchorState {
     pending: Vec<PendingLeaf>,
     next_seq: u64,
+    /// Batches that were anchored but whose record could not be persisted (the
+    /// writer lock stayed busy, or the PUT failed). Kept with their receipt so
+    /// the next commit persists them instead of anchoring the same root again,
+    /// which would cost a second on-chain fee and orphan the first anchor.
+    /// Lost, like `pending`, when the process exits.
+    anchored: Vec<AnchorRecord>,
 }
 
 impl AnchorState {
@@ -442,14 +512,19 @@ const AUTHORITATIVE_INSTALL_ATTEMPTS: u32 = 3;
 /// at ingestion (the MCP schema already calls it a "one-line summary") keeps the
 /// two legs consistent; 512 scalar values is a generous one line yet well under
 /// the token budget of the embedding models this crate targets, so the semantic
-/// leg never truncates an accepted summary. Detail belongs in the body, which has
-/// no such cap.
+/// leg never truncates an accepted summary. Detail belongs in the body, whose
+/// cap ([`MAX_BODY_CHARS`]) is 256 times larger.
 const MAX_SUMMARY_CHARS: usize = 512;
 
 /// Maximum length, in Unicode scalar values, of a note `body` accepted at
 /// ingestion. Generous (a body holds one fact's detail, not a document) but
 /// bounded, so a single write cannot durably persist an arbitrarily large blob
 /// across the team's shared storage.
+///
+/// Counted in characters, not bytes, on purpose: the same note length is
+/// accepted whatever the script, and the byte bound that matters for storage
+/// still follows, at most 4 bytes per scalar value, so 512 KiB of UTF-8. A byte
+/// cap would refuse an edit to a non-ASCII note this cap already accepted.
 const MAX_BODY_CHARS: usize = 128 * 1024;
 
 /// Maximum number of distinct `tags` on a note. Tags are pinned in every machine's
@@ -799,6 +874,182 @@ enum IndexApply {
     Lagging { my_view_tip: u64 },
 }
 
+/// Something a write did in a degraded way, reported with that write's result
+/// (the MCP server turns each into a `warnings` entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Degradation {
+    /// Appended without the cross-process writer lock (none attached where one
+    /// is required, or the lock file could not be opened or locked), so another
+    /// process on this machine could fork it.
+    Unserialized,
+    /// Durable, but its outcome could not be recorded in the local writer-tip
+    /// file; the next writer here completes it from its pending entry.
+    TipNotRecorded,
+    /// Durable, but its signed head pointer could not be published, so the
+    /// author's head lags its op-log until a later write.
+    HeadNotPublished,
+    /// Sealed under a key that no published key check confirms and that opened
+    /// fewer than half of the epoch's oldest notes it tried
+    /// ([`KeyProbe::FailsToOpen`]): teammates may not be able to read it.
+    TeamKeyUnverified,
+}
+
+/// A write's result and what it did in a degraded way, empty when nothing.
+///
+/// Not `#[must_use]`: a caller that reports nothing (an import, a test) may
+/// drop the degradations, which are logged where they happen as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written<T> {
+    /// What the write returns.
+    pub value: T,
+    /// What went degraded during this write, and only this write.
+    pub degraded: Vec<Degradation>,
+}
+
+/// An op this store appended, with what went degraded while appending it.
+struct Appended {
+    op: Op,
+    degraded: Vec<Degradation>,
+}
+
+/// What this machine's key for an epoch looks like against the team's.
+///
+/// Only a published key check decides: see the `keycheck` module docs for who
+/// publishes one and why nothing else may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamKeyCheck {
+    /// The team's published key check matches this machine's key.
+    Matches,
+    /// The team's published key check is another key's. Writes and index
+    /// checkpoints are refused with [`MemError::TeamKeyMismatch`].
+    Mismatch,
+    /// No usable key check is published for the epoch, so writes go ahead.
+    /// `probe` is what trying the key on the epoch's notes showed, when that
+    /// was tried: a hint for the operator, never a verdict.
+    Unpublished {
+        /// The probe result, or `None` when it was not run.
+        probe: Option<KeyProbe>,
+    },
+}
+
+/// What trying this machine's key on an epoch's oldest notes showed
+/// ([`MemoryStore::check_team_key`], [`MemoryStore::probe_team_key`], and the
+/// check every key-check publish makes first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProbe {
+    /// More of the tried notes opened than failed.
+    Opens,
+    /// More of the tried notes failed than opened: the key is probably wrong.
+    FailsToOpen,
+    /// The epoch has no notes.
+    NoNotes,
+    /// Notes exist but none could be tried (blobs missing or failing their
+    /// content hash), or as many opened as failed.
+    Inconclusive,
+}
+
+/// How [`MemoryStore::publish_team_key_check`] treats a check the team already
+/// published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishKeyCheck {
+    /// Publish only where no check exists; never overwrite.
+    IfAbsent,
+    /// Overwrite another key's check, or an unusable object: the recovery path
+    /// for a wrong check. Whoever runs it decides the team's key.
+    Replace,
+}
+
+/// What [`MemoryStore::publish_team_key_check`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCheckPublished {
+    /// This call wrote this machine's check and read it back. `create_only`
+    /// says whether the write was create-only and enforced, so whether a
+    /// concurrent publisher could have been overwritten: `None` for
+    /// [`PublishKeyCheck::Replace`], which overwrites on purpose.
+    Published {
+        /// What the gateway's create-only write support measured, when the
+        /// publish relied on it.
+        create_only: Option<CreateOnly>,
+    },
+    /// The team's check was already this machine's key's.
+    AlreadyPublished,
+    /// The team's check is another key's, or unusable, so nothing was written
+    /// (or a concurrent publisher's check won).
+    Refused,
+    /// This machine's key opened fewer than half of the epoch's oldest notes
+    /// tried ([`KeyProbe::FailsToOpen`]), so nothing was written: publishing
+    /// it would refuse every client holding the key those notes were sealed
+    /// under. Returned for [`PublishKeyCheck::Replace`] too.
+    KeyFailsOnNotes,
+}
+
+/// A verdict this process holds for one epoch, and when it was reached.
+#[derive(Debug, Clone, Copy)]
+struct KnownKeyCheck {
+    found: TeamKeyCheck,
+    at: Instant,
+}
+
+/// Age past which an op a previous write did not confirm is dropped instead of
+/// completed. Half of [`MIN_GC_GRACE`], so `gc` on a machine whose clock is up
+/// to the other half ahead still keeps the op's blob while it is completed.
+const PENDING_OP_MAX_AGE: Duration = Duration::from_secs(MIN_GC_GRACE.as_secs() / 2);
+
+// The argument above holds only while an op that may still be completed is at
+// most half the grace window old; a longer age leaves gc less than half the
+// window of clock difference to absorb.
+const _: () = assert!(2 * PENDING_OP_MAX_AGE.as_secs() <= MIN_GC_GRACE.as_secs());
+
+/// The shortest grace window `gc` accepts for a real sweep. A write whose op
+/// PUT was not confirmed is completed by the next write on its machine only
+/// while the op is younger than half of this, so the other half bounds the
+/// clock difference between that machine and the one running `gc`.
+pub const MIN_GC_GRACE: Duration = Duration::from_hours(2);
+
+/// What this process found when it last looked for an epoch newer than the
+/// one it seals under, and when.
+#[derive(Debug, Clone, Copy)]
+struct KnownNewestEpoch {
+    /// The epoch the lookup was made above: the one writes sealed under.
+    sealing: u64,
+    /// The newest epoch above `sealing` the founder provisioned, if any.
+    newer: Option<u64>,
+    at: Instant,
+}
+
+/// How long a verdict is used before the published check is read again.
+/// Bounds how long a running server keeps writing after a check is published
+/// or replaced (`--replace` can turn a match into a mismatch), or keeps
+/// refusing after a wrong one is replaced, at one GET per epoch per minute at
+/// most on the write path. Arbitrary within that reasoning.
+const KEY_CHECK_RECHECK: Duration = Duration::from_mins(1);
+
+/// How many seqs [`MemoryStore::reserve_seq_and_persist`] tries before it fails
+/// the anchor. Arbitrary: under the writer lock a collision needs a second
+/// machine under the same identity, and each retry re-reads the seq from the
+/// bucket, so two in a row are already rare.
+const ANCHOR_SEQ_ATTEMPTS: u32 = 8;
+
+/// How many times [`MemoryStore::lock_for_edit`] syncs and retries when another
+/// process on this machine committed since this process last synced. One sync
+/// normally suffices; the rest cover a burst of concurrent writers. Arbitrary.
+const EDIT_SYNC_ATTEMPTS: usize = 3;
+
+/// How many of an epoch's oldest notes [`MemoryStore::probe_epoch_key`] tries,
+/// counting a missing or altered blob, so the probe costs at most this many
+/// GETs. Its majority result is reported
+/// at boot, withholds a key-check publish and can fail `doctor`, so the number
+/// must be large enough that a few stray notes sealed under another key do not
+/// decide it. Arbitrary within that reasoning.
+const KEY_PROBE_NOTES: usize = 16;
+
+/// Whether [`MemoryStore::publish_head_for_tip`] published the head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadPublished {
+    Yes,
+    No,
+}
+
 /// The note coordinates a minted op records: which note it acts on, where that
 /// note's ciphertext landed, that blob's hash, and the epoch it was sealed under.
 ///
@@ -883,12 +1134,16 @@ pub struct MemoryStore {
     // `append_under_serialization` itself, may ever run inside a
     // `select!`/`timeout` that can drop its future — a cancelled call would
     // skip the reclaim arm and silently reintroduce the fork this
-    // guard-ordering exists to prevent. No PRODUCTION caller does that today
-    // (two test-only `tokio::time::timeout` wrappers exist — `server.rs` over
-    // `logic_forget`, `store/mod.rs` over `flush_anchors` — but neither
-    // reaches `mint_and_append`/`commit_edit`: the first blocks at
-    // `await_warm` before the store, the second is the anchor-commit path,
-    // not the op-log write path); keep it that way.
+    // guard-ordering exists to prevent. One production caller can: the
+    // binary's exit flush waits, under its time bound or until a signal, for
+    // the `reinforce_use` appends the MCP server started in the background,
+    // and drops one still running when the wait ends (see
+    // `append_under_serialization`'s docs for the accepted cost). The other
+    // `tokio::time::timeout` wrappers that exist (a test in `store/mod.rs`
+    // over `flush_anchors`, and a test in `server.rs` over `logic_forget`)
+    // never reach `mint_and_append`/`commit_edit`: `flush_anchors` is the
+    // anchor-commit path, not the op-log write path, and `logic_forget`
+    // blocks at `await_warm` before the store. Add no other caller.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -900,6 +1155,12 @@ pub struct MemoryStore {
     // `clock` (never both held at once — distinct critical sections, no lock
     // ordering hazard); its guard, like `clock`'s, never spans an `.await`.
     anchor_state: Mutex<AnchorState>,
+    // Set once this process has queued this author's ops that no own anchor
+    // record covers (`requeue_uncovered_own_ops`): at most once per process, also
+    // when it fails. A `OnceCell` rather than a flag, so a second caller waits
+    // for the first to finish queueing instead of committing a batch whose
+    // record would raise the watermark past ops not yet queued.
+    requeued_uncovered: tokio::sync::OnceCell<()>,
     // The team founder's identity, pinned out of band (operator config) so the
     // untrusted bucket cannot elect a founder. `Some` makes `load_manifest` honour
     // ONLY this founder's manifests, so a malicious gateway overwriting the genesis
@@ -938,9 +1199,15 @@ pub struct MemoryStore {
     // `read_and_filter`, briefly takes `writer` (released before the next
     // `.await`) — so a sync holding this gate never waits on `writer`, and
     // `writer`'s own holders (`mint_and_append`/`commit_edit`) never take this
-    // gate, so a write never queues behind a slow sync. See `sync`'s doc for the
-    // full ordering argument.
+    // gate while they hold `writer`, so a write never queues behind a slow sync
+    // with `writer` held. (An edit with a precondition calls `sync` from
+    // `lock_for_edit`, after releasing both writer locks, so it can wait for a
+    // sync; it holds nothing a sync needs while it does.) See `sync`'s doc for
+    // the full ordering argument.
     sync_gate: tokio::sync::Mutex<()>,
+    // How many times `sync` ran, for tests that bound a retry loop's syncs.
+    #[cfg(test)]
+    syncs: std::sync::atomic::AtomicUsize,
     /// The newest index checkpoint this store has loaded, reused while the bucket
     /// still lists it (see `checkpoint_cache`). Memory-only unless
     /// [`with_checkpoint_cache_file`](Self::with_checkpoint_cache_file) is set.
@@ -1015,6 +1282,39 @@ pub struct MemoryStore {
     // e.g. a second team — still gets its own first warning rather than being
     // silenced by an unrelated store's.
     missing_lock_warned: std::sync::atomic::AtomicBool,
+    // What this process found when it compared its key for each epoch against
+    // the team's published key check (see `keycheck`), and when. Re-read after
+    // `KEY_CHECK_RECHECK`.
+    key_checks: Mutex<BTreeMap<u64, KnownKeyCheck>>,
+    // Whether the founder provisioned an epoch newer than the one writes seal
+    // under, as last looked up, and when. Looked up again after the same
+    // interval as `key_checks`.
+    newest_epoch: Mutex<Option<KnownNewestEpoch>>,
+    // How long a verdict is used: `KEY_CHECK_RECHECK` outside tests.
+    key_check_recheck: Duration,
+    // Age past which an unconfirmed op is dropped, not completed:
+    // `PENDING_OP_MAX_AGE` outside tests.
+    pending_op_max_age: Duration,
+    // Whether the blob store enforces create-only writes, measured once per
+    // process by the first publish of a key check (`probe_create_only`).
+    create_only: Mutex<Option<CreateOnly>>,
+    // The writer tip file's revision (see the `writer_lock` module docs) that
+    // this process's index is known to include: read before the last sync
+    // started, or moved forward by this process's own writes when it was
+    // current. `None` until a sync, or while no tip file exists.
+    synced_tip_revision: Mutex<Option<Ulid>>,
+    // Notes the last decode of each left out of the index because their
+    // ciphertext failed its integrity check or did not decrypt, with the reason.
+    // Kept so `get` reports an integrity failure for them instead of "not found";
+    // an entry is removed when the note later decodes.
+    undecodable: Mutex<BTreeMap<NoteId, IntegrityFailure>>,
+    // Notes a decode left out of the index because this process holds no key
+    // for their epoch (a rotation it did not load, or an epoch from before it
+    // joined). While any is here the index is incomplete, so no checkpoint is
+    // written from it. An entry is removed when the note later decodes; one
+    // whose note is forgotten first stays until the process exits, which only
+    // costs this process its checkpoint writes.
+    keyless: Mutex<BTreeSet<NoteId>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -1035,13 +1335,18 @@ impl fmt::Debug for MemoryStore {
 /// material), so a CLI can print it verbatim. `wrapped` is the authoritative
 /// post-rotation read set: an address absent here holds no wrap of the new
 /// epoch and cannot read notes sealed under it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "the caller must relay the new epoch to the team (max_epoch config) or the rotation is silently invisible to them"]
+#[derive(Debug)]
+#[must_use = "the caller must tell the team to restart with their mnemonics, or their servers refuse writes and miss the new epoch's notes"]
 pub struct RotationOutcome {
     /// The freshly minted epoch new writes now seal under.
     pub new_epoch: u64,
     /// The addresses wrapped the new epoch's key — the post-rotation read set.
     pub wrapped: BTreeSet<Ss58>,
+    /// What publishing the new epoch's key check did, or why that publish
+    /// failed. The rotation is already durable in either case; an error,
+    /// [`KeyCheckPublished::KeyFailsOnNotes`] and [`KeyCheckPublished::Refused`]
+    /// mean the operator still needs `admin keycheck publish`.
+    pub key_check: Result<KeyCheckPublished, MemError>,
 }
 
 /// Outcome of a [`MemoryStore::sweep_orphan_blobs`] pass — plain counts a CLI can
@@ -1113,13 +1418,16 @@ impl MemoryStore {
                 lamport_tip: 0,
                 my_last_lamport: 0,
                 my_last_hash: GENESIS_PREV,
+                reclaimed: HashSet::new(),
             }),
             anchor,
             anchor_threshold,
             anchor_state: Mutex::new(AnchorState {
                 pending: Vec::new(),
                 next_seq: 0,
+                anchored: Vec::new(),
             }),
+            requeued_uncovered: tokio::sync::OnceCell::new(),
             // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
             founder: None,
             // No manifest applied yet; the first `read_and_filter` seeds the watermark.
@@ -1128,6 +1436,8 @@ impl MemoryStore {
             auto_refresh: Mutex::new(AutoRefreshState::default()),
             // Unlocked: no rebuild in flight yet.
             sync_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            syncs: std::sync::atomic::AtomicUsize::new(0),
             checkpoints: CheckpointCache::new(None),
             // No durable manifest marker by default; `with_manifest_marker` opts in.
             manifest_marker: None,
@@ -1153,6 +1463,15 @@ impl MemoryStore {
             // the lock missing (if `writer_lock_required`) flips this and warns;
             // see the field doc for why this is per-instance, not global.
             missing_lock_warned: std::sync::atomic::AtomicBool::new(false),
+            // No epoch checked yet; the first write or `check_team_key` fills it.
+            key_checks: Mutex::new(BTreeMap::new()),
+            newest_epoch: Mutex::new(None),
+            key_check_recheck: KEY_CHECK_RECHECK,
+            pending_op_max_age: PENDING_OP_MAX_AGE,
+            create_only: Mutex::new(None),
+            synced_tip_revision: Mutex::new(None),
+            undecodable: Mutex::new(BTreeMap::new()),
+            keyless: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -1382,56 +1701,46 @@ impl MemoryStore {
     /// overwrite a live key).
     ///
     /// For every `epoch` in `epochs`, look up this member's [`crate::WrappedKey`]
-    /// in the bucket and unwrap it with `identity`'s x25519 secret; on success the
+    /// in the bucket under this store's author address and unwrap it with
+    /// `identity`'s x25519 secret; on success the
     /// key joins the ring (via [`MemoryStore::add_epoch_key`]). Epochs this member
     /// cannot unwrap — no wrap addressed to them (a non-member, or one removed
     /// before that epoch), a tampered wrap, a backend miss, or a wrap whose
-    /// provisioner the live manifest does not authorize (a bucket-planted wrap
+    /// provisioner the manifest does not authorize (a bucket-planted wrap
     /// that verifies under its own signature but was never sealed by the
-    /// founder or its named recovery key — see [`fetch_team_key`]'s "Provisioner
-    /// authorization" docs) — are skipped, so a removed member still bootstraps
-    /// the older epochs they retain, and an unauthorized wrap never reaches
-    /// [`MemoryStore::add_epoch_key`]. Returns how many keys were added. Does not
-    /// change the active write epoch.
+    /// founder or its named recovery key — see [`crate::fetch_team_key`]'s
+    /// "Provisioner authorization" docs) — are skipped, so a removed member
+    /// still bootstraps the older epochs they retain, and an unauthorized wrap
+    /// never reaches [`MemoryStore::add_epoch_key`]. Returns how many keys were
+    /// added. Does not change the active write epoch.
     ///
-    /// Discovering *which* epochs exist is left to the caller (a documented
-    /// follow-up): pass the epoch range you know about.
+    /// The manifest that authorizes provisioners is resolved once, through the
+    /// same rollback watermark and durable marker as `sync`
+    /// ([`current_manifest`](Self::current_manifest)), not read raw from the
+    /// bucket: a garbled or deleted newest manifest must not bring back a
+    /// recovery key it retired. [`wrapped_epochs`](Self::wrapped_epochs) lists
+    /// the epochs to pass.
     ///
     /// # Errors
     ///
-    /// Never returns an error for an un-unwrappable epoch (those are skipped); it
-    /// is infallible in practice and returns `Result` only to keep the async
-    /// signature uniform with the rest of the store API.
+    /// Whatever resolving the manifest reports. An epoch that does not unwrap
+    /// is skipped, not an error.
     pub async fn bootstrap_epoch_keys(
         &self,
         identity: &Identity,
         epochs: &[u64],
     ) -> Result<usize, MemError> {
-        let team = self.team.as_str();
-        let secret = identity.x25519_secret();
+        let manifest = self.current_manifest().await?;
         let mut added = 0_usize;
         for &epoch in epochs {
-            // `self.founder` is the same operator pin `sync`/`provision_members` load
-            // the manifest under, so a wrap this member's own store would refuse to
-            // trust as authorized (Task 3's provisioner check, inside
-            // `fetch_team_key`) is refused here too, BEFORE `add_epoch_key` ever
-            // installs it into the ring.
-            match fetch_team_key(
-                self.blob.as_ref(),
-                team,
-                epoch,
-                &identity.ss58,
-                &secret,
-                self.founder.as_ref(),
-            )
-            .await
-            {
+            // Refused BEFORE `add_epoch_key` ever installs the key into the ring.
+            match self.open_wrap(identity, epoch, manifest.as_ref()).await {
                 Ok(key) => {
                     self.add_epoch_key(epoch, key);
                     added += 1;
                 }
                 Err(err) => tracing::warn!(
-                    team = %team,
+                    team = %self.team,
                     epoch,
                     error = %err,
                     "skipping an epoch this member cannot bootstrap (no wrap, unwrap failed, or \
@@ -1440,6 +1749,64 @@ impl MemoryStore {
             }
         }
         Ok(added)
+    }
+
+    /// The key of `epoch`, from the wrap addressed to this store's author,
+    /// under the rules [`bootstrap_epoch_keys`](Self::bootstrap_epoch_keys)
+    /// applies, without adding it to the ring. For a diagnosis (`doctor`) that
+    /// must name why a member's server would not load the key.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] when no wrap is addressed to this author at
+    /// `epoch`, [`MemError::Serialize`] when it does not decode,
+    /// [`MemError::Unauthorized`] when the manifest in force does not authorize
+    /// its provisioner, [`MemError::Crypto`] when `identity` does not open it, or
+    /// whatever resolving the manifest or the GET reports.
+    pub async fn open_epoch_key(
+        &self,
+        identity: &Identity,
+        epoch: u64,
+    ) -> Result<SecretKey, MemError> {
+        let manifest = self.current_manifest().await?;
+        self.open_wrap(identity, epoch, manifest.as_ref()).await
+    }
+
+    /// Read, authorize against `manifest`, and open this author's wrap of
+    /// `epoch` with `identity`'s x25519 secret.
+    async fn open_wrap(
+        &self,
+        identity: &Identity,
+        epoch: u64,
+        manifest: Option<&TeamManifest>,
+    ) -> Result<SecretKey, MemError> {
+        // The wrap sits under the address the member key was signed with, which
+        // is this store's author (`join_as_member`), not `identity.ss58`: the two
+        // differ whenever `author_seed_hex` is not the mnemonic's seed, which is
+        // the per-machine setup `join --bundle` and the installer create.
+        let recipient = self.signer.author_ss58();
+        let wrapped =
+            read_wrapped_key(self.blob.as_ref(), &self.team, epoch, recipient.as_str()).await?;
+        if !provisioner_authorized(&wrapped, manifest, self.founder.as_ref()) {
+            return Err(unauthorized_wrap(&self.team, epoch, &recipient));
+        }
+        unwrap_team_key(&self.team, &wrapped, &identity.x25519_secret(), epoch)
+    }
+
+    /// The epochs at which the bucket holds a wrap addressed to this store's
+    /// author, ascending: what [`bootstrap_epoch_keys`](Self::bootstrap_epoch_keys)
+    /// tries. One LIST of `{team}/_keys/`. Unauthenticated: an epoch listed here
+    /// may hold a planted wrap, which the bootstrap refuses.
+    ///
+    /// Listing beats walking `0..=newest`: rotations may skip epochs another
+    /// object holds, and a GET per epoch would follow an epoch number anyone
+    /// with bucket write can raise.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`BlobStore::list`] reports.
+    pub async fn wrapped_epochs(&self) -> Result<Vec<u64>, MemError> {
+        wrap_epochs_addressed_to(self.blob.as_ref(), &self.team, &self.signer.author_ss58()).await
     }
 
     /// Record a new note: build it, seal it, persist the blob, log a signed
@@ -1461,11 +1828,14 @@ impl MemoryStore {
     /// Returns [`MemError::NearDuplicate`] if `input.summary` is a near-duplicate
     /// of an existing live note and `input.force` is false (the write-time dedup
     /// gate, checked first so nothing is persisted). Otherwise returns
-    /// [`MemError::Crypto`] if sealing fails, [`MemError::Storage`] if the object
+    /// [`MemError::EpochSuperseded`] if the founder provisioned an epoch newer
+    /// than the one this store seals under, [`MemError::Crypto`] if sealing fails, [`MemError::Storage`] if the object
     /// key is invalid or the blob/op write fails, [`MemError::Serialize`] if the
     /// op cannot be encoded, or any error the index reports while upserting.
     pub async fn remember(&self, input: RememberInput) -> Result<NoteId, MemError> {
-        self.remember_impl(input, None).await
+        self.remember_impl(input, None)
+            .await
+            .map(|written| written.value)
     }
 
     /// Like [`remember`](Self::remember) but with a caller-precomputed summary
@@ -1487,7 +1857,7 @@ impl MemoryStore {
         &self,
         input: RememberInput,
         embedding: Vec<f32>,
-    ) -> Result<NoteId, MemError> {
+    ) -> Result<Written<NoteId>, MemError> {
         self.remember_impl(input, Some(embedding)).await
     }
 
@@ -1508,7 +1878,7 @@ impl MemoryStore {
         &self,
         input: RememberInput,
         precomputed: Option<Vec<f32>>,
-    ) -> Result<NoteId, MemError> {
+    ) -> Result<Written<NoteId>, MemError> {
         // Validate at the boundary, before any id/seal/write work, so an oversized
         // summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
@@ -1565,6 +1935,10 @@ impl MemoryStore {
         // concurrent rotation advances `current_epoch` between here and the append.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
+        // Before the blob PUT, so a refused key never uploads ciphertext into
+        // the team's namespace.
+        self.require_newest_epoch(epoch).await?;
+        self.require_team_key(epoch).await?;
 
         // Mint this write's op id up front and key the blob under it: the object
         // key carries the op's ULID (globally unique), so two concurrent writes
@@ -1591,7 +1965,7 @@ impl MemoryStore {
         // assigned; `epoch` is the key epoch the blob was sealed under. On append
         // failure the orphaned ciphertext from Step 1 is reclaimed before the error
         // surfaces (see `append_naming_blob`).
-        let op = self
+        let Appended { op, degraded } = self
             .append_naming_blob(
                 op_id,
                 OpKind::Remember,
@@ -1634,7 +2008,10 @@ impl MemoryStore {
         // and last: the op is already durable in the log, so a failed anchor is
         // logged and retried, never failing this write.
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(id)
+        Ok(Written {
+            value: id,
+            degraded,
+        })
     }
 
     /// Replace the content of an existing note, keeping its identity.
@@ -1688,23 +2065,40 @@ impl MemoryStore {
     /// veto the *append*: rejecting only at the index while the op was already
     /// appended would let the rejected edit win last-writer-wins on the next
     /// reconverge, a silent lost update — the exact hazard this guard exists to
-    /// prevent. Because that check and the index upsert share the writer lock, two
-    /// concurrent same-base edits are serialized — the first commits, the second
-    /// observes its `cid` and conflicts — so they can no longer both pass.
+    /// prevent. Because that check and the index upsert share the writer locks, two
+    /// concurrent same-base edits are serialized: the first commits, the second
+    /// observes its `cid` and conflicts, so they can no longer both pass.
     ///
     /// A cheap advisory pre-check rejects an obviously-stale precondition before the
     /// seal/put work, so the common uncontended conflict still costs no I/O; it is
     /// an optimization, not the load-bearing gate.
     ///
-    /// Scope: the check is against THIS machine's converged index, so it catches the
-    /// realistic same-machine race. An unsynced concurrent writer on another machine
-    /// is not seen here and still converges last-writer-wins — the precondition is a
-    /// CAS within converged state, not a distributed lock.
+    /// # What is and is not guaranteed
+    ///
+    /// - Guaranteed on ONE machine, when the cross-process writer lock is wired
+    ///   and can be taken: the check runs under that lock against an index that
+    ///   holds every op this machine's processes committed (it syncs first when
+    ///   the tip file shows one it has not seen; see
+    ///   [`lock_for_edit`](Self::lock_for_edit)). So of two edits from this
+    ///   machine that read the same version, the second conflicts, whatever the
+    ///   timing. Processes of 0.7.1 or earlier do not record in this build's tip
+    ///   file and are not covered.
+    /// - Across machines, best effort: before checking, the store probes every
+    ///   author's published head and syncs when one moved, so an edit another
+    ///   machine committed (and published the head for) before this call started
+    ///   is seen. NOT guaranteed: an edit committed on another machine between
+    ///   that probe and this append, or one whose head publish failed, is not
+    ///   seen, and the two converge last-writer-wins (the losing edit stays in
+    ///   `history`). Closing that needs a create-only claim object per note
+    ///   version, written with a conditional PUT the gateway must enforce; this
+    ///   store does not use one.
     ///
     /// # Errors
     ///
     /// [`MemError::Conflict`] if `precondition` does not match the current
-    /// content; otherwise every error [`edit`](Self::edit) can return.
+    /// content; [`MemError::EditPreconditionBusy`] when other processes on this
+    /// machine kept writing through every sync attempt; otherwise every error
+    /// [`edit`](Self::edit) can return.
     pub async fn edit_with_precondition(
         &self,
         id: NoteId,
@@ -1713,6 +2107,7 @@ impl MemoryStore {
     ) -> Result<(), MemError> {
         self.edit_with_precondition_impl(id, input, precondition, None)
             .await
+            .map(|written| written.value)
     }
 
     /// Like [`edit_with_precondition`](Self::edit_with_precondition) but with a
@@ -1736,7 +2131,7 @@ impl MemoryStore {
         input: RememberInput,
         precondition: Option<Blake3Hash>,
         embedding: Vec<f32>,
-    ) -> Result<(), MemError> {
+    ) -> Result<Written<()>, MemError> {
         self.edit_with_precondition_impl(id, input, precondition, Some(embedding))
             .await
     }
@@ -1747,13 +2142,23 @@ impl MemoryStore {
         input: RememberInput,
         precondition: Option<Blake3Hash>,
         precomputed: Option<Vec<f32>>,
-    ) -> Result<(), MemError> {
+    ) -> Result<Written<()>, MemError> {
         // Validate at the boundary, before the read/seal/write work, so an
         // oversized summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
+        // A compare-and-swap against this process's index alone misses an edit
+        // another process (or machine) committed since this one last synced, and
+        // accepts the stale edit. Probe the heads and sync if any moved, so a
+        // sequential edit made elsewhere is seen. This costs one heads read, and a
+        // sync only when something changed; edits without a precondition skip it.
+        if precondition.is_some() {
+            self.refresh_now().await?;
+        }
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
-        let current = self.get(id).await?;
+        // `hydrate`, not `get`: reading the note to edit it is not a use, and a
+        // `Reinforce` op would land ahead of this `Edit`.
+        let current = self.hydrate(id).await?;
         // Grandfather-safe body/tag bounds: validate ONLY when the edit CHANGES
         // them. An edit that leaves a pre-existing (possibly pre-cap, oversized)
         // body or tag set untouched — e.g. changing only the summary — must not be
@@ -1818,6 +2223,10 @@ impl MemoryStore {
         // name the exact key the new blob was sealed with), exactly as `remember`.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
+        // Before the blob PUT, so a refused key never uploads ciphertext into
+        // the team's namespace.
+        self.require_newest_epoch(epoch).await?;
+        self.require_team_key(epoch).await?;
 
         // Key the new version under THIS edit's op id (a fresh ULID): every edit
         // lands at a distinct key, so two concurrent edits — even on two machines
@@ -1856,7 +2265,7 @@ impl MemoryStore {
             // (ASYNCBLOCK-002); a `None` embeds inline under the lock, as before.
             embedding: precomputed,
         };
-        let op = self
+        let Appended { op, degraded } = self
             .commit_edit(
                 op_id,
                 OpTarget {
@@ -1871,21 +2280,25 @@ impl MemoryStore {
             .await?;
 
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// Append the `Edit` op and upsert the index UNDER ONE writer-lock critical
     /// section, gated by an optional compare-and-swap `precondition`.
     ///
-    /// Correctness rests on the writer guard spanning the precondition check, the op
-    /// append, and the index upsert: a second concurrent edit observes the first's
-    /// committed version before it decides, so two same-base edits cannot both pass.
+    /// Correctness rests on the writer guards spanning the precondition check, the op
+    /// append, and the index upsert: a second concurrent edit on this machine
+    /// observes the first's committed version before it decides, so two same-base
+    /// edits cannot both pass.
     /// Embedding the (short) summary under the lock is the cost of that guarantee;
     /// edits are not the hot path, `recall` is. That span is why this function takes
-    /// the guard itself (for the precondition check) and hands it into
+    /// both guards itself (for the precondition check) and hands them into
     /// [`append_under_serialization`](Self::append_under_serialization) rather than
-    /// letting that helper acquire its own — the helper hands the SAME guard back on
-    /// success precisely so the index upsert below can still run under it.
+    /// letting that helper acquire its own; the helper hands the in-process guard
+    /// back on success precisely so the index upsert below can still run under it.
     ///
     /// Blob reclaim is ASYMMETRIC on purpose. A CAS reject or a FAILED append leaves
     /// the just-written blob named by no durable op — an orphan — so it is deleted.
@@ -1896,11 +2309,13 @@ impl MemoryStore {
     /// cache of the op-log). Deleting a durably-named blob would silently vanish the
     /// note on the next converge — the regression this asymmetry exists to prevent.
     ///
-    /// A failed append's OP reclaim is asymmetric the other way from the blob one:
-    /// it runs BEFORE the writer guard is dropped, not after — see the
-    /// append-failure arm inside `append_under_serialization`, and
-    /// [`OpLogStore::reclaim_failed_append`]'s own doc, for why that ordering is
-    /// load-bearing rather than a style choice.
+    /// A failed append is the third case. Under the cross-process lock the op
+    /// stays recorded as pending and the next writer completes it, so the blob
+    /// it names is kept and the error is [`MemError::WriteOutcomeUnknown`].
+    /// Without that lock the op is reclaimed BEFORE the writer guard is
+    /// dropped, and the blob after: see the append-failure arm inside
+    /// `append_under_serialization`, and [`OpLogStore::reclaim_failed_append`]'s
+    /// own doc, for why that ordering is load-bearing rather than a style choice.
     ///
     /// # Errors
     ///
@@ -1908,39 +2323,45 @@ impl MemoryStore {
     /// [`MemError::NotFound`] if the note vanished under a precondition — this
     /// returns via `?` before the CAS-mismatch arm below it runs, so unlike that
     /// arm this path does NOT reclaim the just-written blob (a pre-existing gap,
-    /// not introduced or closed by this task); whatever [`OpLogStore::append`]
-    /// reports on a failed append (op reclaimed under the guard, then blob
-    /// reclaimed after it is dropped — see `append_under_serialization`'s
-    /// append-failure arm); or whatever [`MemoryIndex::upsert`] reports AFTER a
-    /// durable append (op kept, blob kept, the local index heals on the next
-    /// `sync`).
+    /// not introduced or closed by this task); [`MemError::WriteOutcomeUnknown`]
+    /// when the append was not confirmed under the cross-process lock (op kept as
+    /// pending, blob kept); whatever [`OpLogStore::append`] reports on a failed
+    /// append without that lock (op reclaimed under the guard, then blob
+    /// reclaimed after it is dropped); or whatever [`MemoryIndex::upsert`]
+    /// reports AFTER a durable append (op kept, blob kept, the local index heals
+    /// on the next `sync`).
     async fn commit_edit(
         &self,
         op_id: Ulid,
         target: OpTarget,
         mut record: IndexRecord,
         precondition: Option<Blake3Hash>,
-    ) -> Result<Op, MemError> {
+    ) -> Result<Appended, MemError> {
         // Capture the key before `target` moves into the op below.
         let object_key = target.object_key.clone();
-        let clock = self.writer.lock().await;
-        // Authoritative CAS: under the writer guard the index reflects every edit that
-        // has already committed on this machine, so a mismatch here means a concurrent
-        // edit landed first. Veto the append (not merely the index write) — an
-        // appended-then-rejected op would still win LWW on the next reconverge. No
-        // append happened on this arm, so there is no OP to reclaim — only the
-        // just-written blob, which is now an orphan. Drop the guard BEFORE reclaiming
-        // IT: a blob delete does not need the writer lock, and holding it across an
-        // unnecessary `.await` only serializes other writers for no benefit. Contrast
-        // the append-failure arm inside `append_under_serialization`, where an op DOES
-        // exist and reclaiming it BEFORE dropping the guard is load-bearing, not a
-        // style choice — see that function's doc and
-        // `OpLogStore::reclaim_failed_append`'s doc for why.
+        let (clock, cross) = match self.lock_for_edit(precondition.is_some()).await {
+            Ok(locks) => locks,
+            Err(err) => {
+                self.reclaim_orphan_blob(&object_key).await;
+                return Err(err);
+            }
+        };
+        // Authoritative CAS: under both locks the index reflects every edit that
+        // has already committed in this process and, where the cross-process lock
+        // is held, on this machine (`lock_for_edit`), so a mismatch here means a
+        // concurrent edit landed first. Veto the append (not merely the index
+        // write): an appended-then-rejected op would still win LWW on the next
+        // reconverge. No append happened on this arm, so there is no OP to
+        // reclaim, only the just-written blob, which is now an orphan. Drop the
+        // guards BEFORE reclaiming IT: a blob delete does not need the writer
+        // locks, and holding them across an unnecessary `.await` only serializes
+        // other writers for no benefit.
         // Redaction is absorbing: a `get` that raced ahead of `redact`'s
         // `redact_at` must not append an Edit that would re-index the note.
         // Forget is the other case — it uses `remove_at` and a later edit is
         // allowed to resurrect, so this check is redact-only.
         if self.index.is_redacted(target.note_id)? {
+            drop(cross);
             drop(clock);
             self.reclaim_orphan_blob(&object_key).await;
             return Err(MemError::NotFound {
@@ -1956,6 +2377,7 @@ impl MemoryStore {
                 })?
                 .cid;
             if actual != expected {
+                drop(cross);
                 drop(clock);
                 self.reclaim_orphan_blob(&object_key).await;
                 return Err(MemError::Conflict {
@@ -1964,26 +2386,25 @@ impl MemoryStore {
                 });
             }
         }
-        // Cross-process serialization, refresh, mint, append, advance, and publish
-        // from here on are `append_under_serialization`'s body — the SAME shared
-        // helper `mint_and_append` calls, taken AFTER the veto arm above so a write
-        // that is about to be rejected never makes every other process on this
-        // machine queue behind it. The CAS itself needs no cross-process lock: the
-        // index it reads is per-process and reflects only what this process has
-        // committed or synced, which is why a concurrent writer elsewhere already
-        // converges last-writer-wins rather than being caught here. The already-held
-        // guard is passed in rather than re-acquired, so the CAS check above and this
-        // sequence stay one uninterrupted critical section.
-        let (op, clock) = match self
-            .append_under_serialization(clock, op_id, OpKind::Edit, target)
+        // Refresh, mint, append, advance, and publish from here on are
+        // `append_under_serialization`'s body, the SAME shared helper
+        // `mint_and_append` calls. The already-held guards are passed in rather
+        // than re-acquired, so the CAS check above and this sequence stay one
+        // uninterrupted critical section. An edit committed on ANOTHER machine
+        // after `edit_with_precondition_impl` probed the heads is not seen here
+        // and converges last-writer-wins.
+        let (appended, clock) = match self
+            .append_under_serialization(clock, cross, op_id, OpKind::Edit, target)
             .await
         {
             Ok(pair) => pair,
+            // The op is kept for the next writer to complete, and it names this
+            // blob, so the blob must stay.
+            Err(err @ MemError::WriteOutcomeUnknown { .. }) => return Err(err),
             Err(err) => {
-                // The append failed; `append_under_serialization` already reclaimed
-                // the op object under its guard and dropped that guard on return, so
-                // this blob reclaim runs outside it — matching the ordering every
-                // write path used before this helper existed.
+                // Nothing was appended, or `append_under_serialization` already
+                // reclaimed the op under its guard and dropped that guard on
+                // return, so this blob reclaim runs outside it.
                 self.reclaim_orphan_blob(&object_key).await;
                 return Err(err);
             }
@@ -1994,20 +2415,125 @@ impl MemoryStore {
         // `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob would
         // orphan a durable op and vanish the note. The local index simply lags until
         // the next `sync` re-reads the op and blob.
-        record.lamport = op.lamport;
+        record.lamport = appended.op.lamport;
         self.index.upsert(record)?;
         drop(clock);
-        Ok(op)
+        Ok(appended)
+    }
+
+    /// Take the in-process writer guard and the cross-process lock for an edit.
+    ///
+    /// With `check_precondition`, also make sure this process's index holds every
+    /// op this machine's processes have committed before the caller compares the
+    /// note's version: under the cross-process lock, any pending op recorded on
+    /// this machine is completed, and the tip file's revision must be the one
+    /// this process's last sync started from (see the `writer_lock` module
+    /// docs). When it is not, both locks are released, this process syncs, and
+    /// it tries again. Syncing under the locks is not possible: `sync` takes
+    /// `sync_gate` and then `writer`, and a `remember` in this process holds
+    /// `writer` while it waits for the cross-process lock.
+    ///
+    /// Without a cross-process lock (none wired, or it cannot be taken) the
+    /// check covers this process only, as it always did.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::EditPreconditionBusy`] when the revision moved on every one of
+    /// [`EDIT_SYNC_ATTEMPTS`] syncs; whatever taking the lock, completing a
+    /// pending op, or syncing reports. Nothing has been appended in any case.
+    async fn lock_for_edit(
+        &self,
+        check_precondition: bool,
+    ) -> Result<
+        (
+            tokio::sync::MutexGuard<'_, OpClock>,
+            Option<WriterLockGuard<'_>>,
+        ),
+        MemError,
+    > {
+        // One more check than syncs: the last check has no sync after it.
+        for attempt in 0..=EDIT_SYNC_ATTEMPTS {
+            let clock = self.writer.lock().await;
+            let cross = self.lock_across_processes().await?;
+            let current = match &cross {
+                Some(guard) if check_precondition => self.settle_machine_writes(guard).await?,
+                _ => true,
+            };
+            if current {
+                return Ok((clock, cross));
+            }
+
+            drop(cross);
+            drop(clock);
+            if attempt == EDIT_SYNC_ATTEMPTS {
+                break;
+            }
+            self.sync().await?;
+        }
+
+        Err(MemError::EditPreconditionBusy)
+    }
+
+    /// Whether this process's index holds every op this machine's processes
+    /// have committed, after completing any pending op the tip file records.
+    ///
+    /// A pending op is from a writer that died or whose append was not
+    /// confirmed. Completing it here (and recording it as committed, which moves
+    /// the revision) means a crash cannot leave an op this check never syncs.
+    async fn settle_machine_writes(&self, guard: &WriterLockGuard<'_>) -> Result<bool, MemError> {
+        let snapshot = guard.snapshot();
+        let mut settled = true;
+        let own_pending = snapshot
+            .authors
+            .iter()
+            .filter(|(_, entry)| entry.pending.is_some())
+            .map(|(author, _)| author);
+        let other_pending = snapshot
+            .via_other_endpoint
+            .iter()
+            .filter(|(_, others)| others.iter().any(|other| other.tip.pending.is_some()))
+            .map(|(author, _)| author);
+        let authors: HashSet<&VerifyingKey> = own_pending.chain(other_pending).collect();
+
+        for author in authors {
+            let others = snapshot
+                .via_other_endpoint
+                .get(author)
+                .into_iter()
+                .flatten()
+                .filter(|other| other.tip.pending.is_some());
+            let resolved = self
+                .resolve_entries(author, snapshot.authors.get(author), others)
+                .await?;
+            // Only another bucket's pending ops: nothing of this bucket to settle.
+            let (true, Some(tip)) = (resolved.had_pending, resolved.tip) else {
+                continue;
+            };
+            guard.record(*author, tip, &resolved.absorbed)?;
+            settled = false;
+        }
+
+        let synced = *self
+            .synced_tip_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(settled && snapshot.revision == synced)
     }
 
     /// Take this machine's cross-process write lock, if one is wired.
     ///
-    /// `None` covers both "no lock configured" (the crate default, and every
-    /// embedder that has not opted in) and "configured but unavailable" — the
-    /// second is warned inside [`WriterLock::acquire`]. Callers treat both the
-    /// same way: proceed unserialized, which is the behaviour of every release
-    /// before the lock existed. A local bookkeeping file must never fail a
-    /// user's write.
+    /// `Ok(None)` covers both "no lock configured" (the crate default, and every
+    /// embedder that has not opted in) and "configured but the lock file cannot be
+    /// opened or locked"; the second is warned inside [`WriterLock::acquire`].
+    /// Callers treat both the same way: proceed unserialized, which is the
+    /// behaviour of every release before the lock existed. Neither case means a
+    /// live peer is writing.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::WriterLockBusy`] when a peer held the lock for the whole wait.
+    /// That case fails rather than degrades: a peer IS writing, and minting beside
+    /// it forks this author's chain against the peer's op.
     ///
     /// # The one case this function itself warns about
     ///
@@ -2034,7 +2560,7 @@ impl MemoryStore {
     /// first call that finds the gap diagnoses it, and every subsequent call on
     /// the same store — while the misconfiguration persists — stays quiet
     /// rather than repeating the same WARN at write frequency.
-    async fn lock_across_processes(&self) -> Option<WriterLockGuard<'_>> {
+    async fn lock_across_processes(&self) -> Result<Option<WriterLockGuard<'_>>, MemError> {
         let Some(lock) = self.writer_lock.as_ref() else {
             if self.writer_lock_required
                 && !self
@@ -2053,10 +2579,335 @@ impl MemoryStore {
                      XDG_DATA_HOME, or HOME)"
                 );
             }
-            return None;
+            return Ok(None);
         };
 
         lock.acquire().await
+    }
+
+    /// This author's newest durable op as known on this machine, read under the
+    /// cross-process lock so no other writer here can move it meanwhile.
+    ///
+    /// - This endpoint's entry for this author, and every other endpoint's
+    ///   entry that is newer and names an op of this bucket
+    ///   ([`resolve_entries`](Self::resolve_entries)): the newest committed tip
+    ///   among them, after completing their pending ops (one PUT of the
+    ///   recorded signed op each; see the `writer_lock` module docs).
+    /// - No such entry (no file yet, an unusable one, or only entries other
+    ///   endpoints recorded for another bucket): this author's published
+    ///   head, one GET. The head lags the durable tail only when a writer died
+    ///   between its append and its head publish; with no entry there is nothing
+    ///   better to read locally.
+    /// - The legacy file shows an older build wrote on this machine since this
+    ///   build last did: whichever of the entry and the published head is newer,
+    ///   because a 0.7.1 write under this seed is in the head but not the entry.
+    ///
+    /// The result's `tip` is `None` when nothing names any op of this author.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] when a GET or a pending op's PUT fails. The write
+    /// then fails with nothing appended, and a pending op stays recorded for
+    /// the next attempt.
+    async fn machine_tip(
+        &self,
+        snapshot: &TipSnapshot,
+        known: SharedTip,
+    ) -> Result<ResolvedTip, MemError> {
+        let author = self.author_key();
+        let own = match snapshot.authors.get(&author) {
+            Some(entry) if self.own_entry_is_stale(&author, entry, known).await? => {
+                tracing::warn!(
+                    team = %self.team,
+                    lamport = entry.committed.lamport,
+                    "this machine's writer tip names an op of this author the bucket does not \
+                     hold (a team re-created under the same name, or a bucket restored from \
+                     an older copy); ignoring it and chaining to what the bucket holds"
+                );
+                None
+            }
+            own => own,
+        };
+        let floor = own.map_or(0, newest_lamport);
+        let newer_elsewhere = snapshot
+            .via_other_endpoint
+            .get(&author)
+            .into_iter()
+            .flatten()
+            .filter(|other| newest_lamport(&other.tip) > floor);
+        let mut resolved = self.resolve_entries(&author, own, newer_elsewhere).await?;
+
+        if resolved.tip.is_none() {
+            resolved.tip = self.own_head_tip(&author).await?.map(tip_without_op_id);
+        } else if snapshot.legacy_written_by_older_build {
+            tracing::warn!(
+                team = %self.team,
+                "an older hippius-mem (0.7.1 or earlier) wrote on this machine since this \
+                 version last did; restart every hippius-mem session so they all run this \
+                 version. This write checks this author's published head as well"
+            );
+            if let Some(head) = self.own_head_tip(&author).await?
+                && resolved
+                    .tip
+                    .as_ref()
+                    .is_some_and(|tip| head.lamport > tip.committed.lamport)
+            {
+                resolved.tip = Some(tip_without_op_id(head));
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// The newest committed tip that `own` (this endpoint's entry for `author`)
+    /// and the `others` that name ops of this bucket give, after completing
+    /// their pending ops.
+    ///
+    /// An entry from another endpoint is used only when this bucket holds its
+    /// pending op, or its committed op when the entry knows that op's id
+    /// ([`OpLogStore::holds_op`], one GET each). An entry that passes names this
+    /// bucket's chain and is reported in `absorbed`; one that fails is from
+    /// another bucket of the same name (or its pending op never landed and its
+    /// committed op id is unknown) and is left alone. No I/O for `own`, which
+    /// [`machine_tip`](Self::machine_tip) has already checked.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] when a GET or a pending op's PUT fails.
+    async fn resolve_entries<'s>(
+        &self,
+        author: &VerifyingKey,
+        own: Option<&'s AuthorTip>,
+        others: impl Iterator<Item = &'s OtherEndpointTip>,
+    ) -> Result<ResolvedTip, MemError> {
+        let mut usable: Vec<&AuthorTip> = own.into_iter().collect();
+        let mut absorbed = Vec::new();
+        for other in others {
+            if self.bucket_holds_entry(author, &other.tip).await? {
+                usable.push(&other.tip);
+                absorbed.push(other.endpoint.clone());
+            } else {
+                tracing::info!(
+                    team = %self.team,
+                    "a writer tip entry recorded through another endpoint names no op this \
+                     bucket holds, so that endpoint reaches another bucket of the same name (or \
+                     its op never landed); ignoring it for this write"
+                );
+            }
+        }
+
+        let mut resolved = ResolvedTip {
+            absorbed,
+            ..ResolvedTip::default()
+        };
+        for entry in usable {
+            let tip = match &entry.pending {
+                Some(op) => {
+                    resolved.had_pending = true;
+                    self.complete_pending_op(author, entry, op).await?
+                }
+                None => entry.clone(),
+            };
+            let newer = resolved
+                .tip
+                .as_ref()
+                .is_none_or(|best| tip.committed.lamport > best.committed.lamport);
+            if newer {
+                resolved.tip = Some(tip);
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// Whether this endpoint's own tip `entry` names a committed op of `author`
+    /// the bucket does not hold, so chaining to it would orphan every later op.
+    ///
+    /// Checked (one GET, [`Self::bucket_holds_entry`]) only when the entry's
+    /// committed tip is ahead of `known`, the tip this process already holds
+    /// from its own writes or its sync: a tip this process wrote or read needs
+    /// no second look, so a steady writer pays nothing. An entry at Lamport 0
+    /// (no committed op yet) and one that does not record its op's id cannot be
+    /// checked and are trusted, as before.
+    async fn own_entry_is_stale(
+        &self,
+        author: &VerifyingKey,
+        entry: &AuthorTip,
+        known: SharedTip,
+    ) -> Result<bool, MemError> {
+        let checkable = entry.committed.lamport > known.lamport && entry.committed_op_id.is_some();
+        if !checkable {
+            return Ok(false);
+        }
+        Ok(!self.bucket_holds_entry(author, entry).await?)
+    }
+
+    /// Whether this bucket holds an op `entry` names: its pending op, or its
+    /// committed op when the entry knows that op's id.
+    async fn bucket_holds_entry(
+        &self,
+        author: &VerifyingKey,
+        entry: &AuthorTip,
+    ) -> Result<bool, MemError> {
+        if let Some(op) = &entry.pending {
+            let tip = SharedTip {
+                lamport: op.lamport,
+                tip_hash: op.hash(),
+            };
+            if self
+                .oplog
+                .holds_op(&self.team, author, tip, op.op_id)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+
+        match entry.committed_op_id {
+            Some(op_id) if entry.committed.lamport > 0 => {
+                self.oplog
+                    .holds_op(&self.team, author, entry.committed, op_id)
+                    .await
+            }
+            Some(_) | None => Ok(false),
+        }
+    }
+
+    /// This author's published head as a tip, or `None` when there is none.
+    async fn own_head_tip(&self, author: &VerifyingKey) -> Result<Option<SharedTip>, MemError> {
+        let head = read_own_head(&self.blob, &self.team, author).await?;
+        Ok(head.map(|head| SharedTip {
+            lamport: head.lamport,
+            tip_hash: head.tip_hash,
+        }))
+    }
+
+    /// Make the pending `op` of `entry` durable and return it as the committed
+    /// tip, or return `entry`'s committed tip when `op` is not a valid op of
+    /// this author that extends it.
+    ///
+    /// The PUT writes the bytes the original append wrote, to the same immutable
+    /// key, so it is idempotent against that append whether it landed before,
+    /// never, or lands later. A recorded op that fails verification was not
+    /// written by an honest writer here (a corrupted or edited file); it is
+    /// warned and ignored, and the outcome of whatever that writer did is not
+    /// known, as with no file at all.
+    ///
+    /// A pending Remember or Edit whose op the bucket does not hold is dropped
+    /// too when its blob is gone, or when the op was minted longer than
+    /// [`PENDING_OP_MAX_AGE`] ago. Its blob was unreferenced while the op was
+    /// pending, so `gc` past its grace window may have reclaimed it, and an op
+    /// naming a missing blob makes the note unreadable for every reader. The
+    /// age bound closes the gap between this check and the PUT: `gc` refuses a
+    /// grace window shorter than [`MIN_GC_GRACE`], so a blob younger than
+    /// [`PENDING_OP_MAX_AGE`] is not reclaimed unless the two machines' clocks
+    /// differ by more than the difference. This costs two GETs, only on this
+    /// rare path. What it cannot close: the original op PUT still in flight and
+    /// landing after this check. That PUT was answered with an error long
+    /// enough ago for `gc` to run, so it is not waited for.
+    async fn complete_pending_op(
+        &self,
+        author: &VerifyingKey,
+        entry: &AuthorTip,
+        op: &Op,
+    ) -> Result<AuthorTip, MemError> {
+        let committed = entry.committed;
+        let extends_committed = op.author_key == *author
+            && op.prev_op_hash == committed.tip_hash
+            && op.lamport > committed.lamport
+            && op.verify_identity()
+            && op.verify_sig();
+        if !extends_committed {
+            tracing::warn!(
+                lamport = op.lamport,
+                "ignoring a pending op in the writer tip file that is not a valid op of this \
+                 author extending its committed tip"
+            );
+            return Ok(AuthorTip {
+                pending: None,
+                ..entry.clone()
+            });
+        }
+
+        if self.pending_op_must_be_dropped(author, op).await? {
+            tracing::warn!(
+                lamport = op.lamport,
+                note = %op.note_id,
+                "dropping an op a previous write on this machine did not confirm: its note \
+                 blob is no longer in the bucket (reclaimed by gc), or it is old enough that \
+                 gc may reclaim it, so that write is lost"
+            );
+            return Ok(AuthorTip {
+                pending: None,
+                ..entry.clone()
+            });
+        }
+
+        self.oplog.append(&self.team, op).await?;
+        tracing::warn!(
+            lamport = op.lamport,
+            "completed an op a previous write on this machine did not confirm (its process \
+             stopped, or the gateway did not answer); chaining to it"
+        );
+        // Another author's op (two seeds sharing one state directory) stays out
+        // of this author's batch: this author's records cover only its own ops,
+        // and the other author's own requeue anchors it.
+        if op.author_key == self.author_key() {
+            self.queue_anchor_leaf(op.hash(), op.lamport);
+        }
+
+        Ok(AuthorTip {
+            committed: SharedTip {
+                lamport: op.lamport,
+                tip_hash: op.hash(),
+            },
+            committed_op_id: Some(op.op_id),
+            pending: None,
+        })
+    }
+
+    /// Whether pending `op` names a note blob the bucket no longer holds, or
+    /// one `gc` may reclaim before the op lands, while the bucket does not hold
+    /// `op` itself (see [`Self::complete_pending_op`]).
+    async fn pending_op_must_be_dropped(
+        &self,
+        author: &VerifyingKey,
+        op: &Op,
+    ) -> Result<bool, MemError> {
+        match op.kind {
+            OpKind::Remember | OpKind::Edit => {}
+            OpKind::Forget
+            | OpKind::Redact
+            | OpKind::Link { .. }
+            | OpKind::Relate { .. }
+            | OpKind::Reinforce => return Ok(false),
+        }
+        let tip = SharedTip {
+            lamport: op.lamport,
+            tip_hash: op.hash(),
+        };
+        if self
+            .oplog
+            .holds_op(&self.team, author, tip, op.op_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        let minted = UNIX_EPOCH + Duration::from_millis(op.op_id.timestamp_ms());
+        let age = SystemTime::now()
+            .duration_since(minted)
+            .unwrap_or(Duration::ZERO);
+        if age >= self.pending_op_max_age {
+            return Ok(true);
+        }
+        // Past the local cache: a copy cached on this machine says nothing about
+        // whether the bucket still holds the blob.
+        self.blob.evict_cache(&op.object_key).await;
+        match self.blob.get(&op.object_key).await {
+            Ok(_) => Ok(false),
+            Err(MemError::NotFound { .. }) => Ok(true),
+            Err(err) => Err(err),
+        }
     }
 
     /// Publish this author's signed [`HeadPointer`] naming `tip_hash` at `lamport`
@@ -2096,7 +2947,8 @@ impl MemoryStore {
     /// still move backward there. That is not a defect in this function; nothing
     /// local can order two machines' PUTs without a compare-and-swap the object
     /// store does not offer. Nor is it ordered when no state directory resolves or
-    /// the lock times out — both warned where they happen.
+    /// the lock file cannot be taken at all, which is warned where it happens. A
+    /// peer holding the lock past its timeout fails the write before this runs.
     ///
     /// It matters here because the consequence is now reportable:
     /// [`HeadRegression`](crate::oplog::HeadRegression) fires on exactly that,
@@ -2135,7 +2987,7 @@ impl MemoryStore {
     /// price of the guarantee; there is no way to pin the tail without writing
     /// something that names it. The local mark write that follows it is a tiny
     /// synchronous file rewrite, negligible beside that PUT.
-    async fn publish_head_for_tip(&self, lamport: u64, tip_hash: Blake3Hash) {
+    async fn publish_head_for_tip(&self, lamport: u64, tip_hash: Blake3Hash) -> HeadPublished {
         let head = HeadPointer::create_signed(self.signer.as_ref(), &self.team, lamport, tip_hash);
 
         if let Err(err) = publish_head(&self.blob, &self.team, &head).await {
@@ -2149,7 +3001,7 @@ impl MemoryStore {
             );
             // Return WITHOUT recording: see the ordering argument above. A mark
             // ahead of the bucket accuses our own identity on the next audit.
-            return;
+            return HeadPublished::No;
         }
 
         // The head is now durably published, so remembering it can only ever be at
@@ -2157,6 +3009,7 @@ impl MemoryStore {
         if let Some(watermarks) = &self.head_watermarks {
             watermarks.record_published_head(&head);
         }
+        HeadPublished::Yes
     }
 
     /// Best-effort delete of an orphaned ciphertext blob — one written for an edit
@@ -2165,13 +3018,14 @@ impl MemoryStore {
     /// naming op is durable: that would vanish the note.
     ///
     /// On the VETOED arm no op was ever minted, so the blob is unreferenced by
-    /// construction. On the append-FAILURE arm that is only true once
-    /// [`OpLogStore::reclaim_failed_append`] has actually deleted the op object —
-    /// and that reclaim is itself best-effort, so a durable-but-"failed" append
-    /// whose reclaim also failed leaves an op that DOES name this blob. Deleting
-    /// it then produces a durable op pointing at a deleted body; the caller runs
-    /// the two in reference-before-referent order to shrink that window, not to
-    /// close it (see `mint_and_append`).
+    /// construction. On the append-FAILURE arm this runs only when no
+    /// cross-process lock was held (with one, the op is kept as pending and so is
+    /// its blob), and only once [`OpLogStore::reclaim_failed_append`] has tried
+    /// to delete the op object. That reclaim is best-effort, so a
+    /// durable-but-"failed" append whose reclaim also failed leaves an op that
+    /// DOES name this blob. Deleting it then produces a durable op pointing at a
+    /// deleted body; the caller runs the two in reference-before-referent order
+    /// to shrink that window, not to close it.
     async fn reclaim_orphan_blob(&self, object_key: &str) {
         if let Err(cleanup) = self.blob.delete(object_key).await {
             tracing::warn!(
@@ -2213,13 +3067,14 @@ impl MemoryStore {
     /// both callers keep the exact guard span each one needs without this
     /// function guessing which applies.
     ///
-    /// On a FAILED append the guard is dropped INSIDE this function instead —
-    /// there is no guard to hand back on the `Err` path. It drops only AFTER
-    /// the best-effort op reclaim below has run, which is the ordering that
-    /// matters (see the comment on that arm): a caller with its own
-    /// failure-arm cleanup (`commit_edit` reclaims its orphaned blob) runs it
-    /// after this function returns, i.e. already outside the guard — matching
-    /// the ordering each write path had before this extraction.
+    /// On a FAILED append the guard is dropped INSIDE this function instead:
+    /// there is no guard to hand back on the `Err` path. Without the
+    /// cross-process lock it drops only AFTER the best-effort op reclaim below
+    /// has run, which is the ordering that matters (see the comment on that
+    /// arm), and a caller with its own failure-arm cleanup (`commit_edit`
+    /// reclaims its orphaned blob) runs it after this function returns, already
+    /// outside the guard. With the lock nothing is reclaimed: the op stays
+    /// pending, and the caller keeps its blob.
     ///
     /// The guard is held across the whole sequence — build-sign,
     /// `oplog.append().await`, advance, the signed head publish on success,
@@ -2239,35 +3094,67 @@ impl MemoryStore {
     ///
     /// # Never call this from inside a `select!`/`timeout`
     ///
-    /// A dropped future between the append landing durably and the reclaim
-    /// below completing skips the reclaim entirely and silently reintroduces
-    /// the permanent self-fork it exists to prevent. No production caller
-    /// does this today — see the `writer` field's own doc comment for the two
-    /// harmless test-only `tokio::time::timeout` wrappers elsewhere in this
-    /// crate, neither of which reaches this function.
+    /// Without the cross-process lock, a dropped future between the append
+    /// landing durably and the reclaim below completing skips the reclaim and
+    /// reintroduces the self-fork it exists to prevent. (With the lock, a
+    /// dropped future is the same as a killed process: the pending record lets
+    /// the next writer complete the op.) One production caller can drop it:
+    /// the MCP server's exit flush waits for the [`reinforce_use`]
+    /// appends it started in the background, under its exit time bound or
+    /// until a signal, and drops one still running when that wait ends (a
+    /// runtime shutdown drops such a task the same way). That costs at most
+    /// the self-fork above for a session with no cross-process lock, in a
+    /// flush that already ran out of time. See the `writer` field's doc
+    /// comment for the test-only `tokio::time::timeout` wrappers, neither of
+    /// which reaches this function.
+    ///
+    /// [`reinforce_use`]: Self::reinforce_use
     ///
     /// # Errors
     ///
-    /// Whatever [`OpLogStore::append`] reports ([`MemError::Serialize`] /
-    /// [`MemError::Storage`]); on error the clock is left untouched.
+    /// [`MemError::WriterTip`] before anything is appended (the caller already
+    /// took the cross-process lock, so a busy lock fails there, not here);
+    /// [`MemError::Storage`] when completing a pending op or reading the head
+    /// fails, also before anything is appended; [`MemError::WriteOutcomeUnknown`]
+    /// when the append under the cross-process lock was not confirmed;
+    /// otherwise whatever [`OpLogStore::append`] reports
+    /// ([`MemError::Serialize`] / [`MemError::Storage`]). On error the clock is
+    /// left untouched.
     async fn append_under_serialization<'writer>(
         &self,
         mut clock: tokio::sync::MutexGuard<'writer, OpClock>,
+        cross: Option<WriterLockGuard<'_>>,
         op_id: Ulid,
         kind: OpKind,
         target: OpTarget,
-    ) -> Result<(Op, tokio::sync::MutexGuard<'writer, OpClock>), MemError> {
-        // Take the CROSS-PROCESS lock inside the in-process one, and refresh the
-        // chain tip from it before computing anything. Order matters both ways:
-        // nesting it inside keeps a single lock ordering everywhere (there is no
-        // path that takes them the other way round, so no deadlock), and the
-        // refresh must precede the `lamport`/`prev_op_hash` reads below or this
-        // mint uses the stale tip that forks the chain — the lock alone fixes
-        // nothing without it. `None` means unserialized, exactly as before.
-        let cross = self.lock_across_processes().await;
-        if let Some(guard) = &cross {
-            adopt_shared_tip(&mut clock, guard);
+    ) -> Result<(Appended, tokio::sync::MutexGuard<'writer, OpClock>), MemError> {
+        let mut degraded = Vec::new();
+        if cross.is_none() && (self.writer_lock.is_some() || self.writer_lock_required) {
+            degraded.push(Degradation::Unserialized);
         }
+        if self.key_opened_few_notes(target.key_epoch) {
+            degraded.push(Degradation::TeamKeyUnverified);
+        }
+        // The caller took the CROSS-PROCESS lock inside the in-process one
+        // (`None` means unserialized, exactly as before). Refresh the chain tip
+        // from it before computing anything: the refresh must precede the
+        // `lamport`/`prev_op_hash` reads below or this mint uses the stale tip
+        // that forks the chain; the lock alone fixes nothing without it.
+        let snapshot = cross.as_ref().map(WriterLockGuard::snapshot);
+        let resolved = match &snapshot {
+            Some(snapshot) => self.machine_tip(snapshot, clock.own_tip()).await?,
+            None => ResolvedTip::default(),
+        };
+        if let Some(tip) = &resolved.tip {
+            adopt_tip(&mut clock, tip.committed);
+        }
+        // The index stays current through this write only if the only op it
+        // adds is this one: completing a pending op of this author above makes
+        // it durable without indexing it.
+        let index_current_through = snapshot
+            .as_ref()
+            .filter(|_| !resolved.had_pending)
+            .map(|snapshot| snapshot.revision);
 
         let lamport = clock.lamport_tip.saturating_add(1);
         let op = Op::create_signed(
@@ -2284,37 +3171,65 @@ impl MemoryStore {
             },
         );
 
+        // Record the signed op as PENDING before appending it, so the next writer
+        // under this author on this machine completes it whatever happens to this
+        // process or this PUT (`machine_tip`). Without this the next writer
+        // chained to the older tip, forked against an op that landed anyway, and
+        // the fork's tie-break dropped the next writer's acknowledged op. If this
+        // local write fails, nothing has been appended yet, so the write fails
+        // rather than risk that fork.
+        let author = self.author_key();
+        let committed = SharedTip {
+            lamport: clock.my_last_lamport,
+            tip_hash: clock.my_last_hash,
+        };
+        // The op id is known when the clock's tip is the one the tip file
+        // named; it lets a session through another endpoint check this entry.
+        let committed_op_id = recorded_committed_op_id(resolved.tip.as_ref(), committed);
+        if let Some(guard) = &cross {
+            guard.record(
+                author,
+                AuthorTip {
+                    committed,
+                    committed_op_id,
+                    pending: Some(op.clone()),
+                },
+                &resolved.absorbed,
+            )?;
+        }
+
         // Append BEFORE advancing: if this fails, the early return leaves
         // `lamport_tip`/`my_last_hash` still pointing at the previous durable op,
-        // so the chain stays intact and the next write re-mints against the same
-        // `prev_op_hash` rather than chaining a durable op to a phantom. If the
-        // "failed" append actually landed (the PUT committed, the response was
-        // lost), best-effort reclaim its op object BEFORE returning — WHILE STILL
-        // HOLDING THE GUARD. `clock` is a parameter owned by this function, so
-        // returning `Err` drops it right here, after the reclaim — do NOT
-        // restructure this to drop the guard first (e.g. to mirror the
-        // blob-reclaim style a caller runs after this returns). Releasing it
-        // first would let a concurrent `read_and_filter` (the `sync`/
-        // `refresh_if_stale` path, same `self.writer` lock) adopt this
-        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
-        // delete lands — it is a valid, signed, genesis-reachable, newest op of
-        // this author, exactly what that adoption logic picks — permanently
-        // forking every later write of this author rather than the bounded
-        // one-op fork this reclaim exists to prevent; see
-        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
-        // is also the reference to a blob a caller may reclaim second once this
-        // returns `Err` (`commit_edit`'s `reclaim_orphan_blob`, or
-        // `append_naming_blob` for `mint_and_append` callers).
-        // Reference-before-referent SHRINKS the window in which a durable op
-        // points at a deleted body; it does NOT close it. Both deletes are
-        // best-effort and this one swallows its own error, so an op delete that
-        // fails followed by a blob delete that succeeds leaves exactly that
-        // state — and those two outcomes are most likely together, on the same
-        // degraded gateway that produced the durable-but-"failed" append.
-        // Nothing local can close that: it would take a transaction across two
-        // objects the store does not offer.
+        // so this process never chains a durable op to one that may not exist.
+        //
+        // A failed append may still have landed (the PUT committed and the
+        // response was lost, or a timed-out attempt completes later). With the
+        // cross-process lock held, the op is recorded as pending, so it is KEPT:
+        // the next writer here completes it and chains to it, which no late PUT
+        // can fork, and the caller hears the outcome is unknown and keeps the
+        // blob the op names. Reclaiming it instead loses to a PUT that lands
+        // after the delete, and the next write then forks against it.
+        //
+        // Without the lock there is no pending record, so the best this can do
+        // is the old reclaim: delete the op object, and record its hash in
+        // `clock.reclaimed`, both while holding the guard. A concurrent
+        // `read_and_filter` (the `sync`/`refresh_if_stale` path) reads the op-log
+        // WITHOUT the guard, so its read can still list the op after the delete;
+        // it installs its view under the guard, and the recorded hash keeps it
+        // from adopting the deleted op as `my_last_hash`, which would orphan every
+        // later write of this author. See `OpLogStore::reclaim_failed_append`.
+        // The caller then reclaims the blob second (reference before referent),
+        // which shrinks, and does not close, the window in which a durable op
+        // names a deleted body.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
+            if cross.is_some() {
+                return Err(MemError::WriteOutcomeUnknown {
+                    note_id: op.note_id.to_string(),
+                    source: Box::new(err),
+                });
+            }
             self.oplog.reclaim_failed_append(&self.team, &op).await;
+            clock.reclaimed.insert(op.hash());
             return Err(err);
         }
 
@@ -2322,26 +3237,61 @@ impl MemoryStore {
         clock.my_last_lamport = lamport;
         clock.my_last_hash = op.hash();
 
-        // Record the machine-shared tip as soon as the op is DURABLE, and before
-        // the head publish below, because the next process must chain to the op
-        // rather than to whatever the best-effort head PUT managed to record. A
-        // failure here is warned and swallowed inside `record_tip`: it leaves the
-        // next process minting from a stale tip, which is where every release
-        // before this one already sat.
+        // Record the op as committed as soon as it is DURABLE, and before the head
+        // publish below, because the next process must chain to the op rather
+        // than to whatever the best-effort head PUT managed to record. A failure
+        // here is warned and leaves the pending entry above in place, and the next
+        // writer completes the op through it (an idempotent PUT), so the chain
+        // stays intact.
         if let Some(guard) = &cross {
-            guard.record_tip(SharedTip {
-                lamport,
-                tip_hash: clock.my_last_hash,
-            });
+            let committed = AuthorTip {
+                committed: SharedTip {
+                    lamport,
+                    tip_hash: clock.my_last_hash,
+                },
+                committed_op_id: Some(op.op_id),
+                pending: None,
+            };
+            match guard.record(author, committed, &[]) {
+                Ok(revision) => {
+                    if let Some(before) = index_current_through {
+                        self.note_own_tip_record(before, revision);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not record the durable op in the writer tip file; the next \
+                         writer on this machine completes it from its pending entry instead"
+                    );
+                    degraded.push(Degradation::TipNotRecorded);
+                }
+            }
         }
 
         // Publish the signed head naming the new tip, STILL UNDER THE GUARD — see
         // `publish_head_for_tip`'s doc for why that ordering keeps the published
         // head monotonic on this machine, and why a failure here is deliberately
         // swallowed.
-        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
+        if self.publish_head_for_tip(lamport, clock.my_last_hash).await == HeadPublished::No {
+            degraded.push(Degradation::HeadNotPublished);
+        }
 
-        Ok((op, clock))
+        Ok((Appended { op, degraded }, clock))
+    }
+
+    /// Move `synced_tip_revision` from `before` to `after` when the index was
+    /// current at `before` and this process's own write, which it indexes, is
+    /// the only op recorded in between. The caller does not call this when the
+    /// write also completed a pending op, which is durable but not indexed.
+    fn note_own_tip_record(&self, before: Option<Ulid>, after: Ulid) {
+        let mut synced = self
+            .synced_tip_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *synced == before {
+            *synced = Some(after);
+        }
     }
 
     /// Mint a signed op (`op_id`/`kind`/`target`), durably append it, and only
@@ -2391,7 +3341,7 @@ impl MemoryStore {
     /// mutation, so do not "simplify" the refresh away.
     ///
     /// - Two or more processes on ONE machine, any backend: CLOSED, whenever a
-    ///   state directory resolves and the lock is taken within its timeout. This is
+    ///   state directory resolves and the lock file can be locked. This is
     ///   the routine case — the user-global MCP registration above produces it — and
     ///   it now covers the one-shots too, including `import`, because the lock lives
     ///   in the write path rather than at process boot. `storage = "local"` keeps
@@ -2402,9 +3352,12 @@ impl MemoryStore {
     ///   sees the other machine, and an object store offering no compare-and-swap
     ///   cannot arbitrate. The console sub-key onboarding is the answer: it gives
     ///   each machine a distinct author key, so there is no shared chain to fork.
-    /// - No resolvable state directory, or a peer holding the lock past its
-    ///   timeout: OPEN, and warned at the point it happens. Both degrade to the
+    /// - No resolvable state directory, or a lock file that cannot be opened or
+    ///   locked: OPEN, and warned at the point it happens. Both degrade to the
     ///   pre-lock behaviour rather than failing the write.
+    /// - A peer holding the lock past its timeout: the write fails with
+    ///   [`MemError::WriterLockBusy`] before anything is appended, because minting
+    ///   beside a live writer is exactly the fork this lock exists to prevent.
     ///
     /// So the honest position is: routine, now serialized per machine, and still not
     /// free across machines. What an operator can do about the residue is (a) treat
@@ -2425,35 +3378,39 @@ impl MemoryStore {
     /// [`HeadRegression`](crate::oplog::HeadRegression). That evidence self-clears;
     /// the self-fork described here does not, so the two must not be conflated.
     ///
-    /// The reclaim's cross-process amplification is NARROWED but not closed. Holding
-    /// the cross-process lock across the reclaim stops another process from MINTING
-    /// while the delete is in flight, but `sync`'s `read_and_filter` takes only this
-    /// process's `writer` lock, so it can still adopt this process's
-    /// durable-but-"failed" op by scanning the log and then chain to it. This
-    /// process's reclaim then deletes an op that process now depends on, orphaning
-    /// its whole subsequent tail rather than the single op the pre-reclaim fork
-    /// would have cost. Putting the read path under the cross-process lock would
-    /// make every sync queue behind every other process's writes, which is why it
-    /// was not done.
+    /// A failed append under the cross-process lock is kept, not reclaimed: the
+    /// op is recorded as pending, the next writer here completes it, and the
+    /// caller hears [`MemError::WriteOutcomeUnknown`]. So no process can adopt an
+    /// op that is later deleted. Without that lock the op is still reclaimed,
+    /// and there `sync`'s `read_and_filter` in ANOTHER process can adopt the
+    /// durable-but-"failed" op before the delete lands and chain to it, orphaning
+    /// its subsequent tail. That case is the degraded, warned one.
     ///
     /// # Errors
     ///
-    /// Whatever [`OpLogStore::append`] reports ([`MemError::Serialize`] /
-    /// [`MemError::Storage`]); on error the clock is left untouched.
+    /// [`MemError::TeamKeyMismatch`] before anything is written, and every error
+    /// [`append_under_serialization`](Self::append_under_serialization) lists.
+    /// On error the clock is left untouched.
     async fn mint_and_append(
         &self,
         op_id: Ulid,
         kind: OpKind,
         target: OpTarget,
-    ) -> Result<Op, MemError> {
+    ) -> Result<Appended, MemError> {
+        // Before the writer lock, so the one GET this can cost on a process's first
+        // write does not hold up other writers.
+        self.require_team_key(target.key_epoch).await?;
         let clock = self.writer.lock().await;
+        // Inside the in-process lock, as everywhere: one lock order, so no
+        // deadlock.
+        let cross = self.lock_across_processes().await?;
 
-        let (op, clock) = self
-            .append_under_serialization(clock, op_id, kind, target)
+        let (appended, clock) = self
+            .append_under_serialization(clock, cross, op_id, kind, target)
             .await?;
         drop(clock);
 
-        Ok(op)
+        Ok(appended)
     }
 
     /// Append the op naming an already-written blob, reclaiming the orphaned blob
@@ -2472,11 +3429,14 @@ impl MemoryStore {
         op_id: Ulid,
         kind: OpKind,
         target: OpTarget,
-    ) -> Result<Op, MemError> {
+    ) -> Result<Appended, MemError> {
         // Capture the key before `target` moves into `mint_and_append`.
         let object_key = target.object_key.clone();
         match self.mint_and_append(op_id, kind, target).await {
-            Ok(op) => Ok(op),
+            Ok(appended) => Ok(appended),
+            // The op is kept for the next writer to complete, and it names this
+            // blob, so the blob must stay.
+            Err(err @ MemError::WriteOutcomeUnknown { .. }) => Err(err),
             Err(err) => {
                 if let Err(cleanup) = self.blob.delete(&object_key).await {
                     tracing::warn!(
@@ -2492,6 +3452,405 @@ impl MemoryStore {
                 Err(err)
             }
         }
+    }
+
+    /// How many notes the index currently leaves out because their ciphertext
+    /// failed its integrity check or did not decrypt under this machine's key.
+    /// Reads a counter only: no I/O.
+    pub fn undecodable_notes(&self) -> usize {
+        self.undecodable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether the verdict held for `epoch` is "no published check, and the
+    /// key opened fewer than half of the notes tried". No I/O.
+    fn key_opened_few_notes(&self, epoch: u64) -> bool {
+        self.key_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&epoch)
+            .is_some_and(|held| {
+                held.found
+                    == TeamKeyCheck::Unpublished {
+                        probe: Some(KeyProbe::FailsToOpen),
+                    }
+            })
+    }
+
+    /// Compare this machine's key for the current epoch against the team's
+    /// published key check. With none published, also try the key on the
+    /// epoch's oldest notes and report what that showed. Never publishes and
+    /// never refuses on the probe: see the `keycheck` module docs.
+    ///
+    /// One GET; with no check, also an op-log read and up to
+    /// [`KEY_PROBE_NOTES`] note GETs. The verdict is kept for the write path.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::KeyUnavailable`] when this machine has no key for the epoch;
+    /// [`MemError::Storage`] when a read fails.
+    pub async fn check_team_key(&self) -> Result<TeamKeyCheck, MemError> {
+        let epoch = self.current_epoch();
+        let key = self.key_for_epoch(epoch)?;
+        let found = match self.published_key_check(epoch, &key).await? {
+            Some(found) => found,
+            None => TeamKeyCheck::Unpublished {
+                probe: Some(self.probe_epoch_key(epoch, &key).await?),
+            },
+        };
+        self.remember_key_check(epoch, found);
+        Ok(found)
+    }
+
+    /// Publish this machine's key check for `epoch`: a write, then a read back
+    /// that decides the outcome. Before writing, the key is tried on the
+    /// epoch's oldest notes ([`probe_team_key`](Self::probe_team_key)), and
+    /// nothing is written when it fails to open most of them
+    /// ([`KeyCheckPublished::KeyFailsOnNotes`]). An epoch with no notes, or
+    /// one whose notes cannot be tried, is published: there is no evidence
+    /// against the key, and refusing would leave a new team or epoch with no
+    /// way to publish. With [`PublishKeyCheck::IfAbsent`] the write is
+    /// create-only where the gateway enforces that (probed once per process),
+    /// and a plain PUT after the existence check where it does not or cannot be
+    /// measured, which the outcome says. With [`PublishKeyCheck::Replace`] it is
+    /// a plain PUT that overwrites another key's check or an unusable object,
+    /// so it works on a gateway without conditional writes.
+    ///
+    /// Costs one GET before and one after the write, the key probe's op-log
+    /// read and up to [`KEY_PROBE_NOTES`] note GETs, plus, the first time in a
+    /// process for [`PublishKeyCheck::IfAbsent`], the create-only probe (two
+    /// PUTs and a DELETE). The key probe is skipped when the published check
+    /// is already this key's or the call is refused before writing.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::KeyUnavailable`] when this machine has no key for `epoch`;
+    /// [`MemError::Storage`] or [`MemError::Serialize`] when a read or the write
+    /// fails.
+    pub async fn publish_team_key_check(
+        &self,
+        epoch: u64,
+        mode: PublishKeyCheck,
+    ) -> Result<KeyCheckPublished, MemError> {
+        let key = self.key_for_epoch(epoch)?;
+        let ours = key_check_value(&key, &self.team, epoch);
+        let blob = self.blob.as_ref();
+
+        match read_key_check(blob, &self.team, epoch).await? {
+            PublishedCheck::Value(found) if found == ours => {
+                self.remember_key_check(epoch, TeamKeyCheck::Matches);
+                return Ok(KeyCheckPublished::AlreadyPublished);
+            }
+            PublishedCheck::Value(_) | PublishedCheck::Unusable
+                if mode == PublishKeyCheck::IfAbsent =>
+            {
+                return Ok(KeyCheckPublished::Refused);
+            }
+            PublishedCheck::Value(_) | PublishedCheck::Unusable | PublishedCheck::Absent => {}
+        }
+
+        // Deliberately no override: a key that fails on most of an epoch's
+        // notes is the wrong key for whoever wrote them, and publishing it locks
+        // them out. If those notes were themselves sealed under a wrong key,
+        // `rotate` moves the team to a new epoch, whose check is published with
+        // no notes to probe.
+        if self.probe_epoch_key(epoch, &key).await? == KeyProbe::FailsToOpen {
+            return Ok(KeyCheckPublished::KeyFailsOnNotes);
+        }
+
+        let create_only = match mode {
+            PublishKeyCheck::IfAbsent => Some(self.create_only().await),
+            PublishKeyCheck::Replace => None,
+        };
+        // A gateway that ignores the condition makes a create-only PUT a plain
+        // one, and one that rejects the header would refuse it, so a plain PUT
+        // is used wherever the condition is not known to hold.
+        let write = match create_only {
+            Some(CreateOnly::Enforced) => WriteMode::CreateOnly,
+            Some(CreateOnly::NotEnforced) | None => WriteMode::Replace,
+        };
+        write_key_check(blob, &self.team, epoch, &key, write).await?;
+
+        // Read back whatever the write did: a lost race, or a retried request
+        // that found its own first attempt, both show here.
+        if read_key_check(blob, &self.team, epoch).await? != PublishedCheck::Value(ours) {
+            return Ok(KeyCheckPublished::Refused);
+        }
+        self.remember_key_check(epoch, TeamKeyCheck::Matches);
+        Ok(KeyCheckPublished::Published { create_only })
+    }
+
+    /// Try this machine's key for `epoch` on that epoch's [`KEY_PROBE_NOTES`]
+    /// oldest notes, and report the majority outcome, whatever
+    /// the team has published. For `doctor`, which reports it beside the
+    /// published check. Keeps no verdict, so the write path is unaffected.
+    ///
+    /// An op-log read and up to [`KEY_PROBE_NOTES`] note GETs.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::KeyUnavailable`] when this machine has no key for `epoch`;
+    /// [`MemError::Storage`] when the op-log read fails.
+    pub async fn probe_team_key(&self, epoch: u64) -> Result<KeyProbe, MemError> {
+        let key = self.key_for_epoch(epoch)?;
+        self.probe_epoch_key(epoch, &key).await
+    }
+
+    /// A store that drops every unconfirmed op older than `max_age` instead of
+    /// completing it, so a test of the age bound does not wait
+    /// [`PENDING_OP_MAX_AGE`].
+    #[cfg(test)]
+    pub(crate) fn with_pending_op_max_age(mut self, max_age: Duration) -> Self {
+        self.pending_op_max_age = max_age;
+        self
+    }
+
+    /// A store that re-reads its key verdict on every write, so a test of the
+    /// re-read does not wait [`KEY_CHECK_RECHECK`].
+    #[cfg(test)]
+    pub(crate) fn with_key_check_recheck(mut self, recheck: Duration) -> Self {
+        self.key_check_recheck = recheck;
+        self
+    }
+
+    /// The epochs this machine holds a key for, oldest first.
+    #[must_use]
+    pub fn held_epochs(&self) -> Vec<u64> {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Whether the blob store enforces create-only writes, probed once per
+    /// process. A probe that fails (a gateway that rejects the header, or one
+    /// that is down) is warned and reads as [`CreateOnly::NotEnforced`] for this
+    /// call, and is not kept, so the next call probes again.
+    async fn create_only(&self) -> CreateOnly {
+        let known = *self
+            .create_only
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(known) = known {
+            return known;
+        }
+
+        match probe_create_only(self.blob.as_ref(), &self.team).await {
+            Ok(measured) => {
+                *self
+                    .create_only
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(measured);
+                measured
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not tell whether the storage gateway enforces create-only writes; \
+                     publishing the team-key check without relying on it"
+                );
+                CreateOnly::NotEnforced
+            }
+        }
+    }
+
+    fn remember_key_check(&self, epoch: u64, found: TeamKeyCheck) {
+        self.key_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                epoch,
+                KnownKeyCheck {
+                    found,
+                    at: Instant::now(),
+                },
+            );
+    }
+
+    /// The verdict the published key check alone gives for `epoch`, or `None`
+    /// when no usable one is published. One GET, no op-log read.
+    async fn published_key_check(
+        &self,
+        epoch: u64,
+        key: &SecretKey,
+    ) -> Result<Option<TeamKeyCheck>, MemError> {
+        Ok(
+            match read_key_check(self.blob.as_ref(), &self.team, epoch).await? {
+                PublishedCheck::Value(check)
+                    if check == key_check_value(key, &self.team, epoch) =>
+                {
+                    Some(TeamKeyCheck::Matches)
+                }
+                PublishedCheck::Value(_) => Some(TeamKeyCheck::Mismatch),
+                PublishedCheck::Absent | PublishedCheck::Unusable => None,
+            },
+        )
+    }
+
+    /// Try `key` on the [`KEY_PROBE_NOTES`] oldest notes sealed under `epoch`,
+    /// and report the majority outcome.
+    ///
+    /// Only an AEAD failure on a blob whose content hash matches its signed op
+    /// counts against the key: a missing or altered blob says nothing about it,
+    /// and counts for neither side. It still uses one of the attempts, so a
+    /// bucket that lost its oldest blobs costs at most the bound in GETs.
+    async fn probe_epoch_key(&self, epoch: u64, key: &SecretKey) -> Result<KeyProbe, MemError> {
+        let (members_view, _raw_lamport_tip) = self.read_and_filter().await?;
+        // `converge` keys by note id, a ULID, so iteration runs oldest first.
+        let converged = converge(&members_view);
+        let pointers: Vec<&NotePointer> = converged
+            .values()
+            .filter_map(|state| state.pointer.as_ref())
+            .filter(|pointer| pointer.key_epoch == epoch)
+            .collect();
+        if pointers.is_empty() {
+            return Ok(KeyProbe::NoNotes);
+        }
+
+        let (mut opened, mut failed) = (0_usize, 0_usize);
+        for pointer in pointers.into_iter().take(KEY_PROBE_NOTES) {
+            let Ok(ciphertext) = self.blob.get(&pointer.object_key).await else {
+                continue;
+            };
+            if content_hash(&ciphertext) != pointer.cid {
+                continue;
+            }
+            if open(key, &ciphertext, pointer.object_key.as_bytes()).is_ok() {
+                opened += 1;
+            } else {
+                failed += 1;
+            }
+        }
+
+        Ok(match opened.cmp(&failed) {
+            std::cmp::Ordering::Greater => KeyProbe::Opens,
+            std::cmp::Ordering::Less => KeyProbe::FailsToOpen,
+            std::cmp::Ordering::Equal => KeyProbe::Inconclusive,
+        })
+    }
+
+    /// Refuse to seal a note under `epoch` when the founder provisioned a
+    /// newer epoch, which a removed member holds no key for.
+    ///
+    /// Only note bodies are fenced: an op about an older note carries nothing a
+    /// holder of the older key lacks. A checkpoint of an index that lacks the
+    /// newer epoch's notes is not written at all (see
+    /// [`maybe_persist_checkpoint`](Self::maybe_persist_checkpoint)). Uses the answer this process holds,
+    /// looked up again (one LIST of `_keys/`, see
+    /// [`newest_provisioned_epoch`](Self::newest_provisioned_epoch)) when older
+    /// than [`KEY_CHECK_RECHECK`]. A lookup that fails keeps the answer held;
+    /// only a first lookup that fails fails the write.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::EpochSuperseded`] when a newer epoch exists, or whatever a
+    /// first lookup reports.
+    async fn require_newest_epoch(&self, epoch: u64) -> Result<(), MemError> {
+        match self.newer_provisioned_epoch(epoch).await? {
+            Some(newest) => Err(MemError::EpochSuperseded {
+                team: self.team.clone(),
+                epoch,
+                newest,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuse a write sealed under `epoch` when the team's published key check
+    /// is another key's.
+    ///
+    /// Consults only what is cheap: the verdict this process holds, re-read
+    /// from the published check (one GET) when it is older than
+    /// [`KEY_CHECK_RECHECK`]. It never reads the op-log, because a write must
+    /// not wait on a full read. A re-read that fails keeps the verdict held;
+    /// only a first read that fails fails the write.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::TeamKeyMismatch`] on a mismatch; [`MemError::KeyUnavailable`] or
+    /// [`MemError::Storage`] when the key, or a first read of the check, fails.
+    async fn require_team_key(&self, epoch: u64) -> Result<(), MemError> {
+        let held = self
+            .key_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&epoch)
+            .copied();
+        let found = match held {
+            Some(held) if held.at.elapsed() < self.key_check_recheck => held.found,
+            _ => self.reread_key_check(epoch, held).await?,
+        };
+
+        match found {
+            TeamKeyCheck::Mismatch => Err(MemError::TeamKeyMismatch {
+                team: self.team.clone(),
+                epoch,
+                object_key: key_check_key(&self.team, epoch),
+            }),
+            TeamKeyCheck::Matches | TeamKeyCheck::Unpublished { .. } => Ok(()),
+        }
+    }
+
+    /// The newest epoch above `epoch` the founder provisioned, from the answer
+    /// this process holds when it is fresh, else looked up again and kept.
+    async fn newer_provisioned_epoch(&self, epoch: u64) -> Result<Option<u64>, MemError> {
+        let held = self
+            .newest_epoch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .filter(|held| held.sealing == epoch);
+        if let Some(held) = held
+            && held.at.elapsed() < self.key_check_recheck
+        {
+            return Ok(held.newer);
+        }
+        let newer = match (self.newest_provisioned_epoch(epoch).await, held) {
+            (Ok(newer), _) => newer,
+            (Err(err), Some(held)) => {
+                tracing::warn!(epoch, error = %err, "could not look for a newer team-key epoch; keeping the last answer");
+                held.newer
+            }
+            (Err(err), None) => return Err(err),
+        };
+        *self
+            .newest_epoch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(KnownNewestEpoch {
+            sealing: epoch,
+            newer,
+            at: Instant::now(),
+        });
+        Ok(newer)
+    }
+
+    /// Read `epoch`'s published check again and keep the result. With none
+    /// published, the probe result `held` carried is kept with it.
+    async fn reread_key_check(
+        &self,
+        epoch: u64,
+        held: Option<KnownKeyCheck>,
+    ) -> Result<TeamKeyCheck, MemError> {
+        let key = self.key_for_epoch(epoch)?;
+        let found = match (self.published_key_check(epoch, &key).await, held) {
+            (Ok(Some(found)), _) => found,
+            (Ok(None), held) => TeamKeyCheck::Unpublished {
+                probe: match held.map(|held| held.found) {
+                    Some(TeamKeyCheck::Unpublished { probe }) => probe,
+                    _ => None,
+                },
+            },
+            (Err(err), Some(held)) => {
+                tracing::warn!(epoch, error = %err, "could not re-read the team-key check; keeping the last verdict");
+                held.found
+            }
+            (Err(err), None) => return Err(err),
+        };
+        self.remember_key_check(epoch, found);
+        Ok(found)
     }
 
     /// Retrieve ranked pointers for `input`: every strong match and at most
@@ -2594,26 +3953,32 @@ impl MemoryStore {
         &self.team
     }
 
-    /// The highest team-key epoch this store's bucket has actually published a
-    /// wrapped key at (`0` when none), against THIS store's own connection and
-    /// team — delegates to [`crate::highest_published_epoch`] over the private
-    /// `self.blob`/`self.team` rather than exposing either.
+    /// The newest epoch above `floor` at which the team's founder provisioned a
+    /// key, or `None` when there is none.
     ///
-    /// A caller with only an `&MemoryStore` (no separate blob handle in scope)
-    /// uses this to compare against a configured `max_epoch` bootstrap ceiling
-    /// — see [`MemoryStore::bootstrap_epoch_keys`]'s docs on why the on-bucket
-    /// epoch discovery this performs is not otherwise available. Deliberately
-    /// NOT a raw blob accessor: [`BlobStore`] carries unrestricted
-    /// put/get/delete/list over unencrypted-at-this-layer bytes, so handing one
-    /// out would let any holder of `&MemoryStore` (including the MCP server's
-    /// long-lived `Arc<MemoryStore>`) bypass the encryption boundary this crate
-    /// otherwise never lets a note's plaintext or an arbitrary write cross.
+    /// An epoch counts only when one of its wraps verifies under a provisioner
+    /// the current manifest authorizes (see [`crate::fetch_team_key`]), so an
+    /// object a bucket writer plants under `_keys/` moves nothing. One LIST of
+    /// the team's `_keys/` prefix; only when it names an epoch above `floor`,
+    /// a manifest read and one GET per candidate wrap, newest first, until one
+    /// counts.
     ///
     /// # Errors
     ///
-    /// Returns [`MemError::Storage`] if the backend listing fails.
-    pub async fn highest_published_epoch(&self) -> Result<u64, MemError> {
-        highest_published_epoch(self.blob.as_ref(), &self.team).await
+    /// Whatever the listing, the manifest read or a wrap GET reports.
+    pub async fn newest_provisioned_epoch(&self, floor: u64) -> Result<Option<u64>, MemError> {
+        let candidates = wrap_keys_above(self.blob.as_ref(), &self.team, floor).await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let manifest = self.current_manifest().await?;
+        first_provisioned_epoch(
+            self.blob.as_ref(),
+            candidates,
+            manifest.as_ref(),
+            self.founder.as_ref(),
+        )
+        .await
     }
 
     /// Whether recall runs the semantic (dense-vector) leg, not keyword-only.
@@ -2628,25 +3993,59 @@ impl MemoryStore {
         self.index.is_semantic()
     }
 
+    /// [`hydrate`](Self::hydrate) the note behind `id`, then count the read as a
+    /// use of a recently recalled note ([`reinforce_use`](Self::reinforce_use)).
+    ///
+    /// The reinforcement can append a signed op: it takes the writer lock and
+    /// waits for the PUTs. A read-only session, or one that must not wait for a
+    /// write, calls `hydrate` and decides on reinforcement itself.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`hydrate`](Self::hydrate) reports; reinforcement never fails
+    /// the read.
+    pub async fn get(&self, id: NoteId) -> Result<Note, MemError> {
+        let note = self.hydrate(id).await?;
+        self.reinforce_use(id).await;
+        Ok(note)
+    }
+
     /// Hydrate the full [`Note`] behind `id`: locate, fetch, verify, decrypt.
+    ///
+    /// Writes nothing: no op, no lock, unlike [`get`](Self::get).
     ///
     /// # Errors
     ///
     /// Returns [`MemError::NotFound`] if `id` is not indexed,
     /// [`MemError::KeyUnavailable`] if the note's key epoch is not in this store's
     /// key-ring (this member was never provisioned that epoch),
-    /// [`MemError::Storage`] if the fetched ciphertext does not match the indexed
-    /// content hash, [`MemError::Crypto`] if decryption or UTF-8 decoding fails, or
-    /// [`MemError::Serialize`] if the decrypted JSON is not a valid note.
+    /// [`MemError::Integrity`] if the fetched ciphertext does not match the
+    /// indexed content hash, or the last sync left the note out because its
+    /// ciphertext failed a check, [`MemError::Crypto`] if decryption or UTF-8
+    /// decoding fails, or [`MemError::Serialize`] if the decrypted JSON is not a
+    /// valid note.
     ///
     /// Unlike [`MemoryStore::sync`], which *skips* a note whose epoch key is absent
     /// (a member missing one old epoch must still index the rest), `get` *errors*:
     /// the caller asked for this specific note and cannot be served it.
-    pub async fn get(&self, id: NoteId) -> Result<Note, MemError> {
-        let located = self
-            .index
-            .locate(id)?
-            .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
+    pub async fn hydrate(&self, id: NoteId) -> Result<Note, MemError> {
+        let Some(located) = self.index.locate(id)? else {
+            // A note the last sync left out because its ciphertext was bad exists;
+            // calling it "not found" would invite re-creating it.
+            let undecodable = self
+                .undecodable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&id)
+                .copied();
+            return Err(match undecodable {
+                Some(reason) => MemError::Integrity {
+                    id: id.to_string(),
+                    reason,
+                },
+                None => MemError::NotFound { id: id.to_string() },
+            });
+        };
         // Select the note's epoch key before fetching: a missing epoch is a clear,
         // immediate error and there is no point pulling the blob we cannot open.
         let key = self.key_for_epoch(located.key_epoch)?;
@@ -2659,9 +4058,10 @@ impl MemoryStore {
         // failure — or, worse, a successful decrypt of a substituted ciphertext
         // under the shared team key.
         if content_hash(&ciphertext) != located.cid {
-            return Err(MemError::Storage(
-                "ciphertext hash does not match the indexed content hash".to_string(),
-            ));
+            return Err(MemError::Integrity {
+                id: id.to_string(),
+                reason: IntegrityFailure::HashMismatch,
+            });
         }
 
         // The object key is passed as AEAD associated data: if these bytes were
@@ -2677,11 +4077,6 @@ impl MemoryStore {
         if !note_matches_object(&note, id, &self.team, &located.object_key) {
             return Err(MemError::Crypto);
         }
-        // Feature 4: a `get` of a recently-recalled note is a use signal; reinforce
-        // it, best-effort. Deliberately AFTER the note is successfully hydrated (a
-        // failed get is not a use) and never propagates an error — reinforcement
-        // must not turn a good read into a failure.
-        self.maybe_reinforce(id).await;
         Ok(note)
     }
 
@@ -2696,7 +4091,10 @@ impl MemoryStore {
     /// reason to fail the caller's `get`. The op is idempotent under convergence
     /// (a duplicate folds into the same distinct-author set), so a dropped append
     /// self-heals on the next qualifying use.
-    async fn maybe_reinforce(&self, id: NoteId) {
+    ///
+    /// Call it after a successful [`hydrate`](Self::hydrate) of `id`: a failed
+    /// read is not a use.
+    pub async fn reinforce_use(&self, id: NoteId) {
         if self.reinforcement_would_change_nothing(id) || !self.reinforce_qualifies(id) {
             return;
         }
@@ -2748,7 +4146,7 @@ impl MemoryStore {
     /// if so record it so the rate limit holds. Returns `true` at most once per note
     /// per [`REINFORCE_RATE_LIMIT`], and only when a recent recall surfaced `id`.
     ///
-    /// The guard is taken and DROPPED here, before [`maybe_reinforce`] awaits the
+    /// The guard is taken and DROPPED here, before [`reinforce_use`](Self::reinforce_use) awaits the
     /// append, so the tracker lock never spans an `.await`.
     fn reinforce_qualifies(&self, id: NoteId) -> bool {
         let now = Instant::now();
@@ -2789,7 +4187,7 @@ impl MemoryStore {
             .locate(id)?
             .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
 
-        let op = self
+        let Appended { op, .. } = self
             .mint_and_append(
                 Ulid::new(),
                 OpKind::Reinforce,
@@ -2850,7 +4248,7 @@ impl MemoryStore {
     /// [`MemError::NotFound`] if `note_id` is not indexed; [`MemError::Serialize`]
     /// / [`MemError::Storage`] if the op cannot be encoded or appended; or whatever
     /// the index reports on remove.
-    pub async fn forget(&self, note_id: NoteId) -> Result<(), MemError> {
+    pub async fn forget(&self, note_id: NoteId) -> Result<Written<()>, MemError> {
         let located = self
             .index
             .locate(note_id)?
@@ -2858,7 +4256,7 @@ impl MemoryStore {
                 id: note_id.to_string(),
             })?;
 
-        let op = self
+        let Appended { op, degraded } = self
             .mint_and_append(
                 Ulid::new(),
                 OpKind::Forget,
@@ -2874,7 +4272,10 @@ impl MemoryStore {
         self.index.remove_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
 
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// Permanently scrub `note_id`'s content: append a signed `Redact` op, delete
@@ -2936,7 +4337,7 @@ impl MemoryStore {
     /// encoded or appended; a [`BlobStore::delete`] error if any ciphertext version
     /// could not be scrubbed (the note stays reclaimable for a re-run); or whatever
     /// the index reports on remove.
-    pub async fn redact(&self, note_id: NoteId) -> Result<(), MemError> {
+    pub async fn redact(&self, note_id: NoteId) -> Result<Written<()>, MemError> {
         let Some(located) = self.index.locate(note_id)? else {
             // The note is not in the LOCAL index. This is the retry path for the
             // dead-end where a first `redact` appended the (durable, converge-hiding)
@@ -2978,14 +4379,18 @@ impl MemoryStore {
                 .ok_or_else(|| MemError::NotFound {
                     id: note_id.to_string(),
                 })?;
-            return self.scrub_blobs(&note_blob_prefix(&object_key)?).await;
+            self.scrub_blobs(&note_blob_prefix(&object_key)?).await?;
+            return Ok(Written {
+                value: (),
+                degraded: Vec::new(),
+            });
         };
         // Derive the note's blob-prefix from a known version key BEFORE the key is
         // moved into the op below. A note's repo is fixed at `remember`, so every
         // version shares this prefix; scrubbing lists them all without re-reading
         // the op-log.
         let note_prefix = note_blob_prefix(&located.object_key)?;
-        let op = self
+        let Appended { op, degraded } = self
             .mint_and_append(
                 Ulid::new(),
                 OpKind::Redact,
@@ -3004,7 +4409,10 @@ impl MemoryStore {
         self.scrub_blobs(&note_prefix).await?;
         self.index.redact_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// The `object_key` of `note_id`'s converged `Redact` op, if any durable op in
@@ -3359,7 +4767,9 @@ impl MemoryStore {
     /// [`MemError::NotFound`] if `from` is not indexed; [`MemError::Serialize`] /
     /// [`MemError::Storage`] if the op cannot be encoded or appended.
     pub async fn link(&self, from: NoteId, to: NoteId) -> Result<(), MemError> {
-        self.relate(from, to, LinkRel::Related).await
+        self.relate(from, to, LinkRel::Related)
+            .await
+            .map(|written| written.value)
     }
 
     /// Assert a TYPED relationship from `from` to `to` — the note `from` supersedes
@@ -3381,7 +4791,12 @@ impl MemoryStore {
     ///
     /// [`MemError::NotFound`] if `from` is not indexed; [`MemError::Serialize`] /
     /// [`MemError::Storage`] if the op cannot be encoded or appended.
-    pub async fn relate(&self, from: NoteId, to: NoteId, rel: LinkRel) -> Result<(), MemError> {
+    pub async fn relate(
+        &self,
+        from: NoteId,
+        to: NoteId,
+        rel: LinkRel,
+    ) -> Result<Written<()>, MemError> {
         let located = self.index.locate(from)?.ok_or_else(|| MemError::NotFound {
             id: from.to_string(),
         })?;
@@ -3394,7 +4809,7 @@ impl MemoryStore {
             OpKind::Relate { to, rel }
         };
 
-        let op = self
+        let Appended { op, degraded } = self
             .mint_and_append(
                 Ulid::new(),
                 kind,
@@ -3407,8 +4822,19 @@ impl MemoryStore {
             )
             .await?;
 
+        // Recall demotes a superseded note through the relations in the index,
+        // which only a sync used to fill, so the new relation had no effect until
+        // the next refresh or restart. This op is the newest for its target, so it
+        // is what convergence will pick.
+        if rel != LinkRel::Related {
+            self.index.set_relation(from, TypedLink { to, rel })?;
+        }
+
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// Reconstruct the full op history of `note_id`, attaching a Merkle
@@ -3628,6 +5054,19 @@ impl MemoryStore {
         .await
     }
 
+    /// Buffer `leaf` for the next anchor batch without committing one, for a
+    /// caller that holds the writer locks a batch commit would take.
+    fn queue_anchor_leaf(&self, leaf: Blake3Hash, lamport: u64) {
+        self.anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .push(PendingLeaf {
+                hash: leaf,
+                lamport,
+            });
+    }
+
     /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
     /// the threshold.
     ///
@@ -3635,10 +5074,15 @@ impl MemoryStore {
     /// source of truth), so a failed anchor is logged and its leaves retained for
     /// the next attempt — it never fails the caller's write. The guard over
     /// [`MemoryStore::anchor_state`] is dropped before every `.await` (axiom
-    /// `rust_quality_74`): push and drain happen under one lock hold with no
-    /// intervening `.await` between them, then the batch commits without it.
+    /// `rust_quality_74`), and the batch commits without it.
+    ///
+    /// The first full batch in a process first queues this author's ops that no
+    /// own record covers ([`requeue_uncovered_own_ops`](Self::requeue_uncovered_own_ops)),
+    /// as [`flush_anchors`](Self::flush_anchors) does: the record this batch
+    /// persists raises the author's watermark past every op it lists, so ops an
+    /// earlier process left unanchored below it would never be queued again.
     async fn schedule_anchor(&self, leaf: Blake3Hash, lamport: u64) {
-        let batch = {
+        let full = {
             let mut state = self
                 .anchor_state
                 .lock()
@@ -3647,10 +5091,22 @@ impl MemoryStore {
                 hash: leaf,
                 lamport,
             });
-            if state.pending.len() >= self.anchor_threshold {
-                Some(state.drain_batch())
-            } else {
+            state.pending.len() >= self.anchor_threshold
+        };
+        if !full {
+            return;
+        }
+        self.requeue_uncovered_own_ops().await;
+        let batch = {
+            let mut state = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // A concurrent write may have drained the batch during the requeue.
+            if state.pending.is_empty() {
                 None
+            } else {
+                Some(state.drain_batch())
             }
         };
         let Some(batch) = batch else { return };
@@ -3662,6 +5118,96 @@ impl MemoryStore {
         }
     }
 
+    /// Queue this author's ops that none of its own anchor records cover, once
+    /// per process, ahead of the leaves this process buffered.
+    ///
+    /// `pending` lives in memory, so the leaves of a process that exits below
+    /// the batch threshold were lost: a stdio session that wrote fewer than a
+    /// threshold's worth of ops anchored nothing, ever. Run from
+    /// [`flush_anchors`](Self::flush_anchors), which the binary calls when a
+    /// session ends, and before this process's first full batch
+    /// ([`schedule_anchor`](Self::schedule_anchor)), so a later session also
+    /// anchors what an earlier one that crashed left behind.
+    ///
+    /// Coverage is a watermark, not a set: an op counts as covered when its
+    /// Lamport value is at or below the newest op this author's newest signed
+    /// record covers ([`own_anchors`]). Costs one LIST of this author's anchor
+    /// prefix and (in steady state) one GET, one LIST of the op-log keys, and
+    /// one GET per own op above the watermark, so it does not grow with the
+    /// author's history in GETs (the op-log LIST still grows with the team's
+    /// log). An op below the watermark that no record lists (an
+    /// op a concurrent process under this identity wrote and never anchored)
+    /// stays unanchored.
+    ///
+    /// Two live processes under one identity can both queue the same uncovered
+    /// op, and one still buffering an op queues it too; the op is then in two
+    /// records, which `history` and `reconcile` read as two records of one
+    /// batch. Best-effort: a failed read is warned and not retried in this
+    /// process. A caller that arrives while another is queueing waits for it.
+    async fn requeue_uncovered_own_ops(&self) {
+        self.requeued_uncovered
+            .get_or_init(|| self.queue_uncovered_own_ops())
+            .await;
+    }
+
+    /// The body of [`requeue_uncovered_own_ops`](Self::requeue_uncovered_own_ops),
+    /// without its once-per-process guard.
+    async fn queue_uncovered_own_ops(&self) {
+        let uncovered = match self.uncovered_own_ops().await {
+            Ok(uncovered) => uncovered,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not look for this author's unanchored ops; ops an earlier process \
+                     left below the batch threshold stay unanchored"
+                );
+                return;
+            }
+        };
+        let mut state = self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Leaves this process holds already: buffered, or in a batch anchored
+        // but not yet persisted.
+        let buffered: HashSet<Blake3Hash> = state
+            .pending
+            .iter()
+            .map(|leaf| leaf.hash)
+            .chain(
+                state
+                    .anchored
+                    .iter()
+                    .flat_map(|record| record.leaves.iter().copied()),
+            )
+            .collect();
+        let mut leaves: Vec<PendingLeaf> = uncovered
+            .into_iter()
+            .filter(|leaf| !buffered.contains(&leaf.hash))
+            .collect();
+        leaves.append(&mut state.pending);
+        state.pending = leaves;
+    }
+
+    /// This author's signed ops above its anchor watermark, in Lamport order.
+    async fn uncovered_own_ops(&self) -> Result<Vec<PendingLeaf>, MemError> {
+        let author = self.author_key();
+        let through = own_anchors(&self.blob, &self.team, &author)
+            .await?
+            .anchored_through();
+        let ops = self
+            .oplog
+            .read_own_after(&self.team, &author, through)
+            .await?;
+        Ok(ops
+            .iter()
+            .map(|op| PendingLeaf {
+                hash: op.hash(),
+                lamport: op.lamport,
+            })
+            .collect())
+    }
+
     /// This store's sr25519 public key — the identity its ops and anchor records
     /// are attributed to (and the namespace its `_anchors/` keys live under).
     fn author_key(&self) -> VerifyingKey {
@@ -3669,6 +5215,11 @@ impl MemoryStore {
     }
 
     /// Force-anchor any pending leaves, returning the receipt if a batch was sealed.
+    ///
+    /// The first call in a process also queues this author's ops that no own
+    /// anchor record covers ([`requeue_uncovered_own_ops`](Self::requeue_uncovered_own_ops)):
+    /// two LISTs and a GET per own op above the anchor watermark, whose failure
+    /// is logged and does not fail the flush.
     ///
     /// Returns `Ok(None)` when nothing is pending. Intended for tests and graceful
     /// shutdown; the threshold path in [`MemoryStore::schedule_anchor`] handles
@@ -3681,6 +5232,8 @@ impl MemoryStore {
     /// Whatever [`AuditAnchor::anchor`] or the blob store reports; on error the
     /// pending leaves are restored before the error returns, so nothing is lost.
     pub async fn flush_anchors(&self) -> Result<Option<AnchorReceipt>, MemError> {
+        self.persist_anchored().await?;
+        self.requeue_uncovered_own_ops().await;
         let batch = {
             let mut state = self
                 .anchor_state
@@ -3697,6 +5250,25 @@ impl MemoryStore {
         Ok(Some(receipt))
     }
 
+    /// Whether this store anchors on chain (`SubxtAnchor`, `chain` feature), where
+    /// anchoring a batch submits a paid transaction and waits for finality.
+    ///
+    /// A caller that bounds [`flush_anchors`](Self::flush_anchors) in time
+    /// must not do so here: cancelling it after the transaction is submitted
+    /// pays the fee without persisting the record, so the next flush anchors
+    /// the same leaves again.
+    #[must_use]
+    pub fn anchors_on_chain(&self) -> bool {
+        #[cfg(feature = "chain")]
+        {
+            self.anchor.as_any().is::<crate::SubxtAnchor>()
+        }
+        #[cfg(not(feature = "chain"))]
+        {
+            false
+        }
+    }
+
     /// Build the batch's Merkle root, anchor it, and persist its [`AnchorRecord`].
     ///
     /// # Ordering, and why leaves can't be lost
@@ -3705,18 +5277,20 @@ impl MemoryStore {
     /// caller); a seq is NOT reserved yet — see
     /// [`reserve_seq_and_persist`](Self::reserve_seq_and_persist) for why that
     /// waits until after the (unlocked) chain anchor call. We build the root,
-    /// anchor it, then reserve a seq and persist the record. On ANY failure —
-    /// anchor or persist — the drained leaves are returned to `pending` (under the
-    /// lock) so the next write or [`MemoryStore::flush_anchors`] retries them; a
-    /// seq consumed before the failure is not reclaimed, so a later batch never
-    /// reuses this one's object key. A persist failure *after* a successful anchor
-    /// re-anchors the same deterministic root next time, a harmless duplicate
-    /// commit — preferable to dropping the local record `history` needs.
+    /// anchor it, then reserve a seq and persist the record. When the anchor
+    /// fails, the drained leaves are returned to `pending` (under the lock) so the
+    /// next write or [`MemoryStore::flush_anchors`] retries them. When the anchor
+    /// succeeded and the persist fails (the writer lock stayed busy, or the PUT
+    /// failed), the record is kept with its receipt and persisted by the next
+    /// commit, before it anchors anything: anchoring the same root again would
+    /// cost a second on-chain fee and orphan the first anchor. A seq consumed
+    /// before a failure is not reclaimed, so a later batch never reuses this
+    /// one's object key. Earlier anchored records are persisted first, here too.
     ///
     /// # Errors
     ///
     /// Propagates the anchor sink's or blob store's [`MemError`]; on error the
-    /// leaves have been restored before returning.
+    /// leaves are back in `pending`, or the anchored record is kept.
     async fn commit_batch(&self, batch: DrainedBatch) -> Result<AnchorReceipt, MemError> {
         // Derive everything the anchor and record need from `batch` BEFORE the guard
         // takes ownership. No `.await` runs in this prelude, so a cancellation here
@@ -3750,6 +5324,15 @@ impl MemoryStore {
         // exactly as before, the `Ok` path drops the batch.
         let mut guard = BatchGuard::arm(self, batch);
 
+        // Persist what an earlier commit anchored first, so a busy lock there
+        // never makes this batch, or that one, anchor twice.
+        if let Err(err) = self.persist_anchored().await {
+            if let Some(batch) = guard.disarm() {
+                self.restore_pending(batch);
+            }
+            return Err(err);
+        }
+
         let receipt = match self.anchor.anchor(root, meta.clone()).await {
             Ok(receipt) => receipt,
             Err(err) => {
@@ -3775,15 +5358,62 @@ impl MemoryStore {
             // settled.
             sig: None,
         };
-        if let Err(err) = self.reserve_seq_and_persist(&mut record).await {
-            if let Some(batch) = guard.disarm() {
-                self.restore_pending(batch);
-            }
-            return Err(err);
-        }
-        // Committed: the leaves must NOT return to pending — disarm and drop them.
+        // The anchor landed, so from here the leaves are the record's. A copy
+        // is kept until the record is persisted, so a failed persist, or a
+        // dropped future, leaves it for the next commit instead of returning
+        // the leaves to be anchored again.
         let _ = guard.disarm();
+        self.anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .anchored
+            .push(record.clone());
+        self.reserve_seq_and_persist(&mut record).await?;
+        self.forget_anchored(root);
         Ok(record.receipt)
+    }
+
+    /// Drop the kept copy of the record anchored at `root`, once persisted.
+    /// Found by root, not position: another commit may have persisted and
+    /// removed records meanwhile. A root names one batch's leaves.
+    fn forget_anchored(&self, root: Blake3Hash) {
+        let mut state = self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = state.anchored.iter().position(|kept| kept.root == root) {
+            state.anchored.remove(at);
+        }
+    }
+
+    /// Persist every record an earlier commit anchored but could not persist,
+    /// oldest first. A failure keeps the rest, the failed one included.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`reserve_seq_and_persist`](Self::reserve_seq_and_persist)
+    /// reports for the first record that fails.
+    async fn persist_anchored(&self) -> Result<(), MemError> {
+        loop {
+            // A copy is persisted and the kept record dropped only afterwards,
+            // so a cancelled call leaves it in place. The cost: a record whose
+            // PUT landed just before a cancellation, or that two commits in this
+            // process persist at once, is persisted twice under two seqs for one
+            // anchor, which `history` and `reconcile` read as two records of one
+            // batch.
+            let next = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .anchored
+                .first()
+                .cloned();
+            let Some(mut record) = next else {
+                return Ok(());
+            };
+            self.reserve_seq_and_persist(&mut record).await?;
+            self.forget_anchored(record.root);
+        }
     }
 
     /// Reserve `record`'s seq and persist it, serialized against any other
@@ -3809,7 +5439,7 @@ impl MemoryStore {
     /// path's analogue of `append_under_serialization` holding it across the op
     /// append and head publish. Immediately after acquiring it,
     /// [`reseed_next_seq`](Self::reseed_next_seq) re-reads the durable records:
-    /// this is the anchor-sequence equivalent of `adopt_shared_tip` refreshing the
+    /// this is the anchor-sequence equivalent of `adopt_tip` refreshing the
     /// chain tip before every mint. A process's own `next_seq` counter is only
     /// ever correct for what THAT process itself has reserved; trusting it once
     /// and then assuming it stays authoritative is exactly the bug. Re-seeding
@@ -3819,8 +5449,8 @@ impl MemoryStore {
     ///
     /// # Fail-on-exists, and why a retry loop
     ///
-    /// [`BlobStore`] has no conditional/if-absent put (see its trait doc), so
-    /// [`anchor_record_exists`] performs a GET-before-PUT instead. Under the held
+    /// A create-only put is not enforced by every gateway (`doctor` probes it),
+    /// so [`anchor_record_exists`] performs a GET-before-PUT instead. Under the held
     /// lock this is sufficient, not merely best-effort: nothing else can persist
     /// to the reserved key while `cross` is held, so the loop below exists for the
     /// residual cases the lock cannot cover — no [`WriterLock`](crate::WriterLock)
@@ -3828,24 +5458,29 @@ impl MemoryStore {
     /// identity, both already-documented open gaps. On a detected collision the
     /// seq is re-reserved (via a fresh [`reseed_next_seq`] call, so the retry
     /// picks up whatever collided) rather than the record silently overwriting it.
+    /// The loop gives up after [`ANCHOR_SEQ_ATTEMPTS`] collisions, and a seq past
+    /// `u64::MAX` is an error, so a planted record can fail an anchor but never
+    /// hang the write that triggered it.
     ///
     /// # Errors
     ///
     /// Whatever [`reseed_next_seq`](Self::reseed_next_seq),
     /// [`anchor_record_exists`], or [`persist_anchor_record`] report.
     async fn reserve_seq_and_persist(&self, record: &mut AnchorRecord) -> Result<(), MemError> {
-        let cross = self.lock_across_processes().await;
+        let cross = self.lock_across_processes().await?;
 
         self.reseed_next_seq().await?;
 
-        loop {
+        for attempt in 1.. {
             record.seq = {
                 let mut state = self
                     .anchor_state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let seq = state.next_seq;
-                state.next_seq = state.next_seq.saturating_add(1);
+                state.next_seq = seq.checked_add(1).ok_or_else(|| {
+                    MemError::Malformed("this author's anchor seqs are exhausted".to_owned())
+                })?;
                 seq
             };
             // The anchor sink cannot know the per-author batch seq — it is
@@ -3859,15 +5494,22 @@ impl MemoryStore {
                 *slot = record.seq;
             }
 
-            if anchor_record_exists(&self.blob, &self.team, &record.author_key, record.seq).await? {
-                tracing::warn!(
-                    seq = record.seq,
-                    "anchor seq collided with an existing record; re-seeding and retrying"
-                );
-                self.reseed_next_seq().await?;
-                continue;
+            if !anchor_record_exists(&self.blob, &self.team, &record.author_key, record.seq).await?
+            {
+                break;
             }
-            break;
+            if attempt == ANCHOR_SEQ_ATTEMPTS {
+                return Err(MemError::Storage(format!(
+                    "anchor seq {} is taken after {ANCHOR_SEQ_ATTEMPTS} attempts; another \
+                     writer under this identity keeps claiming seqs",
+                    record.seq
+                )));
+            }
+            tracing::warn!(
+                seq = record.seq,
+                "anchor seq collided with an existing record; re-seeding and retrying"
+            );
+            self.reseed_next_seq().await?;
         }
 
         // Sign LAST, after the retry loop settled the final `seq` and stamped a
@@ -3884,28 +5526,22 @@ impl MemoryStore {
     /// Refresh this author's `next_seq` from the durable anchor records.
     ///
     /// Sets `next_seq` to `max(next_seq, max(this author's persisted seq) + 1)` —
-    /// monotonic, never walked backward, exactly like `adopt_shared_tip`'s tip
+    /// monotonic, never walked backward, exactly like `adopt_tip`'s tip
     /// refresh. Called only from [`reserve_seq_and_persist`](Self::reserve_seq_and_persist),
     /// under the cross-process lock it holds.
     ///
+    /// The seq comes from this author's own prefix ([`own_anchors`]): one LIST
+    /// and, in steady state, one GET, never a teammate's record. The first free
+    /// seq above the newest record this author signed, so a key planted under
+    /// the prefix (one at `u64::MAX` included) is stepped over, not built on.
+    ///
     /// # Errors
     ///
-    /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
+    /// Whatever [`own_anchors`] or its `next_seq` report.
     async fn reseed_next_seq(&self) -> Result<(), MemError> {
-        let author_key = self.author_key();
-        // Deliberately the plain (Accept) reader, NOT this store's
-        // `unsigned_anchor_policy`: seq allocation is keyspace bookkeeping, not
-        // evidence. A legacy unsigned record of our own still occupies its
-        // `{author_key}/{seq}` object key, so a strict read that hid it here
-        // would under-seed `next_seq` and make every anchor walk the occupied
-        // seqs one detected collision (two bucket reads each) at a time.
-        let records = read_anchor_records(&self.blob, &self.team).await?;
-        let next = records
-            .iter()
-            .filter(|record| record.author_key == author_key)
-            .map(|record| record.seq.saturating_add(1))
-            .max()
-            .unwrap_or(0);
+        let next = own_anchors(&self.blob, &self.team, &self.author_key())
+            .await?
+            .next_seq()?;
         let mut state = self
             .anchor_state
             .lock()
@@ -3995,7 +5631,7 @@ impl MemoryStore {
         // held across the scan AND the rewrites so a concurrent same-identity
         // `reserve_seq_and_persist` (or a second resign run) on this machine
         // cannot interleave with them.
-        let cross = self.lock_across_processes().await;
+        let cross = self.lock_across_processes().await?;
 
         let scanned = scan_anchor_records(&self.blob, &self.team).await?;
         let mut report = AnchorResignReport::default();
@@ -4118,6 +5754,9 @@ impl MemoryStore {
     /// signature/chain violation), or whatever the index reports on upsert/remove.
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
+        #[cfg(test)]
+        self.syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Single-flight the whole rebuild: held from before `read_and_filter`
         // through `replay_full`/`sync_incremental` (and the checkpoint write that
         // follows), so a second concurrent `sync` on this process queues here
@@ -4125,12 +5764,25 @@ impl MemoryStore {
         // exact interleaving that let a fresher sync's `retain` drop a removal
         // watermark a staler sync's `apply_record` still needed. Acquired FIRST,
         // before `self.writer` is ever touched (deep inside `read_and_filter`),
-        // and never held by a writer (`mint_and_append`/`commit_edit` take only
-        // `self.writer`, never this gate) — so lock order is strictly
-        // `sync_gate` -> `writer`, one direction only, and a slow sync still never
-        // blocks a concurrent write. See `sync_gate`'s field doc for the full
-        // ordering argument.
+        // and never taken by a writer that holds `self.writer` (an edit with a
+        // precondition calls this only after releasing both writer locks), so
+        // lock order is strictly `sync_gate` -> `writer`, one direction only, and
+        // a slow sync never blocks a write that holds the writer lock. See
+        // `sync_gate`'s field doc for the full ordering argument.
         let _gate = self.sync_gate.lock().await;
+        // Read before the op-log, so every op recorded under this revision was
+        // appended before the read below lists it.
+        let tip_revision = self.writer_lock.as_ref().and_then(|lock| lock.revision());
+        let indexed = self.sync_under_gate().await?;
+        *self
+            .synced_tip_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = tip_revision;
+        Ok(indexed)
+    }
+
+    /// [`sync`](Self::sync)'s rebuild, run with `sync_gate` held.
+    async fn sync_under_gate(&self) -> Result<usize, MemError> {
         for attempt in 0..AUTHORITATIVE_INSTALL_ATTEMPTS {
             if let Some(indexed) = self.sync_pass(InstallMode::Authoritative).await? {
                 return Ok(indexed);
@@ -4281,6 +5933,7 @@ impl MemoryStore {
         // only the multi-MiB GET is what the cache saves. Keyed by the NEWEST
         // listed key, the one the bucket path would try first.
         let keys = self.blob.list(&snapshot_prefix(&self.team)).await?;
+        let keys = self.checkpoints.without_unopenable(keys, epoch);
         let cached = match keys.last() {
             Some(newest) => self.checkpoints.get(newest, epoch, &key, &self.team).await,
             None => None,
@@ -4296,7 +5949,9 @@ impl MemoryStore {
             return Ok(Some(snapshot));
         }
 
-        let fetched = fetch_newest_snapshot(self.blob.as_ref(), &key, &self.team, &keys).await?;
+        let (fetched, unopenable) =
+            fetch_newest_snapshot(self.blob.as_ref(), &key, &self.team, &keys).await?;
+        self.checkpoints.mark_unopenable(unopenable, epoch);
         let Some(fetched) = fetched else {
             return Ok(None);
         };
@@ -4314,10 +5969,21 @@ impl MemoryStore {
     /// checkpoint-write failure only costs the next sync its fast path.
     ///
     /// Returns `false` only when a write was attempted and failed.
+    ///
+    /// Writes nothing while the index lacks a note for want of its epoch key
+    /// (`keyless`): checkpoint keys name only the Lamport tip, which such a
+    /// process shares with the team, so its checkpoint would replace the team's
+    /// complete one at the same key, sealed under a key the team may not use
+    /// any more.
     async fn maybe_persist_checkpoint(&self, baseline: Option<u64>, last_lamport: u64) -> bool {
         let checkpoint_stale = baseline
             .is_none_or(|base| last_lamport.saturating_sub(base) >= SNAPSHOT_REFRESH_LAMPORT_GAP);
-        if !checkpoint_stale {
+        let incomplete = !self
+            .keyless
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty();
+        if !checkpoint_stale || incomplete {
             return true;
         }
         match self.index.all_records() {
@@ -4430,6 +6096,12 @@ impl MemoryStore {
         records: &[IndexRecord],
         last_lamport: u64,
     ) -> Result<(), MemError> {
+        // A client holding the wrong team key would seal this checkpoint under it
+        // and publish it at the shared checkpoint key, where it shadows (and, by
+        // retention, can evict) the team's usable ones. Without a published key
+        // check this writes as before.
+        self.require_team_key(self.current_epoch()).await?;
+
         let mut records = records.to_vec();
         self.attach_embeddings(&mut records, &BTreeSet::new())?;
         let mut sealed = Vec::with_capacity(records.len());
@@ -4455,7 +6127,7 @@ impl MemoryStore {
         let envelope_key = self.key_for_epoch(epoch)?;
         let (object_key, sealed) = seal_snapshot(&envelope_key, &snapshot)?;
         self.blob.put(&object_key, sealed.clone()).await?;
-        prune_old_snapshots(self.blob.as_ref(), &self.team).await;
+        prune_old_snapshots(self.blob.as_ref(), &self.team, &object_key).await;
         // Keep what we just wrote, so this process (and, via disk, the next one)
         // does not download its own checkpoint back. Built from the live index,
         // which holds no redacted note, so it may go to disk.
@@ -4923,16 +6595,11 @@ impl MemoryStore {
         // reader. Safe against the non-member lamport poisoning the members-view
         // mint seed closes: these values come exclusively from ops SIGNED by this
         // author's own key, which no bucket writer can forge.
-        let my_raw_hashes: Vec<Blake3Hash> = ops
+        let my_raw: Vec<(u64, Blake3Hash)> = ops
             .iter()
             .filter(|op| op.author == self.author)
-            .map(Op::hash)
+            .map(|op| (op.lamport, op.hash()))
             .collect();
-        let my_last_raw = ops
-            .iter()
-            .rev()
-            .find(|op| op.author == self.author)
-            .map(|op| (op.lamport, op.hash()));
 
         // Resolve membership and split to the member-filtered view up front, because
         // the mint clock is now seeded from it. `read_verified` does NOT check
@@ -4976,6 +6643,18 @@ impl MemoryStore {
             // planted lamport can't poison it, while a REMOVED author (whose own
             // ops the members view drops) still mints strictly above their own
             // durable chain instead of colliding with it.
+            // Under the guard, so a reclaim that finished while the read was in
+            // flight is seen here.
+            let my_raw_hashes: Vec<Blake3Hash> = my_raw
+                .iter()
+                .map(|(_, hash)| *hash)
+                .filter(|hash| !clock.reclaimed.contains(hash))
+                .collect();
+            let my_last_raw = my_raw
+                .iter()
+                .rev()
+                .find(|(_, hash)| !clock.reclaimed.contains(hash))
+                .copied();
             let my_raw_tip = my_last_raw.map_or(0, |(lamport, _)| lamport);
             clock.lamport_tip = clock
                 .lamport_tip
@@ -4992,7 +6671,7 @@ impl MemoryStore {
             if head_visible {
                 // Re-seed the pair TOGETHER. `my_last_lamport` exists to order this
                 // machine's cached head against a tip another process recorded
-                // (`adopt_shared_tip`), so leaving it behind here would let a sync
+                // (`adopt_tip`), so leaving it behind here would let a sync
                 // move the head forward while the comparison still reported the old
                 // position — and the next write would then adopt a tip it has
                 // already passed, forking the chain. The two fields are one value in
@@ -5142,6 +6821,18 @@ impl MemoryStore {
                 tracing::warn!(
                     applied_version = current.version,
                     "the team manifest disappeared from storage (possible deletion); keeping the last applied version"
+                );
+                Some(current.clone())
+            }
+            // Two different manifests cannot both be version N of one honest
+            // chain: the founder signs each version once. Keep the one already
+            // trusted, so a replacement at the same version cannot change the
+            // roster without the version moving.
+            (Some(current), Some(new)) if new.version == current.version && new != *current => {
+                tracing::warn!(
+                    version = current.version,
+                    "refusing a team manifest that differs from the applied one at the same \
+                     version; keeping the applied one"
                 );
                 Some(current.clone())
             }
@@ -5898,7 +7589,9 @@ impl MemoryStore {
     async fn decode_records(&self, items: Vec<(NoteId, NotePointer)>) -> Vec<IndexRecord> {
         let decoded: Vec<Option<IndexRecord>> = futures_util::stream::iter(items)
             .map(|(note_id, pointer)| async move {
-                match self.decode_pointer(note_id, &pointer).await {
+                let decoded = self.decode_pointer(note_id, &pointer).await;
+                self.record_decode_outcome(note_id, &decoded);
+                match decoded {
                     Ok(record) => Some(record),
                     Err(err) => {
                         tracing::warn!(
@@ -5917,6 +7610,37 @@ impl MemoryStore {
         decoded.into_iter().flatten().collect()
     }
 
+    /// Remember whether `note_id` decoded, for `get` and [`MemoryStore::undecodable_notes`]. Only
+    /// integrity and decryption failures are kept: a missing epoch key or a
+    /// failed GET is not a fault of the stored note. A missing epoch key is kept
+    /// apart, in `keyless`, which stops checkpoint writes.
+    fn record_decode_outcome(&self, note_id: NoteId, decoded: &Result<IndexRecord, MemError>) {
+        {
+            let mut keyless = self.keyless.lock().unwrap_or_else(PoisonError::into_inner);
+            if matches!(decoded, Err(MemError::KeyUnavailable { .. })) {
+                keyless.insert(note_id);
+            } else {
+                keyless.remove(&note_id);
+            }
+        }
+        let mut undecodable = self
+            .undecodable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match decoded {
+            Ok(_) => {
+                undecodable.remove(&note_id);
+            }
+            Err(MemError::Integrity { reason, .. }) => {
+                undecodable.insert(note_id, *reason);
+            }
+            Err(MemError::Crypto) => {
+                undecodable.insert(note_id, IntegrityFailure::Undecryptable);
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Capture the current converged state into an encrypted [`IndexSnapshot`] and
     /// persist it, returning the baseline Lamport the snapshot covers.
     ///
@@ -5931,6 +7655,9 @@ impl MemoryStore {
     /// [`save_snapshot`] reports (serialize / crypto / storage). A note whose blob
     /// cannot be decoded is logged + skipped exactly as in `sync`, so it is simply
     /// absent from the snapshot and will be decoded on a later tail if still live.
+    /// [`MemError::KeyUnavailable`] when this process holds no key for a live
+    /// note's epoch: that snapshot would lack the note and replace the team's
+    /// checkpoint (see [`maybe_persist_checkpoint`](Self::maybe_persist_checkpoint)).
     pub async fn snapshot(&self) -> Result<u64, MemError> {
         // `snapshot` builds a checkpoint from the member-filtered view alone; it
         // never calls `retain`, so it has no use for `read_and_filter`'s raw-tip
@@ -5957,6 +7684,7 @@ impl MemoryStore {
                     record.last_reinforced = state.last_reinforced;
                     records.push(record);
                 }
+                Err(err @ MemError::KeyUnavailable { .. }) => return Err(err),
                 Err(err) => tracing::warn!(
                     note_id = %note_id,
                     object_key = %pointer.object_key,
@@ -6015,8 +7743,8 @@ impl MemoryStore {
                 pinned.as_str(),
             )));
         }
-        let current = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
-        let next_version = match &current {
+        let current = self.current_manifest().await?;
+        let applied_version = match &current {
             Some(manifest) => {
                 if manifest.founder != self.author {
                     // A founder-authorization denial: the signer is intact but not
@@ -6028,10 +7756,12 @@ impl MemoryStore {
                         manifest.founder.as_str(),
                     )));
                 }
-                manifest.version.saturating_add(1)
+                Some(manifest.version)
             }
-            None => 0,
+            None => None,
         };
+        let next_version =
+            next_free_manifest_version(self.blob.as_ref(), &self.team, applied_version).await?;
         // Carried forward, not re-derived: the caller asked to change membership,
         // not to retire the recovery key. Read through `trusted_recovery_key` so a
         // degenerate key already in the bucket is dropped here instead of being
@@ -6047,7 +7777,36 @@ impl MemoryStore {
             next_version,
             recovery_key,
         );
-        publish_manifest(self.blob.as_ref(), &manifest).await
+        self.publish_and_record_manifest(&manifest).await?;
+        Ok(())
+    }
+
+    /// Publish `manifest`, then raise the rollback watermark and the durable
+    /// marker to it. Every manifest this store publishes goes through here.
+    ///
+    /// Without the second step the next manifest consumer in the same process (the
+    /// rotation `remove` runs right after publishing the shrunk roster) reads
+    /// the bucket again, and a bucket that lost or garbled the new object hands
+    /// it the previous version: the removed member would be wrapped the new key.
+    /// The marker write is best-effort, as in
+    /// [`current_manifest`](Self::current_manifest).
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`publish_manifest`] reports; the watermark is then unchanged.
+    async fn publish_and_record_manifest(&self, manifest: &TeamManifest) -> Result<(), MemError> {
+        publish_manifest(self.blob.as_ref(), manifest).await?;
+        self.monotonic_manifest(Some(manifest.clone()));
+        if let Some(marker) = &self.manifest_marker
+            && let Err(err) = marker.store(manifest).await
+        {
+            tracing::warn!(
+                error = %err,
+                version = manifest.version,
+                "failed to persist the durable manifest marker; cross-restart rollback protection may lag"
+            );
+        }
+        Ok(())
     }
 
     /// Founder action: publish a manifest naming `recovery_key`, at
@@ -6149,7 +7908,8 @@ impl MemoryStore {
             ));
         }
 
-        let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
+        let live = self
+            .current_manifest()
             .await?
             .ok_or_else(|| MemError::ManifestUnavailable {
                 team: self.team.clone(),
@@ -6165,18 +7925,18 @@ impl MemoryStore {
 
         let previous_recovery_key = live.trusted_recovery_key().copied();
 
-        // A forward link, never an overwrite — see this method's docs.
-        // `saturating_add` mirrors `publish_membership`/`recover_founder`: at
-        // `u64::MAX` the chain simply stops advancing rather than wrapping to
-        // version 0 and handing the anchor to whoever publishes next.
+        // A forward link, never an overwrite — see this method's docs: the
+        // version is the first one above the live manifest no object holds.
+        let version =
+            next_free_manifest_version(self.blob.as_ref(), &self.team, Some(live.version)).await?;
         let manifest = TeamManifest::create_signed_with_recovery(
             self.signer.as_ref(),
             self.team.clone(),
             live.members,
-            live.version.saturating_add(1),
+            version,
             Some(recovery_key),
         );
-        publish_manifest(self.blob.as_ref(), &manifest).await?;
+        self.publish_and_record_manifest(&manifest).await?;
         Ok((manifest, previous_recovery_key))
     }
 
@@ -6225,7 +7985,8 @@ impl MemoryStore {
             ));
         }
 
-        let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
+        let live = self
+            .current_manifest()
             .await?
             .ok_or_else(|| MemError::ManifestUnavailable {
                 team: self.team.clone(),
@@ -6238,14 +7999,16 @@ impl MemoryStore {
             ));
         }
 
+        let version =
+            next_free_manifest_version(self.blob.as_ref(), &self.team, Some(live.version)).await?;
         let manifest = TeamManifest::create_signed_with_recovery(
             recovery_signer,
             self.team.clone(),
             live.members,
-            live.version.saturating_add(1),
+            version,
             Some(fresh_recovery_key),
         );
-        publish_manifest(self.blob.as_ref(), &manifest).await?;
+        self.publish_and_record_manifest(&manifest).await?;
         Ok(manifest)
     }
 
@@ -6264,7 +8027,7 @@ impl MemoryStore {
     /// Whatever [`load_manifest`] reports (storage, deserialization, or a
     /// founder-consistency failure).
     pub async fn membership_manifest(&self) -> Result<Option<TeamManifest>, MemError> {
-        load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await
+        self.current_manifest().await
     }
 
     /// The current member set of this store's team.
@@ -6303,23 +8066,24 @@ impl MemoryStore {
     ///
     /// [`MemError::KeyUnavailable`] if this store's key-ring lacks the current
     /// epoch's key (it is not the founder, or the key was never configured), or
-    /// whatever [`load_member_keys`] / `provision_team_key` report.
+    /// whatever [`load_manifest`] / [`load_member_keys`] / the wrap writes report.
     pub async fn provision_members(&self) -> Result<usize, MemError> {
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
         let epoch = self.current_epoch();
         let team_key = self.key_for_epoch(epoch)?;
+        let manifest = self.current_manifest().await?;
         // This store's own signer is the provisioner: it signs every wrap this
         // call produces, recorded in each `WrappedKey` as proof of who sealed it.
-        provision_team_key(
-            self.blob.as_ref(),
+        let wraps = seal_wraps(
             &self.team,
             &team_key,
             epoch,
             &member_keys,
+            manifest.as_ref(),
             self.founder.as_ref(),
             self.signer.as_ref(),
-        )
-        .await?;
+        )?;
+        put_wraps(self.blob.as_ref(), wraps).await?;
         Ok(member_keys.len())
     }
 
@@ -6334,17 +8098,15 @@ impl MemoryStore {
     ///
     /// `known_max_epoch` is the highest epoch the caller knows the team has
     /// rotated to out of band (the CLI passes its configured `max_epoch`). The
-    /// new epoch is `max(ring, known_max_epoch) + 1`. Both floors are LOCAL
-    /// inputs, so this guards only against re-minting an epoch at or below
-    /// them (a stale ring, a lagging config). An epoch that reached the bucket
-    /// ABOVE both — a prior rotation that crashed after wrapping, or a
-    /// concurrent rotation from another founder machine — is invisible here,
-    /// and a re-run WILL re-mint it, overwriting its wraps. Re-run semantics:
-    /// the minted key joins the local ring, so re-running on the same machine
-    /// floors on it and advances to the next epoch consistently; notes sealed
-    /// under a losing key inside such a race window stay unreadable to members
-    /// who bootstrap the re-minted wrap. Bucket-level epoch discovery is a
-    /// documented follow-up, not a promise of this method.
+    /// new epoch is the first above the highest of the local ring,
+    /// `known_max_epoch`, and the newest epoch the founder provisioned in the
+    /// bucket, that no wrap or key check object holds. The wraps are
+    /// create-only writes, so on a gateway that enforces them a concurrent
+    /// rotation from another founder machine that wins the race makes this one
+    /// fail with [`MemError::EpochTaken`] rather than overwrite it, after
+    /// deleting the wraps it had written. On a gateway that does
+    /// not, two rotations racing at the same epoch can still both write; one
+    /// whose wraps reached the bucket before this one listed them cannot.
     ///
     /// Authorization mirrors [`publish_membership`](Self::publish_membership):
     /// rotation decides who can read future notes, which is membership-shaped
@@ -6365,14 +8127,16 @@ impl MemoryStore {
     ///   authorized to receive a wrap. Refused BEFORE the write epoch advances:
     ///   sealing future notes under a key wrapped to no one would make them
     ///   unreadable to the whole team once this process exits.
-    /// - Whatever [`load_manifest`] / [`load_member_keys`] / `rotate_team_key`
+    /// - [`MemError::EpochTaken`] when another rotation's wrap appears at the
+    ///   chosen epoch while this one writes.
+    /// - Whatever [`load_manifest`] / [`load_member_keys`] / the wrap writes
     ///   report (storage, serialization, crypto).
     pub async fn rotate_key(&self, known_max_epoch: u64) -> Result<RotationOutcome, MemError> {
         // Authz first, before any bucket write. `load_manifest` already honours
         // the pin (only the pinned founder's manifests load), so a Some(manifest)
         // under a pin is necessarily the pin's — the author check below then
         // reduces to "is this signer the founder".
-        let manifest = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        let manifest = self.current_manifest().await?;
         match (&manifest, &self.founder) {
             (Some(manifest), _) if manifest.founder != self.author => {
                 return Err(MemError::Unauthorized(format!(
@@ -6403,23 +8167,24 @@ impl MemoryStore {
         }
 
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
-        // `highest_epoch` copies the max key out under the ring lock, so no guard
-        // is held across the awaits below. `None` (empty ring) still floors at
-        // `known_max_epoch`, so a keyless store cannot re-mint epoch 0.
-        let floor = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
-        let new_epoch = floor.saturating_add(1);
+        let new_epoch = self
+            .next_rotation_epoch(known_max_epoch, manifest.as_ref())
+            .await?;
         let new_key = SecretKey::generate();
         // This store's own signer is the provisioner for the rotation too.
-        let wrapped = rotate_team_key(
-            self.blob.as_ref(),
+        // The manifest resolved above, through the rollback watermark, decides
+        // who receives the new key; a fresh bucket read here could elect an
+        // older roster that still lists a removed member.
+        let wraps = seal_wraps(
             &self.team,
             &new_key,
             new_epoch,
             &member_keys,
+            manifest.as_ref(),
             self.founder.as_ref(),
             self.signer.as_ref(),
-        )
-        .await?;
+        )?;
+        let wrapped = create_wraps(self.blob.as_ref(), &self.team, new_epoch, wraps).await?;
         if wrapped.is_empty() {
             // No wraps were published, so the bucket is unchanged; refusing here
             // keeps the write epoch on a key the team can actually read.
@@ -6442,7 +8207,73 @@ impl MemoryStore {
         }
         self.add_epoch_key(new_epoch, new_key);
         self.set_current_epoch(new_epoch);
-        Ok(RotationOutcome { new_epoch, wrapped })
+
+        // The founder generated this key, so it is the one place a new epoch's
+        // check can be published without trusting anyone's judgment. Best
+        // effort: the rotation is already durable, and `admin keycheck publish`
+        // covers a failure here. The outcome is returned, not warned here, so
+        // the caller tells the operator once.
+        let key_check = self
+            .publish_team_key_check(new_epoch, PublishKeyCheck::IfAbsent)
+            .await;
+
+        Ok(RotationOutcome {
+            new_epoch,
+            wrapped,
+            key_check,
+        })
+    }
+
+    /// The epoch a rotation mints: the first epoch above the highest of the
+    /// local ring, `known_max_epoch` and the newest epoch the founder
+    /// provisioned on the bucket that no object under `{team}/_keys/{epoch}/`
+    /// or at `{team}/_keycheck/{epoch}` holds (see [`rotate_key`](Self::rotate_key)).
+    ///
+    /// Stepping over a held epoch, rather than refusing it, is what keeps one
+    /// object anyone with bucket write can put at the next epoch (a stray key
+    /// check, a wrap no founder signed) from blocking every later `rotate` and
+    /// `remove` for good, which would keep the key a removed member holds
+    /// live. Members load rotated keys by listing their own wraps
+    /// ([`wrapped_epochs`](Self::wrapped_epochs)), so a skipped epoch costs
+    /// them nothing. One LIST of `_keys/` and one of `_keycheck/`, and a GET
+    /// per listed wrap above the local floor until one is the founder's.
+    async fn next_rotation_epoch(
+        &self,
+        known_max_epoch: u64,
+        manifest: Option<&TeamManifest>,
+    ) -> Result<u64, MemError> {
+        // The floor includes the newest provisioned epoch: the local ring and
+        // `known_max_epoch` (the configured `max_epoch`) both lag a rotation
+        // this machine did not load after a restart, and minting one past them
+        // re-minted a live epoch with a new key. Only a wrap the founder signed
+        // counts, because a member with bucket write could otherwise plant a key
+        // at `u64::MAX` and leave no epoch to rotate to, which keeps the key a
+        // member about to be removed holds live. `highest_epoch` copies the max
+        // key out under the ring lock, so no guard is held across the awaits.
+        // `None` (empty ring) still floors at the other two, so a keyless store
+        // cannot re-mint epoch 0.
+        let local = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
+        let wraps = wrap_keys_above(self.blob.as_ref(), &self.team, local).await?;
+        // A key check names an epoch too, and it can exist without a wrap (a
+        // `keycheck publish` from a machine holding a key no wrap delivers).
+        let held: BTreeSet<u64> = wraps
+            .iter()
+            .map(|(epoch, _)| *epoch)
+            .chain(key_check_epochs(self.blob.as_ref(), &self.team).await?)
+            .collect();
+        let floor =
+            first_provisioned_epoch(self.blob.as_ref(), wraps, manifest, self.founder.as_ref())
+                .await?
+                .unwrap_or(local);
+        let mut new_epoch = floor;
+        loop {
+            new_epoch = new_epoch.checked_add(1).ok_or_else(|| {
+                MemError::Malformed(format!("team {} has no epoch left to rotate to", self.team))
+            })?;
+            if !held.contains(&new_epoch) {
+                return Ok(new_epoch);
+            }
+        }
     }
 
     /// Member action: publish `identity`'s signed [`MemberKey`] so the founder's
@@ -6502,9 +8333,10 @@ impl MemoryStore {
         // routes into `decode_records`' skip-with-warn path.
         let cid = pointer.cid;
         if content_hash(&ciphertext) != cid {
-            return Err(MemError::Storage(format!(
-                "note {note_id}: ciphertext hash does not match the op-attested content hash"
-            )));
+            return Err(MemError::Integrity {
+                id: note_id.to_string(),
+                reason: IntegrityFailure::HashMismatch,
+            });
         }
         // The object key is the AEAD associated data, so a blob relocated under a
         // foreign key fails authentication here and is skipped, never indexed under
@@ -7012,10 +8844,15 @@ mod tests {
     )]
 
     use super::{
+        CreateOnly, CreateOutcome, KeyCheckPublished, KeyProbe, PublishKeyCheck, PublishedCheck,
+        WriteMode, key_check_key, read_key_check,
+    };
+    use super::{
         IncrementalOutcome, IndexApply, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
-        MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput,
+        MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput, TeamKeyCheck,
         anchor_proof_for, bound_index_fields, current_millis, drop_redacted, load_latest_snapshot,
-        object_key, validate_body, validate_summary, validate_tags, within_index_bounds,
+        newest_lamport, object_key, recorded_committed_op_id, tip_without_op_id, validate_body,
+        validate_summary, validate_tags, within_index_bounds,
     };
     use crate::NetworkPrefix;
     use crate::WriterLock;
@@ -7027,10 +8864,9 @@ mod tests {
     };
     use crate::crypto::{SecretKey, content_hash, open, seal};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
-    use crate::error::MemError;
+    use crate::error::{IntegrityFailure, MemError};
     use crate::identity::{
-        ManifestMarker, MemberKey, TeamManifest, derive_identity, load_manifest,
-        provision_team_key, publish_manifest, signer_from_mnemonic,
+        ManifestMarker, MemberKey, TeamManifest, load_manifest, publish_manifest,
     };
     use crate::index::{
         Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query,
@@ -7038,7 +8874,8 @@ mod tests {
     };
     use crate::oplog::Signature;
     use crate::oplog::{
-        LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey, converge,
+        AuthorTip, LinkRel, NotePointer, Op, OpKind, OpLogStore, SharedTip, Signer, Sr25519Signer,
+        TypedLink, VerifyingKey, converge,
     };
     use crate::store::InstrumentedBlobStore;
     use crate::store::checkpoint_cache::{CheckpointCache, Persist};
@@ -7480,6 +9317,33 @@ mod tests {
                     similarity >= threshold,
                     "similarity {similarity} must clear the {threshold} gate threshold"
                 );
+                Ok(())
+            }
+            other => Err(format!("expected NearDuplicate, got {other:?}").into()),
+        }
+    }
+
+    /// The stored note's tags must not count against the candidate's summary:
+    /// with them in the stored token set, re-sending a tagged note scored below
+    /// the threshold against itself and was written a second time.
+    #[tokio::test]
+    async fn a_tagged_note_sent_again_is_refused() -> TestResult {
+        let store = test_store()?;
+        let repo = RepoScope::Repo("thebrain".to_string());
+        let tagged = || RememberInput {
+            tags: ["storage", "ordering", "snapshots"]
+                .map(str::to_string)
+                .into(),
+            ..dedup_input(
+                repo.clone(),
+                "prefer BTreeMap for deterministic snapshot ordering",
+                false,
+            )
+        };
+        let first = store.remember(tagged()).await?;
+        match store.remember(tagged()).await {
+            Err(MemError::NearDuplicate { existing, .. }) => {
+                assert_eq!(existing, first, "the refusal names the existing note");
                 Ok(())
             }
             other => Err(format!("expected NearDuplicate, got {other:?}").into()),
@@ -7992,6 +9856,7 @@ mod tests {
                 None,
             )
             .await
+            .map(|appended| appended.op)
     }
 
     #[tokio::test]
@@ -8414,6 +10279,9 @@ mod tests {
         fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
             self.inner.locate(id)
         }
+        fn set_relation(&self, from: NoteId, link: TypedLink) -> Result<(), MemError> {
+            self.inner.set_relation(from, link)
+        }
         fn retain(&self, keep: &BTreeSet<NoteId>, baseline_lamport: u64) -> Result<(), MemError> {
             self.inner.retain(keep, baseline_lamport)
         }
@@ -8654,6 +10522,42 @@ mod tests {
         ));
     }
 
+    /// The MCP tool schema (its snapshot) and `docs/REFERENCE.md` state the
+    /// limits the code enforces. Reads both, so a limit changed in one place
+    /// fails here.
+    #[test]
+    fn the_documented_size_limits_match_the_code() {
+        let reference = include_str!("../../../docs/REFERENCE.md").replace('\n', " ");
+        let schema = include_str!("../../../hippius-mem/tests/snapshots/tool_schemas.json")
+            .replace("\\n", " ");
+        let stated = format!(
+            "line of at most {MAX_SUMMARY_CHARS} characters, `body` at most {MAX_BODY_CHARS} \
+             characters, `tags` at most {MAX_TAGS} of at most {MAX_TAG_CHARS} characters each"
+        );
+        assert!(
+            reference.contains(&stated),
+            "REFERENCE.md must state: {stated}"
+        );
+        for phrase in [
+            format!("at most {MAX_SUMMARY_CHARS} characters"),
+            format!("at most {MAX_BODY_CHARS} characters"),
+            format!("at most {MAX_TAG_CHARS} characters"),
+        ] {
+            assert!(
+                schema.contains(&phrase),
+                "the tool schema must state: {phrase}"
+            );
+        }
+
+        let four_byte_body = "\u{1F600}".repeat(MAX_BODY_CHARS);
+        assert_eq!(
+            four_byte_body.len(),
+            512 * 1024,
+            "the cap counts characters, not bytes"
+        );
+        assert!(validate_body(&four_byte_body).is_ok());
+    }
+
     #[tokio::test]
     async fn remember_rejects_an_oversized_body_or_tag_set() -> TestResult {
         // An unbounded body or tag set is a resource-exhaustion vector; rejected at
@@ -8869,7 +10773,10 @@ mod tests {
 
         let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
         let signer = crate::signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
-        let member_key = crate::MemberKey::create_signed(&signer, &identity);
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        // Signed by the store's author, as `join_as_member` publishes it: the
+        // wrap is stored under that address.
+        let member_key = crate::MemberKey::create_signed(store.signer.as_ref(), &identity);
         let epoch1_key = SecretKey::from_bytes(EPOCH1_KEY);
 
         // Provision the member's epoch-1 wrap under a FOREIGN team, then bootstrap
@@ -8884,7 +10791,6 @@ mod tests {
             &signer,
         )
         .await?;
-        let store = store_over(blob.clone(), SOLO_SEED)?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(
             added, 0,
@@ -8905,6 +10811,682 @@ mod tests {
         .await?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(added, 1, "a wrap under this store's own team loads");
+        Ok(())
+    }
+
+    /// A member whose author seed is not its mnemonic's (the documented setup:
+    /// `join --bundle` and the installer mint a random seed per machine) loads
+    /// the key of an epoch the founder rotated to after it joined. The wrap is
+    /// stored under the author address the member key was signed with, and the
+    /// bootstrap looked it up under the mnemonic's address instead, so no member
+    /// ever received a rotated key.
+    #[tokio::test]
+    async fn a_member_with_its_own_author_seed_loads_a_rotated_epoch() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        assert_ne!(
+            member.author, identity.ss58,
+            "the fixture needs the two to differ"
+        );
+        member.join_as_member(&identity).await?;
+
+        let rotation = founder.rotate_key(0).await?;
+        assert!(
+            rotation.wrapped.contains(&member.author),
+            "{:?}",
+            rotation.wrapped
+        );
+        let sealed_at_1 = founder.remember(numbered_input(7)).await?;
+
+        let restarted = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        let added = restarted
+            .bootstrap_epoch_keys(&identity, &[0, rotation.new_epoch])
+            .await?;
+        assert_eq!(added, 1, "the rotated epoch's wrap loads");
+        restarted.sync().await?;
+        assert_eq!(restarted.get(sealed_at_1).await?.summary, "numbered note 7");
+        Ok(())
+    }
+
+    /// A founder that rotated, restarted, and did not raise its `max_epoch`
+    /// rotates again to a NEW epoch, leaving the earlier epoch's wraps as they
+    /// were. The new epoch used to be one past the local ring and `max_epoch`
+    /// only, so the second rotation minted epoch 1 again with a new key and
+    /// overwrote its wraps: notes sealed under the first epoch-1 key could not
+    /// be opened after a restart.
+    #[tokio::test]
+    async fn a_rotation_with_a_stale_max_epoch_mints_a_new_epoch() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+
+        let first = founder.rotate_key(0).await?;
+        let wrap_key = crate::wrapped_key_key(TEAM, first.new_epoch, founder.author.as_str());
+        let first_wrap = blob.get(&wrap_key).await?;
+
+        let restarted = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let second = restarted.rotate_key(0).await?;
+
+        assert_eq!(second.new_epoch, first.new_epoch + 1);
+        assert_eq!(
+            blob.get(&wrap_key).await?,
+            first_wrap,
+            "epoch 1's wrap is untouched"
+        );
+        Ok(())
+    }
+
+    /// After the founder rotates, a machine that never loaded the new key
+    /// refuses to seal under the old one, which a removed member still holds,
+    /// instead of writing as if nothing happened.
+    #[tokio::test]
+    async fn a_write_under_an_epoch_the_founder_rotated_past_is_refused() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        let member =
+            store_over(Arc::clone(&blob), [21_u8; 32])?.with_key_check_recheck(Duration::ZERO);
+        member.remember(sample_input()).await?;
+
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+
+        let refused = member.remember(sample_input()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MemError::EpochSuperseded {
+                    epoch: 0,
+                    newest: 1,
+                    ..
+                })
+            ),
+            "got {refused:?}"
+        );
+        founder.remember(sample_input()).await?;
+        Ok(())
+    }
+
+    /// A process the founder rotated past syncs without replacing the team's
+    /// checkpoint. It used to seal its index, which lacks every note under the
+    /// newer key, under the older key at the same checkpoint key (the shared
+    /// Lamport tip), so every up-to-date teammate fell back to a full replay.
+    #[tokio::test]
+    async fn a_process_the_founder_rotated_past_keeps_the_teams_checkpoint() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        founder.remember(numbered_input(1)).await?;
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        founder.remember(numbered_input(2)).await?;
+        founder.sync().await?;
+        let checkpoints = blob.list(&snapshot_prefix(TEAM)).await?;
+        let [checkpoint] = checkpoints.as_slice() else {
+            return Err(format!("one checkpoint expected: {checkpoints:?}").into());
+        };
+        let written = blob.get(checkpoint).await?;
+
+        let lagging = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        lagging.sync().await?;
+
+        assert_eq!(blob.list(&snapshot_prefix(TEAM)).await?, checkpoints);
+        assert_eq!(
+            blob.get(checkpoint).await?,
+            written,
+            "the team's checkpoint is kept"
+        );
+        Ok(())
+    }
+
+    /// A rotation steps over an epoch that a key check or a wrap the founder did
+    /// not sign already holds, and leaves those objects alone. It used to
+    /// refuse with `EpochTaken`, so one such object at the next epoch blocked
+    /// every later `rotate` and `remove`. The founder's restarted server still
+    /// loads the new epoch: it lists its own wraps and skips the planted one.
+    #[tokio::test]
+    async fn a_rotation_steps_over_epochs_other_objects_hold() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        let check = key_check_key(TEAM, 1);
+        let planted = crate::wrapped_key_key(TEAM, 2, founder.author.as_str());
+        blob.put(&check, b"a check".to_vec()).await?;
+        blob.put(&planted, b"not a wrap".to_vec()).await?;
+
+        let rotation = founder.rotate_key(0).await?;
+
+        assert_eq!(rotation.new_epoch, 3);
+        assert_eq!(blob.get(&check).await?, b"a check".to_vec());
+        assert_eq!(blob.get(&planted).await?, b"not a wrap".to_vec());
+        let restarted = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let epochs = restarted.wrapped_epochs().await?;
+        assert_eq!(epochs, [2, 3]);
+        assert_eq!(restarted.bootstrap_epoch_keys(&identity, &epochs).await?, 1);
+        assert_eq!(restarted.highest_epoch(), Some(3));
+        Ok(())
+    }
+
+    /// A member's server bootstraps a rotated key only when a provisioner the
+    /// manifest in force authorizes signed its wrap. With the newest manifest
+    /// object garbled, the bucket's newest readable manifest still names a
+    /// recovery key the newest one retired; a wrap that key signed is refused,
+    /// because the bootstrap resolves the manifest through the rollback
+    /// watermark. It used to read the bucket's manifest raw.
+    #[tokio::test]
+    async fn a_bootstrap_refuses_a_wrap_only_a_rolled_back_manifest_authorizes() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        member.join_as_member(&identity).await?;
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                member.author.clone(),
+            ]))
+            .await?;
+        let retired = Sr25519Signer::from_seed_with_prefix(&[55_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let (named, _) = founder
+            .publish_recovery_key(retired.verifying_key())
+            .await?;
+        let replacement =
+            Sr25519Signer::from_seed_with_prefix(&[56_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let (newest, _) = founder
+            .publish_recovery_key(replacement.verifying_key())
+            .await?;
+        assert_eq!(newest.version, named.version + 1);
+        member.sync().await?;
+        garble_manifest(&blob, newest.version).await?;
+
+        let forged = crate::wrap_team_key(
+            TEAM,
+            &SecretKey::generate(),
+            &identity.x25519_public(),
+            5,
+            &retired,
+        )?;
+        blob.put(
+            &crate::wrapped_key_key(TEAM, 5, member.author.as_str()),
+            serde_json::to_vec(&forged)?,
+        )
+        .await?;
+
+        assert_eq!(member.bootstrap_epoch_keys(&identity, &[5]).await?, 0);
+        assert_eq!(member.highest_epoch(), Some(0));
+        Ok(())
+    }
+
+    /// A founder machine that never applied manifest v1 (no marker) and finds
+    /// it garbled publishes the next roster at v2, leaving v1's object alone.
+    /// It used to sign v1 again from v0's roster and overwrite the object, so
+    /// readers that had applied v1 refused the new one and readers that had not
+    /// took a roster v1 had changed.
+    #[tokio::test]
+    async fn a_publish_never_reuses_a_version_an_unreadable_manifest_holds() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        let garbled_key = format!("{TEAM}/_manifest/{:020}", 1);
+        blob.put(&garbled_key, b"garbled".to_vec()).await?;
+
+        let restarted = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        restarted
+            .publish_membership(BTreeSet::from([restarted.author.clone()]))
+            .await?;
+
+        assert_eq!(blob.get(&garbled_key).await?, b"garbled".to_vec());
+        let current = load_manifest(blob.as_ref(), TEAM, None)
+            .await?
+            .ok_or("a manifest is published")?;
+        assert_eq!(current.version, 2);
+        Ok(())
+    }
+
+    /// What the store does at the second create-only wrap write.
+    #[derive(Debug, Clone, Copy)]
+    enum SecondWrap {
+        /// Another rotation at the same epoch wins the slot just before it.
+        TakenByAnother,
+        /// The write is stored, then answered `AlreadyExists`: a create whose
+        /// response was lost and whose retry found its own object.
+        StoredThenTaken,
+        /// The write is stored, then answered with an error: every attempt's
+        /// response was lost.
+        StoredThenFails,
+    }
+
+    /// A [`MemoryBlobStore`] that does `second` at the second wrap write.
+    struct SecondWrapStore {
+        inner: MemoryBlobStore,
+        second: SecondWrap,
+        wraps_written: AtomicUsize,
+    }
+
+    impl SecondWrapStore {
+        fn new(second: SecondWrap) -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                second,
+                wraps_written: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for SecondWrapStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            if !key.contains("/_keys/") || self.wraps_written.fetch_add(1, Ordering::Relaxed) != 1 {
+                return self.inner.put_if_absent(key, bytes).await;
+            }
+            match self.second {
+                SecondWrap::TakenByAnother => {
+                    self.inner
+                        .put(key, b"the other machine's wrap".to_vec())
+                        .await?;
+                    self.inner.put_if_absent(key, bytes).await
+                }
+                SecondWrap::StoredThenTaken => {
+                    self.inner.put_if_absent(key, bytes).await?;
+                    Ok(CreateOutcome::AlreadyExists)
+                }
+                SecondWrap::StoredThenFails => {
+                    self.inner.put_if_absent(key, bytes).await?;
+                    Err(MemError::Storage("response lost".into()))
+                }
+            }
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A founder and one member, both with published member keys, over a
+    /// store that does `second` at the second wrap write.
+    async fn founder_and_member_over(
+        second: SecondWrap,
+    ) -> Result<(Arc<dyn BlobStore>, MemoryStore), Box<dyn std::error::Error>> {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(SecondWrapStore::new(second));
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        founder.join_as_member(&identity).await?;
+        member.join_as_member(&identity).await?;
+        Ok((blob, founder))
+    }
+
+    /// A rotation that loses one wrap slot to another rotation at the same
+    /// epoch fails with `EpochTaken`, leaves the other machine's wrap as it
+    /// was, and deletes the wraps it had already written. Those were
+    /// founder-signed wraps of the key this rotation discards: left behind,
+    /// they marked the epoch provisioned, so the founder's writes were refused
+    /// while the members they reached sealed notes under that key.
+    #[tokio::test]
+    async fn a_rotation_that_loses_a_wrap_slot_leaves_no_wrap_of_its_own() -> TestResult {
+        let (blob, founder) = founder_and_member_over(SecondWrap::TakenByAnother).await?;
+
+        let refused = founder.rotate_key(0).await;
+
+        assert!(
+            matches!(refused, Err(MemError::EpochTaken { epoch: 1, .. })),
+            "got {refused:?}"
+        );
+        let left = blob.list(&format!("{TEAM}/_keys/{:020}/", 1)).await?;
+        assert_eq!(left.len(), 1, "only the other machine's wrap: {left:?}");
+        assert_eq!(
+            blob.get(&left[0]).await?,
+            b"the other machine's wrap".to_vec()
+        );
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
+        assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        Ok(())
+    }
+
+    /// A wrap write answered `AlreadyExists` for the wrap it stored itself
+    /// counts as written, so the rotation completes with both wraps. It used
+    /// to fail with `EpochTaken` and leave that founder-signed wrap behind,
+    /// so the epoch counted as provisioned under a key the founder dropped.
+    #[tokio::test]
+    async fn a_rotation_whose_retried_wrap_finds_itself_completes() -> TestResult {
+        let (blob, founder) = founder_and_member_over(SecondWrap::StoredThenTaken).await?;
+
+        let rotated = founder.rotate_key(0).await?;
+
+        assert_eq!(rotated.new_epoch, 1);
+        assert_eq!(rotated.wrapped.len(), 2, "both members: {rotated:?}");
+        let stored = blob.list(&format!("{TEAM}/_keys/{:020}/", 1)).await?;
+        assert_eq!(stored.len(), 2, "{stored:?}");
+        assert_eq!(founder.current_epoch(), 1);
+        Ok(())
+    }
+
+    /// A wrap write that fails after the store kept it fails the rotation and
+    /// deletes that wrap with the others, so the epoch is not left
+    /// provisioned under a key the founder dropped.
+    #[tokio::test]
+    async fn a_rotation_whose_failed_wrap_was_stored_leaves_no_wrap() -> TestResult {
+        let (blob, founder) = founder_and_member_over(SecondWrap::StoredThenFails).await?;
+
+        let refused = founder.rotate_key(0).await;
+
+        assert!(
+            matches!(&refused, Err(MemError::Storage(msg)) if msg == "response lost"),
+            "got {refused:?}"
+        );
+        let left = blob.list(&format!("{TEAM}/_keys/{:020}/", 1)).await?;
+        assert!(left.is_empty(), "no wrap of this rotation: {left:?}");
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
+        assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        Ok(())
+    }
+
+    /// A [`MemoryBlobStore`] whose key-check reads and writes fail, as a
+    /// gateway refusing that prefix would; listings work.
+    struct KeyCheckUnreachable(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for KeyCheckUnreachable {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            if key.contains("/_keycheck/") {
+                return Err(MemError::Storage("key check refused".into()));
+            }
+            self.0.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains("/_keycheck/") {
+                return Err(MemError::Storage("key check refused".into()));
+            }
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// A rotation whose key-check publish fails still completes, and its
+    /// outcome carries the publish error, so `admin rotate` can say why the
+    /// check is missing instead of only that it is.
+    #[tokio::test]
+    async fn a_rotation_reports_why_its_key_check_was_not_published() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(KeyCheckUnreachable(MemoryBlobStore::default()));
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .join_as_member(&crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+
+        let rotated = founder.rotate_key(0).await?;
+
+        assert_eq!(rotated.new_epoch, 1);
+        assert!(
+            matches!(&rotated.key_check, Err(MemError::Storage(msg)) if msg == "key check refused"),
+            "{:?}",
+            rotated.key_check
+        );
+        Ok(())
+    }
+
+    /// A membership publish right after naming a recovery key carries that key
+    /// forward even when the bucket no longer serves the manifest naming it.
+    /// The recovery-key publish did not raise the rollback watermark, so the
+    /// next publish elected the manifest before it and dropped the key.
+    #[tokio::test]
+    async fn a_publish_after_naming_a_recovery_key_keeps_it() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[55_u8; 32], NetworkPrefix::HIPPIUS)?
+            .verifying_key();
+        founder.publish_recovery_key(recovery).await?;
+        garble_manifest(&blob, 1).await?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let current = load_manifest(blob.as_ref(), TEAM, None)
+            .await?
+            .ok_or("a manifest is published")?;
+        assert_eq!(current.trusted_recovery_key(), Some(&recovery));
+        Ok(())
+    }
+
+    /// Publish member keys for M and C to `blob`, returning their addresses.
+    async fn publish_m_and_c(
+        blob: &Arc<dyn BlobStore>,
+    ) -> Result<(crate::Ss58, crate::Ss58), Box<dyn std::error::Error>> {
+        const PHRASE_M: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        const PHRASE_C: &str =
+            "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+        let mut addresses = Vec::new();
+        for (seed, phrase) in [([21_u8; 32], PHRASE_M), ([22_u8; 32], PHRASE_C)] {
+            let signer = Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?;
+            let identity = crate::derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
+            let member_key = MemberKey::create_signed(&signer, &identity);
+            crate::publish_member_key(blob.as_ref(), TEAM, &member_key).await?;
+            addresses.push(member_key.ss58);
+        }
+        let [m, c] = <[crate::Ss58; 2]>::try_from(addresses).map_err(|_| "two members")?;
+        Ok((m, c))
+    }
+
+    /// A founder machine with a durable manifest marker, after it removed C:
+    /// manifest v0 named M and C, v1 names only M, and epoch 1 is wrapped to M.
+    /// Returns the bucket, the marker's directory, M's and C's addresses.
+    async fn founder_after_removing_c() -> Result<
+        (
+            Arc<dyn BlobStore>,
+            tempfile::TempDir,
+            crate::Ss58,
+            crate::Ss58,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let dir = tempfile::tempdir()?;
+        let (m, c) = publish_m_and_c(&blob).await?;
+
+        let founder = founder_with_marker(&blob, &dir)?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone(), c.clone()]))
+            .await?;
+        let founder = founder_with_marker(&blob, &dir)?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone()]))
+            .await?;
+        let rotation = founder.rotate_key(0).await?;
+        assert!(
+            !rotation.wrapped.contains(&c),
+            "C was removed before the rotation"
+        );
+        Ok((blob, dir, m, c))
+    }
+
+    /// `remove`'s two steps in one process: the rotation after publishing the
+    /// shrunk roster uses that roster even when the bucket no longer serves it.
+    /// The publish did not raise the rollback watermark, so the rotation read
+    /// the bucket, elected the previous manifest, and wrapped the removed member.
+    #[tokio::test]
+    async fn a_rotation_after_a_publish_uses_the_published_roster() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (m, c) = publish_m_and_c(&blob).await?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone(), c.clone()]))
+            .await?;
+        founder
+            .publish_membership(BTreeSet::from([m.clone()]))
+            .await?;
+        garble_manifest(&blob, 1).await?;
+
+        let rotation = founder.rotate_key(0).await?;
+        assert!(!rotation.wrapped.contains(&c), "{:?}", rotation.wrapped);
+        Ok(())
+    }
+
+    /// A recovery raises the rollback watermark like every other publish, so
+    /// this process keeps the recovered manifest when the bucket stops serving
+    /// it. It used to elect the manifest before the recovery again, with the
+    /// old founder and the recovery key that was just used.
+    #[tokio::test]
+    async fn a_recovery_holds_its_manifest_when_the_bucket_garbles_it() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let fresh = Sr25519Signer::from_seed_with_prefix(&[12_u8; 32], NetworkPrefix::HIPPIUS)?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder
+            .publish_recovery_key(recovery.verifying_key())
+            .await?;
+        let operator = store_over(Arc::clone(&blob), [99_u8; 32])?;
+        let recovered = operator
+            .recover_founder(&recovery, fresh.verifying_key())
+            .await?;
+        garble_manifest(&blob, recovered.version).await?;
+
+        let held = operator
+            .membership_manifest()
+            .await?
+            .ok_or("a manifest is held")?;
+        assert_eq!(held.version, recovered.version);
+        assert_eq!(held.founder, recovery.author_ss58());
+        Ok(())
+    }
+
+    /// The founder store over `blob` with its durable manifest marker in `dir`.
+    fn founder_with_marker(
+        blob: &Arc<dyn BlobStore>,
+        dir: &tempfile::TempDir,
+    ) -> Result<MemoryStore, MemError> {
+        let marker: Arc<dyn ManifestMarker> = Arc::new(crate::FileManifestMarker::new(
+            dir.path().join("team.manifest.json"),
+        ));
+        Ok(store_over(Arc::clone(blob), SOLO_SEED)?.with_manifest_marker(Some(marker)))
+    }
+
+    /// The manifest object at `version`, replaced with bytes that do not parse.
+    async fn garble_manifest(blob: &Arc<dyn BlobStore>, version: u64) -> TestResult {
+        let key = format!("{TEAM}/_manifest/{version:020}");
+        blob.put(&key, b"not a manifest".to_vec()).await?;
+        Ok(())
+    }
+
+    /// A later `rotate` on the founder machine does not wrap the new key to a
+    /// member the newest manifest removed, when that manifest's object is
+    /// garbled. The rotation read the bucket without the rollback watermark,
+    /// elected the previous manifest, and wrapped the key to the removed member.
+    #[tokio::test]
+    async fn a_garbled_newest_manifest_does_not_reach_a_founders_rotation() -> TestResult {
+        let (blob, dir, m, c) = founder_after_removing_c().await?;
+        garble_manifest(&blob, 1).await?;
+
+        let restarted = founder_with_marker(&blob, &dir)?;
+        let rotation = restarted.rotate_key(1).await?;
+        assert!(rotation.wrapped.contains(&m), "{:?}", rotation.wrapped);
+        assert!(!rotation.wrapped.contains(&c), "{:?}", rotation.wrapped);
+        Ok(())
+    }
+
+    /// The founder's next membership change after a garbled newest manifest
+    /// starts from that manifest, not the one before it. It used to start from
+    /// the previous roster, so removing M signed the removed C back in, at the
+    /// version readers already held, which they accepted.
+    #[tokio::test]
+    async fn a_garbled_newest_manifest_does_not_reach_a_founders_next_remove() -> TestResult {
+        let (blob, dir, m, c) = founder_after_removing_c().await?;
+        garble_manifest(&blob, 1).await?;
+
+        let restarted = founder_with_marker(&blob, &dir)?;
+        let mut members = restarted
+            .membership_manifest()
+            .await?
+            .ok_or("the marker holds a manifest")?
+            .members;
+        assert!(!members.contains(&c), "{members:?}");
+        members.remove(&m);
+        restarted.publish_membership(members).await?;
+
+        let live = load_manifest(blob.as_ref(), TEAM, None)
+            .await?
+            .ok_or("published")?;
+        assert_eq!(live.version, 2);
+        assert!(!live.members.contains(&c), "{:?}", live.members);
+        Ok(())
+    }
+
+    /// A manifest replaced at the version a reader already applied, with
+    /// another roster, does not change that reader's members.
+    #[tokio::test]
+    async fn a_replaced_manifest_at_the_applied_version_is_refused() -> TestResult {
+        let (blob, _dir, m, c) = founder_after_removing_c().await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        let applied = reader.members().await?;
+        assert!(!applied.contains(&c), "{applied:?}");
+
+        let founder_signer =
+            Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?;
+        let replaced = TeamManifest::create_signed(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([m.clone(), c]),
+            1,
+        );
+        blob.put(
+            &format!("{TEAM}/_manifest/{:020}", 1),
+            serde_json::to_vec(&replaced)?,
+        )
+        .await?;
+
+        assert_eq!(reader.members().await?, applied);
         Ok(())
     }
 
@@ -9068,7 +11650,7 @@ mod tests {
         let input = sample_input();
         let expected = input.clone();
         let embedding = store.embed_summary(&input.summary)?;
-        let id = store.remember_offloaded(input, embedding).await?;
+        let id = store.remember_offloaded(input, embedding).await?.value;
 
         let note = store.get(id).await?;
         assert_eq!(note.summary, expected.summary);
@@ -10111,45 +12693,53 @@ mod tests {
         Ok(())
     }
 
+    /// Only a wrap the founder signed makes an epoch provisioned: junk under
+    /// `_keys/` (a key at `u64::MAX`, a key with an extra segment) and a wrap
+    /// that verifies under a stranger's signature move nothing.
     #[tokio::test]
-    async fn highest_published_epoch_reports_the_bucket_state() -> TestResult {
-        // `MemoryStore::highest_published_epoch` delegates to the free
-        // `teamkey::highest_published_epoch` over this store's OWN private
-        // blob/team, without exposing either — the seam this pins: a caller
-        // holding only `&MemoryStore` still learns what the bucket has
-        // published, with no raw blob handle ever leaving the store.
+    async fn only_a_founder_signed_wrap_counts_as_a_provisioned_epoch() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder.join_as_member(&identity).await?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, None);
 
-        assert_eq!(
-            store.highest_published_epoch().await?,
-            0,
-            "a fresh bucket has published no wrapped key"
-        );
+        let rotated = founder.rotate_key(0).await?;
+        assert_eq!(rotated.new_epoch, 1);
 
-        // Publish a wrapped key at epoch 1 directly on the SAME underlying
-        // blob store the store was built over, via the real teamkey publish
-        // path (`provision_team_key`) — exactly how a rotation populates it.
-        let phrase = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-        let signer = signer_from_mnemonic(phrase, NetworkPrefix::HIPPIUS)?;
-        let identity = derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
-        let member = MemberKey::create_signed(&signer, &identity);
-        provision_team_key(
-            blob.as_ref(),
+        let address = founder.author.as_str().to_owned();
+        blob.put(
+            &crate::wrapped_key_key(TEAM, u64::MAX, &address),
+            b"junk".to_vec(),
+        )
+        .await?;
+        blob.put(
+            &format!("{}/junk", crate::wrapped_key_key(TEAM, 1000, &address)),
+            b"junk".to_vec(),
+        )
+        .await?;
+        let stranger = Sr25519Signer::from_seed_with_prefix(&[77_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let forged = crate::wrap_team_key(
             TEAM,
-            &SecretKey::from_bytes([9u8; 32]),
-            1,
-            std::slice::from_ref(&member),
-            None,
-            &signer,
+            &SecretKey::from_bytes([9_u8; 32]),
+            &identity.x25519_public(),
+            7,
+            &stranger,
+        )?;
+        blob.put(
+            &crate::wrapped_key_key(TEAM, 7, &address),
+            serde_json::to_vec(&forged)?,
         )
         .await?;
 
-        assert_eq!(
-            store.highest_published_epoch().await?,
-            1,
-            "the store must report the epoch actually published on its own bucket"
-        );
+        assert_eq!(founder.newest_provisioned_epoch(0).await?, Some(1));
+        assert_eq!(founder.newest_provisioned_epoch(1).await?, None);
+        let next = founder.rotate_key(0).await?;
+        assert_eq!(next.new_epoch, 2, "planted keys must not move the floor");
         Ok(())
     }
 
@@ -10372,68 +12962,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_precondition_is_not_a_distributed_lock() -> TestResult {
-        // Scope guard for `edit_with_precondition`. The CAS compares against THIS
-        // machine's converged index, so two machines holding the same base version
-        // BOTH pass their preconditions and last-writer-wins silently drops one
-        // edit. That is the documented contract ("a CAS within converged state,
-        // not a distributed lock"), but nothing pinned it: the only concurrency
-        // test for the guard is same-machine, where it genuinely does serialize.
-        // Without this test the tool-facing promise could widen into a
-        // cross-machine guarantee the implementation has never provided.
-        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let a = store_over(bucket.clone(), SOLO_SEED)?;
-        let b = store_over(bucket.clone(), [72_u8; 32])?;
-
-        let base = RememberInput {
-            force: true,
-            note_type: NoteType::Reference,
-            repo: RepoScope::Global,
-            tags: BTreeSet::new(),
-            summary: "shared base summary".to_string(),
-            body: "base body".to_string(),
-        };
-        let id = a.remember(base).await?;
-        b.sync().await?;
-
-        // Both machines read the same version and hold it as their precondition.
-        let version_a = a.current_version(id)?;
-        let version_b = b.current_version(id)?;
-        assert_eq!(
-            version_a, version_b,
-            "both machines must start from the same base version",
-        );
-
-        let edit = |body: &str| RememberInput {
-            force: true,
-            note_type: NoteType::Reference,
-            repo: RepoScope::Global,
-            tags: BTreeSet::new(),
-            summary: format!("summary {body}"),
-            body: body.to_string(),
-        };
-
-        // Neither machine has seen the other's edit, so BOTH preconditions pass.
-        // A same-machine pair here would conflict — see
-        // `concurrent_precondition_edits_cannot_both_win`.
-        a.edit_with_precondition(id, edit("A body"), Some(version_a))
-            .await?;
-        b.edit_with_precondition(id, edit("B body"), Some(version_b))
-            .await?;
-
-        // Exactly one survives convergence; the other is superseded with no
-        // conflict ever surfaced to its author.
-        a.sync().await?;
-        let body = a.get(id).await?.body;
-        assert!(
-            body == "A body" || body == "B body",
-            "one of the two concurrent preconditioned edits must win, got {body:?}",
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn edit_converges() -> TestResult {
         // Two machines share one bucket/op-log. A remembers; B syncs and sees the
         // original. A edits; after B re-syncs, convergence's latest-wins surfaces
@@ -10480,7 +13008,8 @@ mod tests {
     /// All later lists pass straight through.
     struct GatedListBlob {
         inner: MemoryBlobStore,
-        /// Armed for exactly one list; the first `list` consumes it via swap.
+        /// Armed for exactly one op-log list; the first consumes it via swap.
+        /// Other prefixes pass: the write path lists `_keys/` too.
         armed: AtomicBool,
         /// Fired by the gated list once it has captured its (pre-write) snapshot.
         captured: tokio::sync::Notify,
@@ -10514,7 +13043,7 @@ mod tests {
             // log as it was when `sync` began reading — exactly the stale view the
             // bug re-seeds the clock from.
             let result = self.inner.list(prefix).await;
-            if self.armed.swap(false, Ordering::SeqCst) {
+            if prefix.ends_with("/_oplog/") && self.armed.swap(false, Ordering::SeqCst) {
                 self.captured.notify_one();
                 self.release.notified().await;
             }
@@ -11530,6 +14059,47 @@ mod tests {
         Ok(())
     }
 
+    /// `link` with `supersedes` demotes the target in the very next recall, with
+    /// no refresh in between. Regression test: the relation reached the index
+    /// only on a sync, so the old note stayed first until refresh or restart.
+    #[tokio::test]
+    async fn supersede_demotes_without_waiting_for_a_sync() -> TestResult {
+        let store = build_store()?;
+        let topic = "retry backoff policy for the uploader".to_string();
+        let mk = |body: &str| RememberInput {
+            force: true,
+            note_type: NoteType::Decision,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: topic.clone(),
+            body: body.to_string(),
+        };
+        let old = store.remember(mk("retry three times, no jitter")).await?;
+        let new = store.remember(mk("retry with exponential jitter")).await?;
+        store.relate(new, old, LinkRel::Supersedes).await?;
+
+        let pointers = store
+            .recall(RecallInput {
+                text: topic,
+                repo: RepoScope::Global,
+                k: 10,
+                token_budget: None,
+            })?
+            .pointers;
+        let score_of = |id| {
+            pointers
+                .iter()
+                .find(|p| p.note_id == id)
+                .map(|p| p.score)
+                .ok_or("both notes are returned")
+        };
+        assert!(
+            score_of(new)? > score_of(old)?,
+            "the superseded note must rank below"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn related_relation_emits_the_legacy_link_op() -> TestResult {
         // Backward compatibility: a plain `Related` relation still emits the
@@ -11701,10 +14271,67 @@ mod tests {
         store.blob.put(&located.object_key, vec![0_u8; 64]).await?;
 
         match store.get(id).await {
-            Err(MemError::Storage(message)) => assert!(message.contains("content hash")),
-            Err(other) => return Err(format!("expected Storage, got {other:?}").into()),
+            Err(MemError::Integrity { id: reported, .. }) => assert_eq!(reported, id.to_string()),
+            Err(other) => return Err(format!("expected Integrity, got {other:?}").into()),
             Ok(_) => return Err("tampered blob unexpectedly resolved".into()),
         }
+        Ok(())
+    }
+
+    /// A process that boots after a note's blob was tampered with reports an
+    /// integrity failure for it, not "not found", and counts it.
+    ///
+    /// Regression test: the sync skipped the note with a warning, so `get` said
+    /// the note did not exist, inviting the agent to write it again.
+    #[tokio::test]
+    async fn a_note_tampered_before_boot_reads_as_an_integrity_failure() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let id = writer.remember(sample_input()).await?;
+        let located = writer.index.locate(id)?.ok_or("note not indexed")?;
+        blob.put(&located.object_key, vec![0_u8; 64]).await?;
+
+        let fresh = store_over(Arc::clone(&blob), READER_SEED)?;
+        fresh.sync().await?;
+
+        let result = fresh.get(id).await;
+        assert!(
+            matches!(
+                &result,
+                Err(MemError::Integrity {
+                    reason: IntegrityFailure::HashMismatch,
+                    ..
+                })
+            ),
+            "expected a hash-mismatch Integrity failure, got {result:?}"
+        );
+        assert_eq!(fresh.undecodable_notes(), 1);
+        Ok(())
+    }
+
+    /// A note sealed under another key reads as undecryptable, the reason that
+    /// points at the team key rather than at tampering.
+    #[tokio::test]
+    async fn a_note_under_another_key_reads_as_undecryptable() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let id = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
+            .remember(sample_input())
+            .await?;
+
+        let wrong = store_with_team_key(&blob, READER_SEED, WRONG_KEY)?;
+        wrong.sync().await?;
+
+        let result = wrong.get(id).await;
+        assert!(
+            matches!(
+                &result,
+                Err(MemError::Integrity {
+                    reason: IntegrityFailure::Undecryptable,
+                    ..
+                })
+            ),
+            "expected an undecryptable Integrity failure, got {result:?}"
+        );
         Ok(())
     }
 
@@ -11797,6 +14424,9 @@ mod tests {
         }
         fn locate(&self, _id: NoteId) -> Result<Option<Located>, MemError> {
             Ok(None)
+        }
+        fn set_relation(&self, _from: NoteId, _link: TypedLink) -> Result<(), MemError> {
+            Ok(())
         }
         fn retain(&self, _keep: &BTreeSet<NoteId>, _baseline_lamport: u64) -> Result<(), MemError> {
             Ok(())
@@ -12587,7 +15217,9 @@ mod tests {
         let dir = tempfile::tempdir().map_err(MemError::Io)?;
         let lock = WriterLock::new(
             dir.path().join("writer.lock"),
+            dir.path().join("writer-tip-v3.json"),
             dir.path().join("writer-tip.json"),
+            "test-endpoint".to_owned(),
         );
 
         Ok((Arc::new(lock), dir))
@@ -12663,6 +15295,2858 @@ mod tests {
             "exactly one of the two forked ops is dropped from convergence"
         );
         Ok(())
+    }
+
+    /// A distinct note per call, so the six writes below are six notes a reader
+    /// can look up one by one.
+    fn numbered_input(n: usize) -> RememberInput {
+        RememberInput {
+            summary: format!("numbered note {n}"),
+            ..sample_input()
+        }
+    }
+
+    /// Assert that a fresh reader (its own store, never written) sees every note
+    /// in `ids` and that `reconcile` finds no quarantined author.
+    async fn assert_fresh_reader_sees_all(blob: &Arc<dyn BlobStore>, ids: &[NoteId]) -> TestResult {
+        let reader = store_over(Arc::clone(blob), READER_SEED)?;
+        reader.sync().await?;
+
+        for id in ids {
+            assert!(
+                reader.get(*id).await.is_ok(),
+                "a fresh reader must see every acknowledged write, {id} is missing"
+            );
+        }
+
+        let report = reader.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "no author chain may fork: {:?}",
+            report.quarantined_authors
+        );
+        Ok(())
+    }
+
+    /// Seed for a store that only reads, distinct from every writing seed.
+    const READER_SEED: [u8; 32] = [9_u8; 32];
+    /// A second author, distinct from [`SOLO_SEED`].
+    const OTHER_SEED: [u8; 32] = [6_u8; 32];
+
+    /// Two author seeds sharing ONE writer lock and tip file, writing in turn.
+    ///
+    /// Regression test for the shared writer tip carrying no author: the second
+    /// author adopted the first author's op as its own `prev_op_hash`, so every
+    /// op after the first chained to the other author's chain and was quarantined.
+    #[tokio::test]
+    async fn two_authors_on_one_writer_lock_keep_their_own_chains() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let first =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let second =
+            store_over(Arc::clone(&blob), OTHER_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            ids.push(first.remember(numbered_input(2 * round)).await?);
+            ids.push(second.remember(numbered_input(2 * round + 1)).await?);
+        }
+
+        assert_fresh_reader_sees_all(&blob, &ids).await
+    }
+
+    /// [`WriterLock`]s for one bucket's tip file in `dir`, one per endpoint id
+    /// in `endpoints`, as the binary builds them for sessions that reach one
+    /// bucket through different URLs.
+    fn writer_locks_via(dir: &std::path::Path, endpoints: [&str; 2]) -> [Arc<WriterLock>; 2] {
+        endpoints.map(|endpoint| {
+            Arc::new(WriterLock::new(
+                dir.join("writer.lock"),
+                dir.join("writer-tip-v3.json"),
+                dir.join("writer-tip.json"),
+                endpoint.to_owned(),
+            ))
+        })
+    }
+
+    /// A bucket that refuses every head pointer PUT, so a write's published
+    /// head never moves and only the tip file can say where a chain is, and
+    /// whose LIST of the op-log shows nothing while `list_lags` is set, as an
+    /// eventually consistent gateway's LIST can right after a PUT.
+    struct LaggingBucket {
+        inner: MemoryBlobStore,
+        list_lags: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for LaggingBucket {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("/_heads/") {
+                return Err(MemError::Storage("head PUT refused by the test".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix.contains("/_oplog/") && self.list_lags.load(Ordering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Two live sessions under one seed reach one bucket through two endpoint
+    /// URLs and write in turn. Their tip entries carry different endpoint ids,
+    /// so each session must find the other's op in the bucket and chain to it.
+    /// Head PUTs are refused, so the published head cannot stand in for the
+    /// tip file, and the op-log LIST lags throughout the writes, so the check
+    /// must not depend on it.
+    ///
+    /// Regression test: each session chained to its own stale tip and the
+    /// author's chain forked, dropping acknowledged writes; then the check
+    /// found the other endpoint's op through a LIST, which a lagging gateway
+    /// answers without it.
+    #[test]
+    fn newest_lamport_is_the_committed_lamport_when_nothing_is_pending() {
+        let entry = tip_without_op_id(SharedTip {
+            lamport: 7,
+            tip_hash: crate::domain::Blake3Hash::new([7; 32]),
+        });
+        assert_eq!(newest_lamport(&entry), 7);
+    }
+
+    #[test]
+    fn recorded_committed_op_id_is_kept_only_when_the_clock_still_names_that_tip() {
+        let op_id = Ulid::new();
+        let committed = SharedTip {
+            lamport: 3,
+            tip_hash: crate::domain::Blake3Hash::new([3; 32]),
+        };
+        let tip = AuthorTip {
+            committed,
+            committed_op_id: Some(op_id),
+            pending: None,
+        };
+        assert_eq!(recorded_committed_op_id(Some(&tip), committed), Some(op_id));
+        assert_eq!(
+            recorded_committed_op_id(
+                Some(&tip),
+                SharedTip {
+                    lamport: 4,
+                    tip_hash: crate::domain::Blake3Hash::new([4; 32]),
+                }
+            ),
+            None,
+            "a clock that has moved on must not reuse the previous op id"
+        );
+        assert_eq!(recorded_committed_op_id(None, committed), None);
+    }
+
+    #[tokio::test]
+    async fn one_bucket_through_two_endpoints_keeps_one_chain() -> TestResult {
+        let bucket = Arc::new(LaggingBucket {
+            inner: MemoryBlobStore::default(),
+            list_lags: AtomicBool::new(true),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+        let first =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&via_a)));
+        let second =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&via_b)));
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            ids.push(first.remember(numbered_input(2 * round)).await?);
+            ids.push(second.remember(numbered_input(2 * round + 1)).await?);
+        }
+
+        // The last write was through endpoint-b and should have absorbed
+        // endpoint-a's entry, so the next write through b pays no extra GET.
+        let guard = via_b
+            .acquire()
+            .await?
+            .ok_or("the writer lock must be free after the writes")?;
+        let leftover = guard
+            .snapshot()
+            .via_other_endpoint
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        assert_eq!(
+            leftover, 0,
+            "the last write should have dropped the other endpoint's absorbed entry"
+        );
+        drop(guard);
+
+        bucket.list_lags.store(false, Ordering::SeqCst);
+        assert_fresh_reader_sees_all(&blob, &ids).await
+    }
+
+    /// Two gateways each hold a bucket of the same name, so one tip file serves
+    /// both, and one seed writes to each in turn. An entry recorded through the
+    /// other endpoint names an op this bucket does not hold, so neither bucket's
+    /// chain may continue from it.
+    ///
+    /// Regression test for the shared tip file trusting every entry: the
+    /// second bucket's op chained to the first bucket's op and was quarantined,
+    /// and the first bucket's next op chained to the second bucket's. Also for
+    /// a bucket check that a cached copy of the first bucket's op answered.
+    #[tokio::test]
+    async fn two_buckets_of_one_name_through_two_endpoints_keep_their_chains() -> TestResult {
+        // The local op cache is keyed by team, so both buckets share it, as
+        // the binary's do.
+        let cache = tempfile::tempdir()?;
+        let cached = || -> Arc<dyn BlobStore> {
+            Arc::new(crate::CachingBlobStore::new(
+                Arc::new(MemoryBlobStore::default()),
+                cache.path().to_path_buf(),
+                SecretKey::from_bytes([3; 32]),
+            ))
+        };
+        let (here, there) = (cached(), cached());
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+        let first = store_over(Arc::clone(&here), SOLO_SEED)?.with_writer_lock(Some(via_a));
+        let second = store_over(Arc::clone(&there), SOLO_SEED)?.with_writer_lock(Some(via_b));
+
+        let mut first_bucket_ids = vec![
+            first.remember(numbered_input(0)).await?,
+            first.remember(numbered_input(1)).await?,
+        ];
+        let second_bucket_ids = [second.remember(numbered_input(2)).await?];
+        first_bucket_ids.push(first.remember(numbered_input(3)).await?);
+
+        assert_fresh_reader_sees_all(&here, &first_bucket_ids).await?;
+        assert_fresh_reader_sees_all(&there, &second_bucket_ids).await
+    }
+
+    /// Two gateways each hold a bucket of the same name. A session on the first
+    /// dies after its op is durable and before it records the outcome, so its
+    /// head is never published; a session on the second writes; a new session
+    /// on the first then writes. It must still find and complete the pending
+    /// op, so the first bucket's chain does not fork.
+    ///
+    /// Regression test: the tip file held one entry per author, so the write
+    /// through the second gateway replaced the first gateway's entry and its
+    /// pending op, and the next session on the first chained to the older
+    /// published head and forked against the durable op.
+    #[tokio::test]
+    async fn a_pending_op_survives_a_write_to_another_bucket_of_the_same_name() -> TestResult {
+        let fake = Arc::new(HangAfterOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            landed: tokio::sync::Notify::new(),
+        });
+        let here: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let there: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+        let session_here = || {
+            store_over(Arc::clone(&here), SOLO_SEED)
+                .map(|s| s.with_writer_lock(Some(Arc::clone(&via_a))))
+        };
+
+        let base = session_here()?.remember(numbered_input(0)).await?;
+        let doomed = session_here()?;
+        fake.armed.store(true, Ordering::SeqCst);
+        tokio::select! {
+            result = doomed.remember(numbered_input(1)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.landed.notified() => {}
+        }
+        drop(doomed);
+
+        let elsewhere = store_over(Arc::clone(&there), SOLO_SEED)?.with_writer_lock(Some(via_b));
+        let there_id = elsewhere.remember(numbered_input(2)).await?;
+        let acked = session_here()?.remember(numbered_input(3)).await?;
+
+        assert_fresh_reader_sees_all(&here, &[base, acked]).await?;
+        assert_fresh_reader_sees_all(&there, &[there_id]).await
+    }
+
+    /// A session dies after its first op under this seed is durable, before it
+    /// records the outcome, so its entry holds only that pending op. A second
+    /// session reaching the same bucket through another endpoint then writes:
+    /// it must find the pending op in the bucket and chain to it.
+    ///
+    /// Regression test for checking an entry from another endpoint only by its
+    /// committed tip: with no committed op yet the entry was ignored, the second
+    /// session minted from genesis, and the chain forked against the durable op.
+    #[tokio::test]
+    async fn a_first_op_left_pending_through_another_endpoint_is_completed() -> TestResult {
+        let fake = Arc::new(HangAfterOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(true),
+            landed: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+
+        let doomed = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_a));
+        tokio::select! {
+            result = doomed.remember(numbered_input(0)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.landed.notified() => {}
+        }
+        drop(doomed);
+
+        let survivor = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_b));
+        let acked = survivor.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[acked]).await
+    }
+
+    /// A blob store whose op-log `put`, once armed, lands the object and then never
+    /// returns: the shape of a writer killed after its op reached the bucket but
+    /// before it recorded the outcome. `landed` fires once the object is stored.
+    struct HangAfterOplogPut {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        landed: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for HangAfterOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await?;
+            if key.contains("/_oplog/") && self.armed.swap(false, Ordering::SeqCst) {
+                self.landed.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A writer dies after its op is durable but before it records the tip; a
+    /// second session under the same seed, already running, then writes.
+    ///
+    /// Regression test: the second session chained to the older tip and forked
+    /// against the durable op, and the fork's tie-break kept the older op, so the
+    /// second session's acknowledged write vanished. Dropping the first write's
+    /// future mid-`put` stands in for the kill: it releases both locks exactly as
+    /// process exit does, and skips everything after the `put`.
+    #[tokio::test]
+    async fn a_write_after_a_writer_died_mid_append_is_not_lost() -> TestResult {
+        let fake = Arc::new(HangAfterOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            landed: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = |seed| -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), seed)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+
+        let base = session(SOLO_SEED)?.remember(numbered_input(0)).await?;
+        let survivor = session(SOLO_SEED)?;
+        survivor.sync().await?;
+
+        let doomed = session(SOLO_SEED)?;
+        fake.armed.store(true, Ordering::SeqCst);
+        tokio::select! {
+            result = doomed.remember(numbered_input(1)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.landed.notified() => {}
+        }
+        drop(doomed);
+
+        let acked = survivor.remember(numbered_input(2)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[base, acked]).await
+    }
+
+    /// A 0.7.1 process under the same seed writes between two writes of this
+    /// build on one machine. 0.7.1 updates only the legacy tip file, so this
+    /// build's own entry is stale afterwards.
+    ///
+    /// Regression test for mixed-version rollouts: this build read its stale
+    /// entry, chained to the older op, and forked against the 0.7.1 write. Now
+    /// it sees the legacy file moved and takes its newer published head. The
+    /// 0.7.1 writer is modelled by a lockless store that syncs, writes and
+    /// publishes its head, plus the legacy file write 0.7.1 makes.
+    #[tokio::test]
+    async fn a_write_by_an_older_build_in_between_is_not_forked_against() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (lock, dir) = writer_lock_in_temp()?;
+        let current = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+        let older = store_over(Arc::clone(&blob), SOLO_SEED)?;
+
+        let first = current.remember(numbered_input(0)).await?;
+        older.sync().await?;
+        let between = older.remember(numbered_input(1)).await?;
+        let older_tip = {
+            let clock = older.writer.lock().await;
+            crate::oplog::SharedTip {
+                lamport: clock.my_last_lamport,
+                tip_hash: clock.my_last_hash,
+            }
+        };
+        std::fs::write(
+            dir.path().join("writer-tip.json"),
+            serde_json::to_vec(&serde_json::json!({ "version": 1, "tip": older_tip }))?,
+        )?;
+
+        let last = current.remember(numbered_input(2)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[first, between, last]).await
+    }
+
+    /// A gateway that holds the first armed op PUT without storing it or
+    /// answering, until the test lands it: a request still in a send buffer when
+    /// its writer died, delivered later.
+    struct LateOplogPut {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        held: std::sync::Mutex<Option<(String, Vec<u8>)>>,
+        captured: tokio::sync::Notify,
+    }
+
+    impl LateOplogPut {
+        /// Deliver the held PUT now.
+        async fn land_held(&self) -> TestResult {
+            let (key, bytes) = self
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .ok_or("a PUT must have been held")?;
+            self.inner.put(&key, bytes).await?;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for LateOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("/_oplog/") && self.armed.swap(false, Ordering::SeqCst) {
+                *self.held.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((key.to_owned(), bytes));
+                self.captured.notify_one();
+                return std::future::pending().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A writer dies while its op PUT is still in flight; a second session
+    /// under the same seed writes; then the old PUT lands.
+    ///
+    /// Regression test: the second session found the pending op absent, chained
+    /// to the older tip, and the late PUT then forked the chain, dropping the
+    /// second session's acknowledged write. Now the second session completes the
+    /// pending op first, so the late PUT only rewrites identical bytes.
+    #[tokio::test]
+    async fn a_put_that_lands_after_its_writer_died_does_not_fork_the_chain() -> TestResult {
+        let fake = Arc::new(LateOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            held: std::sync::Mutex::new(None),
+            captured: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = |seed| -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), seed)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+
+        let base = session(SOLO_SEED)?.remember(numbered_input(0)).await?;
+        let survivor = session(SOLO_SEED)?;
+        survivor.sync().await?;
+
+        let doomed = session(SOLO_SEED)?;
+        fake.armed.store(true, Ordering::SeqCst);
+        tokio::select! {
+            result = doomed.remember(numbered_input(1)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.captured.notified() => {}
+        }
+        drop(doomed);
+
+        let acked = survivor.remember(numbered_input(2)).await?;
+        fake.land_held().await?;
+
+        assert_fresh_reader_sees_all(&blob, &[base, acked]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        assert_eq!(
+            reader.sync().await?,
+            3,
+            "the dead writer's op was completed"
+        );
+        Ok(())
+    }
+
+    /// An append that landed but reported an error, whose op delete would also
+    /// fail, followed by the next write in the same session.
+    ///
+    /// Regression test: the failed write cleared its pending record, so the next
+    /// write chained to the older tip, forked against the landed op, and the
+    /// fork's tie-break dropped the next acknowledged write. Now the caller hears
+    /// the outcome is unknown, the op and its blob stay, and the next write
+    /// chains to it.
+    #[tokio::test]
+    async fn a_failed_append_that_landed_is_kept_and_chained_to() -> TestResult {
+        let fake = Arc::new(DurableThenFailingOplogPut::new());
+        fake.also_fail_deletes();
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+
+        let base = store.remember(numbered_input(0)).await?;
+        fake.arm();
+        let err = store
+            .remember(numbered_input(1))
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        fake.disarm();
+        let acked = store.remember(numbered_input(2)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[base, acked]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        assert_eq!(
+            reader.sync().await?,
+            3,
+            "the unconfirmed note stays readable: its blob was kept"
+        );
+        Ok(())
+    }
+
+    /// An append that never landed is completed by the next write: the caller
+    /// was told its outcome is unknown, never that it failed, and it lands.
+    #[tokio::test]
+    async fn an_append_that_never_landed_is_completed_by_the_next_write() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+
+        fake.arm();
+        let err = store
+            .remember(numbered_input(0))
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(store.oplog.read_all(TEAM).await?.len(), 0);
+
+        fake.disarm();
+        let acked = store.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[acked]).await?;
+        assert_eq!(store.oplog.read_all(TEAM).await?.len(), 2);
+        Ok(())
+    }
+
+    /// Ops an earlier process left below the batch threshold, and did not flush
+    /// (it crashed), are anchored by the next process's flush. Pending leaves
+    /// lived only in memory, so the flush anchored only the two ops of its own
+    /// process.
+    #[tokio::test]
+    async fn ops_an_earlier_process_left_unanchored_are_anchored_later() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let earlier = store_with(Arc::clone(&blob), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 0..3 {
+            earlier.remember(numbered_input(n)).await?;
+        }
+        drop(earlier);
+
+        let later = store_with(Arc::clone(&blob), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 3..5 {
+            later.remember(numbered_input(n)).await?;
+        }
+        later.flush_anchors().await?;
+
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(
+            leaves, 5,
+            "the earlier process's three ops are in the batch too"
+        );
+        Ok(())
+    }
+
+    /// A record under this author's anchor prefix at seq `u64::MAX` that this
+    /// author never signed (here a copy of its real record with the seq and
+    /// Lamport range raised) does not stop its anchoring: the next batch lands
+    /// at seq 1 and holds the new op. The seq used to be one past the highest
+    /// key, so that one object failed every later batch of the author.
+    #[tokio::test]
+    async fn a_planted_anchor_record_at_the_last_seq_does_not_stop_anchoring() -> TestResult {
+        // Yielding, so the timeout below can fire on a loop that never ends; the
+        // in-memory store alone completes every call without returning to the
+        // runtime.
+        let blob: Arc<dyn BlobStore> = Arc::new(YieldingBlob(MemoryBlobStore::default()));
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        store.flush_anchors().await?;
+        let mut planted = read_anchor_records(&blob, TEAM)
+            .await?
+            .pop()
+            .ok_or("the first batch was anchored")?;
+        planted.seq = u64::MAX;
+        planted.meta.last_lamport = u64::MAX;
+        let key = format!(
+            "{TEAM}/_anchors/{}/{:020}",
+            store.author_key().to_hex(),
+            u64::MAX
+        );
+        blob.put(&key, serde_json::to_vec(&planted)?).await?;
+
+        let later = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        later.remember(numbered_input(1)).await?;
+        let flushed = tokio::time::timeout(Duration::from_mins(1), later.flush_anchors()).await??;
+
+        assert!(flushed.is_some(), "the new op was anchored");
+        let seqs: Vec<u64> = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.seq)
+            .collect();
+        assert_eq!(seqs, [0, 1]);
+        Ok(())
+    }
+
+    /// A byte-for-byte copy of this author's real signed record, put at the
+    /// seq `u64::MAX` key, does not count either: its signature is valid, but
+    /// it names another seq than its key. Taken as the newest record it would
+    /// leave no seq above it, failing every later batch.
+    #[tokio::test]
+    async fn a_signed_anchor_record_copied_to_another_seq_does_not_count() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        store.flush_anchors().await?;
+        let prefix = format!("{TEAM}/_anchors/{}/", store.author_key().to_hex());
+        let real = blob.get(&format!("{prefix}{:020}", 0)).await?;
+        blob.put(&format!("{prefix}{:020}", u64::MAX), real).await?;
+
+        let later = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        later.remember(numbered_input(1)).await?;
+        let flushed = later.flush_anchors().await?;
+
+        assert!(flushed.is_some(), "the new op was anchored");
+        assert!(
+            blob.get(&format!("{prefix}{:020}", 1)).await.is_ok(),
+            "the batch landed at seq 1"
+        );
+        Ok(())
+    }
+
+    /// A key under this author's prefix that is not of the minted
+    /// `{seq:020}` shape (here `.../0`) occupies no seq, so the first batch
+    /// still lands at seq 0.
+    #[tokio::test]
+    async fn an_anchor_key_not_of_the_minted_shape_occupies_no_seq() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let planted = format!("{TEAM}/_anchors/{}/0", store.author_key().to_hex());
+        blob.put(&planted, b"{}".to_vec()).await?;
+        store.remember(sample_input()).await?;
+
+        store.flush_anchors().await?;
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(
+            records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            [0]
+        );
+        Ok(())
+    }
+
+    /// A session's exit flush costs the same reads whether this author anchored
+    /// one batch before or forty: coverage comes from the newest signed record,
+    /// not from a GET of every record and a read of the whole team's log. The
+    /// bucket's GETs yield before they answer, as a gateway's do, so GETs
+    /// started ahead of the one that is used show in the count.
+    #[tokio::test]
+    async fn the_exit_requeue_does_not_grow_with_anchored_history() -> TestResult {
+        let gets_to_flush = |earlier_batches: usize| async move {
+            let bucket: Arc<dyn BlobStore> = Arc::new(PeakGetsBlob::default());
+            let earlier = store_with(Arc::clone(&bucket), SOLO_SEED, Arc::new(NoopAnchor), 1)?;
+            for n in 0..earlier_batches {
+                earlier.remember(numbered_input(n)).await?;
+            }
+            drop(earlier);
+            let meter = Arc::new(InstrumentedBlobStore::new(Arc::clone(&bucket)));
+            let later = store_with(
+                Arc::clone(&meter) as Arc<dyn BlobStore>,
+                SOLO_SEED,
+                Arc::new(NoopAnchor),
+                16,
+            )?;
+            later.remember(numbered_input(1000)).await?;
+            let before = meter.stats().get.calls;
+            later.flush_anchors().await?;
+            let leaves = read_anchor_records(&bucket, TEAM)
+                .await?
+                .last()
+                .map(|record| record.leaves.len());
+            Ok::<_, Box<dyn std::error::Error>>((meter.stats().get.calls - before, leaves))
+        };
+
+        let (one, one_leaves) = gets_to_flush(1).await?;
+        let (forty, forty_leaves) = gets_to_flush(40).await?;
+        assert_eq!(one, forty, "GETs per exit flush");
+        assert_eq!(one_leaves, Some(1), "only the new op is anchored");
+        assert_eq!(forty_leaves, Some(1), "only the new op is anchored");
+        Ok(())
+    }
+
+    /// Ops a session left below the batch threshold when it ended without a
+    /// flush (a crash) are anchored by the next session's first full batch.
+    /// That batch's record raises the watermark past them, so a requeue only
+    /// at the next session's exit no longer saw them.
+    #[tokio::test]
+    async fn a_crashed_sessions_ops_join_the_next_sessions_first_batch() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let crashed = store_with(Arc::clone(&bucket), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 0..3 {
+            crashed.remember(numbered_input(n)).await?;
+        }
+        drop(crashed);
+
+        let next = store_with(Arc::clone(&bucket), SOLO_SEED, Arc::new(NoopAnchor), 16)?;
+        for n in 100..116 {
+            next.remember(numbered_input(n)).await?;
+        }
+
+        let anchored: usize = read_anchor_records(&bucket, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(bucket.list(&format!("{TEAM}/_oplog/")).await?.len(), 19);
+        assert_eq!(anchored, 19, "every op of both sessions is anchored");
+        Ok(())
+    }
+
+    /// A store like [`store_over`] in `team` instead of [`TEAM`].
+    fn store_in_team(
+        blob: &Arc<dyn BlobStore>,
+        seed: [u8; 32],
+        team: &str,
+    ) -> Result<MemoryStore, MemError> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        Ok(MemoryStore::new(
+            Arc::clone(blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
+            team.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        ))
+    }
+
+    /// The leaves of every anchor record under [`TEAM`] that names [`TEAM`].
+    async fn team_anchored_leaves(blob: &Arc<dyn BlobStore>) -> Result<usize, MemError> {
+        Ok(read_anchor_records(blob, TEAM)
+            .await?
+            .iter()
+            .filter(|record| record.meta.team == TEAM)
+            .map(|record| record.leaves.len())
+            .sum())
+    }
+
+    /// An op this author signed in another team's log, copied into this
+    /// team's log at a well-formed key, is not anchored here: it names an
+    /// object of the other team, and a record listing it would report a
+    /// missing op on every reconcile of this team.
+    #[tokio::test]
+    async fn an_own_op_copied_from_another_team_is_not_anchored() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let elsewhere = store_in_team(&bucket, SOLO_SEED, "elsewhere")?;
+        elsewhere.remember(sample_input()).await?;
+        let foreign = bucket
+            .list("elsewhere/_oplog/")
+            .await?
+            .pop()
+            .ok_or("the other team's op was written")?;
+        let copy = foreign.replacen("elsewhere/", &format!("{TEAM}/"), 1);
+        bucket.put(&copy, bucket.get(&foreign).await?).await?;
+
+        let crashed = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        crashed.remember(numbered_input(0)).await?;
+        drop(crashed);
+        let next = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        next.flush_anchors().await?;
+
+        assert_eq!(
+            team_anchored_leaves(&bucket).await?,
+            1,
+            "only this team's op"
+        );
+        Ok(())
+    }
+
+    /// A signed anchor record of this author from another team, copied to a
+    /// free seq of this author's prefix here, does not set the watermark. Its
+    /// Lamport value is that team's, so taking it hid every op of this team
+    /// below it from the next exit flush.
+    #[tokio::test]
+    async fn an_own_anchor_record_copied_from_another_team_sets_no_watermark() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let elsewhere = store_in_team(&bucket, SOLO_SEED, "elsewhere")?;
+        for batch in 0..2 {
+            for n in 0..4 {
+                elsewhere.remember(numbered_input(batch * 10 + n)).await?;
+            }
+            elsewhere.flush_anchors().await?;
+        }
+        let author = elsewhere.author_key().to_hex();
+        let foreign = bucket
+            .get(&format!("elsewhere/_anchors/{author}/{:020}", 1))
+            .await?;
+
+        let crashed = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        crashed.remember(numbered_input(100)).await?;
+        crashed.flush_anchors().await?;
+        crashed.remember(numbered_input(101)).await?;
+        crashed.remember(numbered_input(102)).await?;
+        drop(crashed);
+        bucket
+            .put(&format!("{TEAM}/_anchors/{author}/{:020}", 1), foreign)
+            .await?;
+        let next = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        let flushed = next.flush_anchors().await?;
+
+        assert!(flushed.is_some(), "the crashed session's ops were anchored");
+        assert_eq!(
+            team_anchored_leaves(&bucket).await?,
+            3,
+            "every op of this team"
+        );
+        Ok(())
+    }
+
+    /// A blob store that records the most GETs it had in flight at once, and
+    /// how many GETs named an op-log key. Each GET yields once before it
+    /// answers, so GETs a caller issues together are all in flight together.
+    #[derive(Default)]
+    struct PeakGetsBlob {
+        inner: MemoryBlobStore,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        oplog_gets: AtomicUsize,
+    }
+
+    impl PeakGetsBlob {
+        fn reset(&self) {
+            self.peak.store(0, Ordering::SeqCst);
+            self.oplog_gets.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PeakGetsBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains("/_oplog/") {
+                self.oplog_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Objects under this author's anchor prefix above its newest signed
+    /// record are fetched several at a time on the way down to that record,
+    /// not one round trip each: forty of them used to cost forty round trips
+    /// in each exit flush.
+    #[tokio::test]
+    async fn the_walk_to_the_newest_own_anchor_record_fetches_concurrently() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let first = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        first.remember(numbered_input(0)).await?;
+        first.flush_anchors().await?;
+        let prefix = format!("{TEAM}/_anchors/{}/", first.author_key().to_hex());
+        for seq in 1..=40_u64 {
+            blob.put(&format!("{prefix}{seq:020}"), b"{}".to_vec())
+                .await?;
+        }
+
+        let next = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        next.remember(numbered_input(1)).await?;
+        bucket.reset();
+        next.flush_anchors().await?;
+
+        assert!(bucket.peak.load(Ordering::SeqCst) > 1, "GETs overlap");
+        assert!(
+            blob.get(&format!("{prefix}{:020}", 41)).await.is_ok(),
+            "the batch landed above the planted keys"
+        );
+        Ok(())
+    }
+
+    /// The ops a crashed session left unanchored are fetched several at a
+    /// time, not one round trip each, and not at all when this process's own
+    /// sync already verified them.
+    #[tokio::test]
+    async fn a_crashed_sessions_ops_are_fetched_concurrently_or_from_the_cache() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let crashed = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        for n in 0..20 {
+            crashed.remember(numbered_input(n)).await?;
+        }
+        drop(crashed);
+
+        let cold = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        bucket.reset();
+        cold.flush_anchors().await?;
+        assert!(bucket.peak.load(Ordering::SeqCst) > 1, "GETs overlap");
+        assert_eq!(bucket.oplog_gets.load(Ordering::SeqCst), 20);
+
+        for record in blob.list(&format!("{TEAM}/_anchors/")).await? {
+            blob.delete(&record).await?;
+        }
+        let synced = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        synced.sync().await?;
+        bucket.reset();
+        synced.flush_anchors().await?;
+        assert_eq!(
+            team_anchored_leaves(&blob).await?,
+            20,
+            "every op is anchored"
+        );
+        assert_eq!(
+            bucket.oplog_gets.load(Ordering::SeqCst),
+            0,
+            "the sync verified every op already"
+        );
+        Ok(())
+    }
+
+    /// Wrap keys above the floor that hold no wrap the founder provisioned are
+    /// fetched several at a time, not one round trip each. Each write rechecks
+    /// this once a minute.
+    #[tokio::test]
+    async fn the_newest_provisioned_epoch_lookup_fetches_concurrently() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        for epoch in 1..=40 {
+            blob.put(
+                &crate::wrapped_key_key(TEAM, epoch, "planted"),
+                b"{}".to_vec(),
+            )
+            .await?;
+        }
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+
+        assert_eq!(store.newest_provisioned_epoch(0).await?, None);
+        assert!(bucket.peak.load(Ordering::SeqCst) > 1, "GETs overlap");
+        Ok(())
+    }
+
+    /// Committing an anchor batch reads no anchor record: the next seq comes
+    /// from the keys of this author's own prefix. It used to GET every record
+    /// of every teammate, under the writer lock, on each batch.
+    #[tokio::test]
+    async fn an_anchor_batch_reads_no_teammate_record() -> TestResult {
+        let gets_to_flush = |teammate_records: u64| async move {
+            let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let teammate = store_over(Arc::clone(&bucket), OTHER_SEED)?;
+            for seq in 0..teammate_records {
+                let key = format!(
+                    "{TEAM}/_anchors/{}/{seq:020}",
+                    teammate.author_key().to_hex()
+                );
+                bucket.put(&key, b"{}".to_vec()).await?;
+            }
+            let meter = Arc::new(InstrumentedBlobStore::new(Arc::clone(&bucket)));
+            let store = store_over(Arc::clone(&meter) as Arc<dyn BlobStore>, SOLO_SEED)?;
+            store.remember(sample_input()).await?;
+            let before = meter.stats().get.calls;
+            store.flush_anchors().await?;
+            Ok::<u64, Box<dyn std::error::Error>>(meter.stats().get.calls - before)
+        };
+
+        assert_eq!(gets_to_flush(50).await?, gets_to_flush(0).await?);
+        Ok(())
+    }
+
+    /// A checkpoint that did not open is downloaded once per process, not on
+    /// every load. Three such objects above the honest checkpoints used to cost
+    /// three large GETs on every sync.
+    #[tokio::test]
+    async fn an_unopenable_checkpoint_is_not_downloaded_again() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        for lamport in [900_u64, 901, 902] {
+            let key = format!("{}{lamport:020}", snapshot_prefix(TEAM));
+            bucket.put(&key, b"not a sealed snapshot".to_vec()).await?;
+        }
+        let meter = Arc::new(InstrumentedBlobStore::read_only(Arc::clone(&bucket)));
+        let store = store_over(Arc::clone(&meter) as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        assert!(store.load_checkpoint().await?.is_none());
+        assert_eq!(meter.stats().get.calls, 3, "each object is tried once");
+        assert!(store.load_checkpoint().await?.is_none());
+        assert_eq!(meter.stats().get.calls, 3, "and not downloaded again");
+        Ok(())
+    }
+
+    /// Orders one failed op append against a concurrent sync: the sync's op-log
+    /// LIST waits until the op lands, the append then reports failure only
+    /// after the sync has read the op, so the sync's view holds an op the
+    /// writer is about to reclaim.
+    struct ReclaimRaceBlob {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        list_hooked: AtomicBool,
+        put_hooked: AtomicBool,
+        landed: Mutex<Option<String>>,
+        stage: tokio::sync::watch::Sender<u8>,
+    }
+
+    impl ReclaimRaceBlob {
+        async fn wait_for(&self, at_least: u8) {
+            let mut stage = self.stage.subscribe();
+            while *stage.borrow_and_update() < at_least {
+                if stage.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        fn advance(&self, to: u8) {
+            self.stage.send_if_modified(|stage| {
+                let moved = *stage < to;
+                *stage = (*stage).max(to);
+                moved
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ReclaimRaceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if self.armed.load(Ordering::SeqCst)
+                && key.contains("/_oplog/")
+                && !self.put_hooked.swap(true, Ordering::SeqCst)
+            {
+                self.inner.put(key, bytes).await?;
+                *self.landed.lock().map_err(|_| MemError::Crypto)? = Some(key.to_owned());
+                self.advance(2);
+                self.wait_for(3).await;
+                return Err(MemError::Storage("response lost (injected)".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let got = self.inner.get(key).await;
+            if self.landed.lock().map_err(|_| MemError::Crypto)?.as_deref() == Some(key) {
+                self.advance(3);
+            }
+            got
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if self.armed.load(Ordering::SeqCst)
+                && prefix.ends_with("/_oplog/")
+                && !self.list_hooked.swap(true, Ordering::SeqCst)
+            {
+                self.advance(1);
+                self.wait_for(2).await;
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Without a writer lock, a sync whose read listed an op that its failed
+    /// append then reclaimed does not make that op the head. It did, so the
+    /// next acknowledged write chained to a deleted op and a fresh reader
+    /// dropped it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sync_does_not_adopt_an_op_a_failed_append_reclaimed() -> TestResult {
+        let (stage, _keep) = tokio::sync::watch::channel(0_u8);
+        let race = Arc::new(ReclaimRaceBlob {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            list_hooked: AtomicBool::new(false),
+            put_hooked: AtomicBool::new(false),
+            landed: Mutex::new(None),
+            stage,
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&race) as Arc<dyn BlobStore>;
+        let store = Arc::new(store_over(Arc::clone(&blob), SOLO_SEED)?);
+        let first = store.remember(numbered_input(0)).await?;
+        store.sync().await?;
+
+        race.armed.store(true, Ordering::SeqCst);
+        let syncing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.sync().await })
+        };
+        race.wait_for(1).await;
+        assert!(
+            store.remember(numbered_input(1)).await.is_err(),
+            "the append fails"
+        );
+        syncing.await??;
+        race.armed.store(false, Ordering::SeqCst);
+
+        let third = store.remember(numbered_input(2)).await?;
+        assert_fresh_reader_sees_all(&blob, &[first, third]).await?;
+        Ok(())
+    }
+
+    /// A pending edit whose blob `gc` reclaimed before the next write is
+    /// dropped, not completed. Completing it published an op naming a deleted
+    /// blob, and every reader then failed `get` on the note that edit changed,
+    /// although its first version was still in the bucket.
+    #[tokio::test]
+    async fn a_pending_edit_whose_blob_gc_reclaimed_is_dropped() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+        let id = store.remember(numbered_input(0)).await?;
+
+        fake.arm();
+        let edit = RememberInput {
+            body: "the edited body".to_owned(),
+            ..numbered_input(0)
+        };
+        let err = store
+            .edit(id, edit)
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        fake.disarm();
+
+        let gc = store_over(Arc::clone(&blob), READER_SEED)?;
+        let swept = gc.sweep_orphan_blobs(Duration::ZERO, false).await?;
+        assert_eq!(
+            swept.orphans_reclaimed, 1,
+            "the edit's blob was unreferenced"
+        );
+
+        let later = store.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[id, later]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        reader.sync().await?;
+        assert_eq!(reader.get(id).await?.body, sample_input().body);
+        Ok(())
+    }
+
+    /// A pending edit older than the age bound is dropped even though its blob
+    /// is still in the bucket: `gc` on another machine may delete that blob
+    /// between the check and the op's PUT, and the op would then name a
+    /// missing blob.
+    #[tokio::test]
+    async fn a_pending_edit_past_the_age_bound_is_dropped() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?
+            .with_writer_lock(Some(lock))
+            .with_pending_op_max_age(Duration::ZERO);
+        let id = store.remember(numbered_input(0)).await?;
+
+        fake.arm();
+        let edit = RememberInput {
+            body: "the edited body".to_owned(),
+            ..numbered_input(0)
+        };
+        let err = store
+            .edit(id, edit)
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        fake.disarm();
+
+        let later = store.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[id, later]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        reader.sync().await?;
+        assert_eq!(reader.get(id).await?.body, sample_input().body);
+        Ok(())
+    }
+
+    /// A writer tip file that names an op the bucket no longer holds (the team
+    /// re-created under the same name, the state directory kept) does not
+    /// orphan the next writes. The writer adopted the file's tip without a
+    /// check, chained every new op to the missing one, and a fresh reader
+    /// dropped them all as a gap, a restart included.
+    #[tokio::test]
+    async fn a_tip_file_naming_an_op_the_bucket_lost_is_not_chained_to() -> TestResult {
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let first_bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let first = store_over(first_bucket, SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        first.remember(numbered_input(0)).await?;
+        first.remember(numbered_input(1)).await?;
+        drop(first);
+
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let second = store_over(Arc::clone(&bucket), SOLO_SEED)?.with_writer_lock(Some(lock));
+        second.sync().await?;
+        let later = [
+            second.remember(numbered_input(2)).await?,
+            second.remember(numbered_input(3)).await?,
+        ];
+
+        assert_fresh_reader_sees_all(&bucket, &later).await?;
+        Ok(())
+    }
+
+    /// Environment variable naming the directory a child writer process shares
+    /// with its parent: the blob store root, the state directory and the file the
+    /// child writes its note id to. [`writer_child_process`] does nothing without
+    /// it, so a run that includes ignored tests passes it harmlessly.
+    const CHILD_DIR_ENV: &str = "HIPPIUS_MEM_TEST_CHILD_DIR";
+
+    /// The child half of the multi-process writer tests: boot a store the way a
+    /// server process does (sync first) over the shared directories, write one
+    /// note and record its id. Runs only when the parent sets [`CHILD_DIR_ENV`].
+    ///
+    /// Ignored so a normal run does not count it as a passing test; the parent
+    /// runs it with `--ignored --exact`.
+    #[tokio::test]
+    #[ignore = "a child-process role, run by its parent test"]
+    async fn writer_child_process() -> TestResult {
+        let Some(dir) = std::env::var_os(CHILD_DIR_ENV).map(std::path::PathBuf::from) else {
+            return Ok(());
+        };
+        let seed: u8 = std::env::var("HIPPIUS_MEM_TEST_CHILD_SEED")?.parse()?;
+        let note: usize = std::env::var("HIPPIUS_MEM_TEST_CHILD_NOTE")?.parse()?;
+
+        let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.join("bucket")));
+        let lock = WriterLock::new(
+            dir.join("state/writer.lock"),
+            dir.join("state/writer-tip-v3.json"),
+            dir.join("state/writer-tip.json"),
+            "test-endpoint".to_owned(),
+        );
+        let store = store_over(blob, [seed; 32])?.with_writer_lock(Some(Arc::new(lock)));
+        store.sync().await?;
+
+        let id = store.remember(numbered_input(note)).await?;
+        std::fs::write(dir.join("written-id"), id.to_string())?;
+        Ok(())
+    }
+
+    /// Run [`writer_child_process`] in a new process of this test binary and
+    /// return the id of the note it wrote.
+    fn write_in_child_process(
+        dir: &std::path::Path,
+        seed: u8,
+        note: usize,
+    ) -> Result<NoteId, Box<dyn std::error::Error>> {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "store::tests::writer_child_process",
+                "--ignored",
+                "--exact",
+                "--quiet",
+            ])
+            .env(CHILD_DIR_ENV, dir)
+            .env("HIPPIUS_MEM_TEST_CHILD_SEED", seed.to_string())
+            .env("HIPPIUS_MEM_TEST_CHILD_NOTE", note.to_string())
+            .stdout(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(format!("child writer for seed {seed} exited with {status}").into());
+        }
+
+        Ok(std::fs::read_to_string(dir.join("written-id"))?.parse()?)
+    }
+
+    /// Two processes edit one note in turn with the same `expected_version`: the
+    /// second edit must conflict. Each `MemoryStore` here is all the state one
+    /// server process holds, and they share only the bucket.
+    ///
+    /// Regression test: the second process checked the version against its own
+    /// index, which had not seen the first edit, so the stale edit was accepted
+    /// and the first edit was lost.
+    #[tokio::test]
+    async fn a_sequential_stale_edit_from_another_process_conflicts() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let first = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let id = first.remember(numbered_input(0)).await?;
+
+        let second = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        second.sync().await?;
+        // Record a probe baseline, as a running server has, so the conflict below
+        // depends on seeing the first store's head move, not on a first probe
+        // that syncs because it has nothing to compare against.
+        second.refresh_now().await?;
+        let read_version = second.current_version(id)?;
+
+        first.sync().await?;
+        first
+            .edit_with_precondition(id, numbered_input(1), Some(read_version))
+            .await?;
+
+        let result = second
+            .edit_with_precondition(id, numbered_input(2), Some(read_version))
+            .await;
+        assert!(
+            matches!(result, Err(MemError::Conflict { .. })),
+            "a stale expected_version must conflict, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A gateway whose op and head PUTs fail on demand without storing.
+    struct DroppedOpAndHeadPuts {
+        inner: MemoryBlobStore,
+        fail_ops: AtomicBool,
+        fail_heads: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for DroppedOpAndHeadPuts {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            let fail = (key.contains("/_oplog/") && self.fail_ops.load(Ordering::SeqCst))
+                || (key.contains("/_heads/") && self.fail_heads.load(Ordering::SeqCst));
+            if fail {
+                return Err(MemError::Storage("put failed (injected)".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A session completes another session's unconfirmed edit while writing
+    /// something else, with its head publish failing so the head probe sees
+    /// nothing. Its index lacks that edit, so a later precondition edit from the
+    /// old version must still conflict.
+    ///
+    /// Regression test: the session counted its own write as the only change
+    /// since its sync and skipped the sync, so the stale edit was accepted.
+    #[tokio::test]
+    async fn completing_a_pending_edit_does_not_mark_the_index_current() -> TestResult {
+        let fake = Arc::new(DroppedOpAndHeadPuts {
+            inner: MemoryBlobStore::default(),
+            fail_ops: AtomicBool::new(false),
+            fail_heads: AtomicBool::new(false),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = || -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+        let first = session()?;
+        let id = first.remember(numbered_input(0)).await?;
+        let version = first.current_version(id)?;
+
+        fake.fail_ops.store(true, Ordering::SeqCst);
+        let unconfirmed = first.edit(id, numbered_input(1)).await;
+        assert!(
+            matches!(unconfirmed, Err(MemError::WriteOutcomeUnknown { .. })),
+            "got {unconfirmed:?}"
+        );
+        fake.fail_ops.store(false, Ordering::SeqCst);
+
+        let second = session()?;
+        second.sync().await?;
+        second.refresh_now().await?;
+        fake.fail_heads.store(true, Ordering::SeqCst);
+        second.remember(numbered_input(2)).await?;
+
+        let stale = second
+            .edit_with_precondition(id, numbered_input(3), Some(version))
+            .await;
+        assert!(
+            matches!(stale, Err(MemError::Conflict { .. })),
+            "the completed edit moved the note past {version:?}, got {stale:?}"
+        );
+        Ok(())
+    }
+
+    /// An edit without a precondition does not wait for this machine to settle:
+    /// only a precondition needs the index current.
+    #[tokio::test]
+    async fn a_plain_edit_does_not_wait_for_this_machine_to_settle() -> TestResult {
+        let fake = Arc::new(ChurningTipOnList {
+            inner: MemoryBlobStore::default(),
+            churn: std::sync::Mutex::new(None),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let id = store.remember(numbered_input(0)).await?;
+        *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = Some(lock);
+        // Leaves the remembered revision behind the file's.
+        store.sync().await?;
+
+        store.edit(id, numbered_input(1)).await?;
+        Ok(())
+    }
+
+    /// A pending op in the tip file that is not a valid op of this author
+    /// extending its committed tip is ignored, never completed.
+    #[tokio::test]
+    async fn an_invalid_pending_op_is_never_completed() -> TestResult {
+        use crate::oplog::{AuthorTip, GENESIS_PREV, OpContent, SharedTip};
+
+        let own = Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?;
+        let not_newer = Op::create_signed(
+            &own,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: 0,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: NoteId::new(),
+                object_key: format!("{TEAM}/global/note/op"),
+                cid: content_hash(b"ciphertext"),
+                prev_op_hash: GENESIS_PREV,
+            },
+        );
+        for (case, pending) in [
+            (
+                "another author's op",
+                crate::oplog::test_support::signed_op(1),
+            ),
+            ("an op no newer than the committed tip", not_newer),
+        ] {
+            let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let (lock, _dir) = writer_lock_in_temp()?;
+            {
+                let guard = lock.acquire().await?.ok_or("lock must be available")?;
+                guard.record(
+                    own.verifying_key(),
+                    AuthorTip {
+                        committed: SharedTip {
+                            lamport: 0,
+                            tip_hash: GENESIS_PREV,
+                        },
+                        committed_op_id: None,
+                        pending: Some(pending),
+                    },
+                    &[],
+                )?;
+            }
+            let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+            let id = store.remember(numbered_input(0)).await?;
+
+            assert_eq!(op_count(&blob).await?, 1, "{case} was not written");
+            assert_fresh_reader_sees_all(&blob, &[id]).await?;
+        }
+        Ok(())
+    }
+
+    /// A configured lock whose file cannot be opened makes the write
+    /// unserialized, which the write reports, even where no lock is required.
+    #[tokio::test]
+    async fn a_lock_that_cannot_be_opened_reports_an_unserialized_write() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("state"), b"")?;
+        let lock = WriterLock::new(
+            dir.path().join("state/writer.lock"),
+            dir.path().join("state/writer-tip-v3.json"),
+            dir.path().join("state/writer-tip.json"),
+            "test-endpoint".to_owned(),
+        );
+        let store = store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)?
+            .with_writer_lock(Some(Arc::new(lock)));
+
+        let written = store.remember_impl(numbered_input(0), None).await?;
+        assert_eq!(written.degraded, [super::Degradation::Unserialized]);
+        Ok(())
+    }
+
+    /// A clean write reports nothing, and a clean index leaves nothing out.
+    #[tokio::test]
+    async fn a_clean_write_reports_no_degradation() -> TestResult {
+        let store = store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)?;
+        store.check_team_key().await?;
+        let written = store.remember_impl(numbered_input(0), None).await?;
+        assert!(written.degraded.is_empty(), "{:?}", written.degraded);
+        assert_eq!(store.undecodable_notes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn held_epochs_lists_every_key_in_the_ring() -> TestResult {
+        let store = store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)?;
+        store.add_epoch_key(3, SecretKey::from_bytes([3; 32]));
+        assert_eq!(store.held_epochs(), [0, 3]);
+        Ok(())
+    }
+
+    /// The probe tries at most `KEY_PROBE_NOTES` notes, oldest first: eight that
+    /// open and eight that fail are a tie, whatever newer notes say.
+    #[tokio::test]
+    async fn the_key_probe_stops_at_its_bound() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        for i in 0..8 {
+            right.remember(numbered_input(i)).await?;
+        }
+        for i in 8..17 {
+            wrong.remember(numbered_input(i)).await?;
+        }
+
+        assert_eq!(
+            store_with_team_key(&blob, READER_SEED, TEST_KEY)?
+                .check_team_key()
+                .await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::Inconclusive)
+            }
+        );
+        Ok(())
+    }
+
+    /// A missing blob uses one of the probe's attempts: with every note blob
+    /// of the epoch gone, the probe stops at `super::KEY_PROBE_NOTES` GETs. Missing
+    /// blobs used to be skipped without counting, so the probe walked the
+    /// whole epoch, one GET per note, at every boot.
+    #[tokio::test]
+    async fn missing_blobs_count_toward_the_key_probe_bound() -> TestResult {
+        let fake = Arc::new(CountingGets::new("/mem_"));
+        let blob = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let writer = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        for i in 0..super::KEY_PROBE_NOTES + 4 {
+            writer.remember(numbered_input(i)).await?;
+        }
+        for key in blob.list(&format!("{TEAM}/")).await? {
+            if key.contains("/mem_") {
+                blob.delete(&key).await?;
+            }
+        }
+        let reader = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
+        let before = fake.gets.load(Ordering::SeqCst);
+
+        let probe = reader
+            .probe_epoch_key(0, &SecretKey::from_bytes(TEST_KEY))
+            .await?;
+
+        assert_eq!(probe, KeyProbe::Inconclusive, "nothing could be read");
+        assert_eq!(
+            fake.gets.load(Ordering::SeqCst) - before,
+            super::KEY_PROBE_NOTES
+        );
+        Ok(())
+    }
+
+    /// A store that counts GETs of keys containing `counted`.
+    struct CountingGets {
+        inner: MemoryBlobStore,
+        counted: &'static str,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingGets {
+        fn new(counted: &'static str) -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                counted,
+                gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for CountingGets {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains(self.counted) {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Writes inside the re-check interval reuse the verdict: one GET of the
+    /// published check, not one per write.
+    #[tokio::test]
+    async fn writes_inside_the_recheck_interval_read_the_check_once() -> TestResult {
+        let fake = Arc::new(CountingGets::new("/_keycheck/"));
+        let store = store_over(Arc::clone(&fake) as Arc<dyn BlobStore>, SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        store.remember(numbered_input(1)).await?;
+        assert_eq!(fake.gets.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// A re-read that still finds no check keeps the probe result, so a write
+    /// under a key that opened few notes keeps saying so.
+    #[tokio::test]
+    async fn a_reread_keeps_the_probe_result() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
+            .remember(numbered_input(0))
+            .await?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
+        wrong.check_team_key().await?;
+
+        let written = wrong.remember_impl(numbered_input(1), None).await?;
+        assert_eq!(written.degraded, [super::Degradation::TeamKeyUnverified]);
+        Ok(())
+    }
+
+    /// An op completed from a pending record joins the next anchor batch.
+    #[tokio::test]
+    async fn a_completed_pending_op_is_anchored() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::new(RecordingAnchor::new()),
+            NO_ANCHOR_THRESHOLD,
+        )?
+        .with_writer_lock(Some(lock));
+
+        fake.arm();
+        assert!(store.remember(numbered_input(0)).await.is_err());
+        fake.disarm();
+        store.remember(numbered_input(1)).await?;
+        store.flush_anchors().await?;
+
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(leaves, 2, "the completed op and the new one");
+        Ok(())
+    }
+
+    /// A store whose anchor is not the on-chain one does not report anchoring
+    /// on chain, so the binary keeps its exit flush bounded in time; reported
+    /// for every store, a stalled gateway would hold a closed session's
+    /// process. (The on-chain case needs a `SubxtAnchor`, which only a
+    /// connection to a live node builds.)
+    #[test]
+    fn only_the_chain_anchor_anchors_on_chain() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        for anchor in [
+            Arc::new(NoopAnchor) as Arc<dyn AuditAnchor>,
+            Arc::new(RecordingAnchor::new()),
+        ] {
+            let store = store_with(Arc::clone(&blob), SOLO_SEED, anchor, 16)?;
+            assert!(!store.anchors_on_chain());
+        }
+        Ok(())
+    }
+
+    /// An edit that completes another author's pending op (two seeds sharing
+    /// one state directory) keeps that op out of its own anchor batch. It used
+    /// to queue it, so this author signed a record covering an op it did not
+    /// write, and its batch's Lamport range took the other author's.
+    #[tokio::test]
+    async fn another_authors_completed_op_stays_out_of_this_authors_batch() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let other =
+            store_over(Arc::clone(&blob), OTHER_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let this = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::new(RecordingAnchor::new()),
+            NO_ANCHOR_THRESHOLD,
+        )?
+        .with_writer_lock(Some(lock));
+        fake.arm();
+        assert!(other.remember(numbered_input(0)).await.is_err());
+        fake.disarm();
+        let id = this.remember(numbered_input(1)).await?;
+        let version = this.current_version(id)?;
+
+        this.edit_with_precondition(id, numbered_input(2), Some(version))
+            .await?;
+        this.flush_anchors().await?;
+
+        assert_eq!(
+            other.oplog.read_all(TEAM).await?.len(),
+            3,
+            "the op was completed"
+        );
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(leaves, 2, "this author's remember and edit only");
+        other.flush_anchors().await?;
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(leaves, 3, "the other author's own flush anchors its op");
+        Ok(())
+    }
+
+    /// A gateway that pauses the first armed note-blob PUT until resumed, so a
+    /// test can run another session's whole edit inside one edit's window.
+    struct PausingNotePut {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        paused: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PausingNotePut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if !key.contains("/_") && self.armed.swap(false, Ordering::SeqCst) {
+                self.paused.notify_one();
+                self.resume.notified().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Two sessions on one machine edit one note concurrently from the same
+    /// version: exactly one succeeds. The first is held inside its call (after
+    /// its head probe, before its append) while the second edits.
+    ///
+    /// Regression test: the first session compared against its own index, which
+    /// had not seen the second edit, so both edits were accepted and one was
+    /// lost.
+    #[tokio::test]
+    async fn concurrent_same_version_edits_on_one_machine_conflict() -> TestResult {
+        let fake = Arc::new(PausingNotePut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            paused: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = || -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+        let first = session()?;
+        let second = session()?;
+
+        let id = first.remember(numbered_input(0)).await?;
+        first.sync().await?;
+        second.sync().await?;
+        let version = first.current_version(id)?;
+
+        fake.armed.store(true, Ordering::SeqCst);
+        let held_edit = first.edit_with_precondition(id, numbered_input(1), Some(version));
+        tokio::pin!(held_edit);
+        // An edit that ends before its note PUT never pauses; it fails the test
+        // here instead of leaving it waiting for the pause.
+        tokio::select! {
+            ended = &mut held_edit => {
+                return Err(format!("the first edit ended before its note PUT: {ended:?}").into());
+            }
+            () = fake.paused.notified() => {}
+        }
+        let other = second
+            .edit_with_precondition(id, numbered_input(2), Some(version))
+            .await;
+        fake.resume.notify_one();
+        let held = held_edit.await;
+
+        other?;
+        assert!(
+            matches!(held, Err(MemError::Conflict { .. })),
+            "the held edit read the same version and must conflict, got {held:?}"
+        );
+        Ok(())
+    }
+
+    /// A gateway whose every op-log listing comes with another process on this
+    /// machine recording in the tip file: the revision moves during every sync.
+    struct ChurningTipOnList {
+        inner: MemoryBlobStore,
+        churn: std::sync::Mutex<Option<Arc<WriterLock>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ChurningTipOnList {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let churn = self
+                .churn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if prefix.contains("_oplog")
+                && let Some(lock) = churn
+            {
+                let guard = lock.acquire().await?.ok_or_else(|| {
+                    MemError::Storage("the churning writer could not take the lock".to_owned())
+                })?;
+                guard.record(
+                    VerifyingKey::new([5; 32]),
+                    crate::oplog::AuthorTip {
+                        committed: crate::oplog::SharedTip {
+                            lamport: 1,
+                            tip_hash: crate::oplog::GENESIS_PREV,
+                        },
+                        committed_op_id: None,
+                        pending: None,
+                    },
+                    &[],
+                )?;
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// An edit with a precondition that never sees the tip file settle gives up
+    /// with a typed error after `EDIT_SYNC_ATTEMPTS` syncs and appends nothing.
+    /// It used to run one more sync, whose result it then discarded.
+    #[tokio::test]
+    async fn an_edit_that_never_sees_this_machine_settle_is_refused() -> TestResult {
+        let fake = Arc::new(ChurningTipOnList {
+            inner: MemoryBlobStore::default(),
+            churn: std::sync::Mutex::new(None),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let id = store.remember(numbered_input(0)).await?;
+        let version = store.current_version(id)?;
+
+        *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = Some(lock);
+        let syncs_before = store.syncs.load(Ordering::Relaxed);
+        let result = store
+            .edit_with_precondition(id, numbered_input(1), Some(version))
+            .await;
+
+        assert!(
+            matches!(result, Err(MemError::EditPreconditionBusy)),
+            "got {result:?}"
+        );
+        *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        // The precondition's refresh syncs once (this store never probed the
+        // heads), and the retry loop syncs `EDIT_SYNC_ATTEMPTS` times.
+        assert_eq!(
+            store.syncs.load(Ordering::Relaxed) - syncs_before,
+            1 + super::EDIT_SYNC_ATTEMPTS
+        );
+        assert_eq!(
+            store.oplog.read_all(TEAM).await?.len(),
+            1,
+            "nothing appended"
+        );
+        Ok(())
+    }
+
+    /// A store like [`store_over`] whose epoch-0 team key is `key`.
+    fn store_with_team_key(
+        blob: &Arc<dyn BlobStore>,
+        seed: [u8; 32],
+        key: [u8; 32],
+    ) -> Result<MemoryStore, MemError> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        Ok(MemoryStore::new(
+            Arc::clone(blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0, SecretKey::from_bytes(key))]),
+            0,
+            TEAM.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        ))
+    }
+
+    /// A well-formed key that is not the team's [`TEST_KEY`].
+    const WRONG_KEY: [u8; 32] = [0x42; 32];
+
+    async fn op_count(blob: &Arc<dyn BlobStore>) -> Result<usize, MemError> {
+        Ok(blob.list(&format!("{TEAM}/_oplog/")).await?.len())
+    }
+
+    /// The note-blob keys in the bucket: everything under the team that is not
+    /// an op, head, key check or probe object.
+    async fn note_blob_count(blob: &Arc<dyn BlobStore>) -> Result<usize, MemError> {
+        Ok(blob
+            .list(&format!("{TEAM}/"))
+            .await?
+            .iter()
+            .filter(|key| !key.contains("/_"))
+            .count())
+    }
+
+    /// A right-key client publishes the key check, and a client holding a
+    /// different key is then refused before it uploads anything.
+    ///
+    /// Regression test: a wrong key was accepted silently, and its writes were
+    /// sealed where no teammate could read them. The refusal also used to come
+    /// after the note's ciphertext was uploaded.
+    #[tokio::test]
+    async fn a_wrong_team_key_is_refused_once_a_key_check_is_published() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::Enforced)
+            }
+        );
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::AlreadyPublished
+        );
+
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        assert_eq!(wrong.check_team_key().await?, TeamKeyCheck::Mismatch);
+
+        let (ops, blobs) = (op_count(&blob).await?, note_blob_count(&blob).await?);
+        let result = wrong.remember(numbered_input(1)).await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { epoch: 0, .. })),
+            "a wrong-key write must be refused, got {result:?}"
+        );
+        assert_eq!(op_count(&blob).await?, ops, "no op appended");
+        assert_eq!(
+            note_blob_count(&blob).await?,
+            blobs,
+            "no ciphertext uploaded"
+        );
+
+        let again = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
+        assert_eq!(again.check_team_key().await?, TeamKeyCheck::Matches);
+        Ok(())
+    }
+
+    /// Booting never publishes a check, whichever key the booting server
+    /// holds.
+    ///
+    /// Regression test: a server booting on an epoch with no check published
+    /// one from its own key.
+    #[tokio::test]
+    async fn booting_never_publishes_a_key_check() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        assert_eq!(
+            wrong.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::NoNotes)
+            }
+        );
+        wrong.remember(numbered_input(0)).await?;
+        assert_eq!(
+            wrong.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::Opens)
+            }
+        );
+        assert!(
+            matches!(
+                read_key_check(blob.as_ref(), TEAM, 0).await?,
+                PublishedCheck::Absent
+            ),
+            "no check may appear without a deliberate publish"
+        );
+
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            right.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::FailsToOpen)
+            }
+        );
+        right.remember(numbered_input(1)).await?;
+        Ok(())
+    }
+
+    /// The probe is reported, never acted on: with most of the oldest notes
+    /// written under a wrong key, the right key probes `FailsToOpen` and the
+    /// wrong one `Opens`, neither is refused or publishes, and an explicit
+    /// publish by the right key then settles it.
+    ///
+    /// Regression test: the probe's majority decided both the verdict and
+    /// what was published.
+    #[tokio::test]
+    async fn a_wrong_key_majority_among_the_oldest_notes_decides_nothing() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
+        right.remember(numbered_input(0)).await?;
+        wrong.remember(numbered_input(1)).await?;
+        wrong.remember(numbered_input(2)).await?;
+
+        let fresh_right = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
+        assert_eq!(
+            fresh_right.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::FailsToOpen)
+            }
+        );
+        assert_eq!(
+            wrong.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::Opens)
+            }
+        );
+        let written = fresh_right.remember_impl(numbered_input(3), None).await?;
+        assert_eq!(
+            written.degraded,
+            [super::Degradation::TeamKeyUnverified],
+            "a write under a key that opens few notes says so"
+        );
+        assert!(matches!(
+            read_key_check(blob.as_ref(), TEAM, 0).await?,
+            PublishedCheck::Absent
+        ));
+
+        fresh_right
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
+        let result = wrong.remember(numbered_input(4)).await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
+            "the running wrong-key server re-reads and is refused, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A tie between notes that open and notes that fail is inconclusive for
+    /// either key.
+    #[tokio::test]
+    async fn a_probe_tie_is_inconclusive() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        wrong.remember(numbered_input(1)).await?;
+
+        for key in [TEST_KEY, WRONG_KEY] {
+            assert_eq!(
+                store_with_team_key(&blob, READER_SEED, key)?
+                    .check_team_key()
+                    .await?,
+                TeamKeyCheck::Unpublished {
+                    probe: Some(KeyProbe::Inconclusive)
+                }
+            );
+        }
+        Ok(())
+    }
+
+    /// Two keys publishing at once: one check lands, the other publisher hears
+    /// it was refused, and the stored check is the winner's.
+    ///
+    /// Regression test: both PUTs succeeded unconditionally and both clients
+    /// believed they had published, so the loser kept writing under a key the
+    /// bucket rejected.
+    #[tokio::test]
+    async fn of_two_concurrent_publishers_exactly_one_wins() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(YieldingBlob(MemoryBlobStore::default()));
+        let first = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let second = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+
+        let (a, b) = tokio::join!(
+            first.publish_team_key_check(0, PublishKeyCheck::IfAbsent),
+            second.publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+        );
+        let (a, b) = (a?, b?);
+        let published =
+            |found: KeyCheckPublished| matches!(found, KeyCheckPublished::Published { .. });
+        assert!(
+            published(a) != published(b),
+            "exactly one publisher wins: {a:?} {b:?}"
+        );
+
+        let (winner, loser) = if published(a) {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(winner.check_team_key().await?, TeamKeyCheck::Matches);
+        assert_eq!(loser.check_team_key().await?, TeamKeyCheck::Mismatch);
+        Ok(())
+    }
+
+    /// A store that yields before every call, so two joined futures interleave
+    /// at each request the way two processes would.
+    struct YieldingBlob(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for YieldingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            tokio::task::yield_now().await;
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            tokio::task::yield_now().await;
+            self.0.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            tokio::task::yield_now().await;
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            tokio::task::yield_now().await;
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            tokio::task::yield_now().await;
+            self.0.delete(key).await
+        }
+    }
+
+    /// A store whose first GET of each key-check object misses it: the window
+    /// in which another publisher writes between this one's read and its write.
+    struct MissesFirstKeyCheckGet {
+        inner: MemoryBlobStore,
+        missed: std::sync::Mutex<BTreeSet<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for MissesFirstKeyCheckGet {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.inner.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let first = key.contains("/_keycheck/")
+                && self
+                    .missed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key.to_owned());
+            if first {
+                return Err(MemError::NotFound { id: key.to_owned() });
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A publish whose first read missed an existing check (another publisher
+    /// wrote in between) does not overwrite it: the create-only write refuses
+    /// and the read back reports the loss.
+    #[tokio::test]
+    async fn a_publish_never_overwrites_a_check_its_first_read_missed() -> TestResult {
+        let inner = MemoryBlobStore::default();
+        let winner = SecretKey::from_bytes(TEST_KEY);
+        super::keycheck::write_key_check(&inner, TEAM, 0, &winner, WriteMode::CreateOnly).await?;
+        let blob: Arc<dyn BlobStore> = Arc::new(MissesFirstKeyCheckGet {
+            inner,
+            missed: std::sync::Mutex::new(BTreeSet::new()),
+        });
+
+        let late = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        assert_eq!(
+            late.publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused
+        );
+        assert_eq!(
+            store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
+                .check_team_key()
+                .await?,
+            TeamKeyCheck::Matches,
+            "the first publisher's check survives"
+        );
+        Ok(())
+    }
+
+    /// A gateway that ignores the create-only condition, standing in for one
+    /// whose support is not known.
+    struct IgnoresCreateOnly(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for IgnoresCreateOnly {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.0.put(key, bytes).await?;
+            Ok(CreateOutcome::Created)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// A machine whose key does not open the team's notes cannot publish its
+    /// key check, with or without `Replace`, and leaves no check object; the
+    /// right key then publishes as usual.
+    ///
+    /// Regression test: the publish wrote any key's check, so one run from a
+    /// machine with the wrong key made every right-key client refused.
+    #[tokio::test]
+    async fn a_key_that_does_not_open_the_teams_notes_is_not_published() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right.remember(numbered_input(1)).await?;
+
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        for mode in [PublishKeyCheck::IfAbsent, PublishKeyCheck::Replace] {
+            assert_eq!(
+                wrong.publish_team_key_check(0, mode).await?,
+                KeyCheckPublished::KeyFailsOnNotes,
+                "{mode:?}"
+            );
+            assert!(
+                blob.list(&key_check_key(TEAM, 0)).await?.is_empty(),
+                "{mode:?} wrote a check"
+            );
+        }
+        assert_eq!(wrong.probe_team_key(0).await?, KeyProbe::FailsToOpen);
+
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::Enforced)
+            }
+        );
+        assert_eq!(
+            wrong
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::KeyFailsOnNotes,
+            "a right-key check is not replaced by a key that fails on the notes"
+        );
+        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Matches);
+        assert_eq!(right.probe_team_key(0).await?, KeyProbe::Opens);
+        Ok(())
+    }
+
+    /// On a gateway that ignores the condition, the publish still refuses to
+    /// replace an existing check (it reads first) and says the create-only
+    /// write was not enforced.
+    #[tokio::test]
+    async fn a_publish_says_when_the_gateway_does_not_enforce_create_only() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(IgnoresCreateOnly(MemoryBlobStore::default()));
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::NotEnforced)
+            }
+        );
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        assert_eq!(
+            wrong
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused
+        );
+        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Matches);
+        Ok(())
+    }
+
+    /// A wrong or unusable check is never overwritten by an ordinary publish,
+    /// is reported as no check when unusable, and `Replace` recovers from
+    /// either; a server that held a mismatch then writes again after re-reading.
+    ///
+    /// Regression test: there was no in-product way to undo a wrong check, an
+    /// unusable object was treated as absent and overwritten, and a mismatch
+    /// was kept until restart.
+    #[tokio::test]
+    async fn a_wrong_or_unusable_check_is_replaced_only_on_purpose() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right =
+            store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?.with_key_check_recheck(Duration::ZERO);
+        let other_key = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        other_key
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
+
+        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Mismatch);
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused
+        );
+        assert!(right.remember(numbered_input(0)).await.is_err());
+
+        blob.put(&key_check_key(TEAM, 0), b"not a check".to_vec())
+            .await?;
+        assert_eq!(
+            right.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::NoNotes)
+            }
+        );
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused,
+            "an unusable object is not overwritten without Replace"
+        );
+
+        other_key
+            .publish_team_key_check(0, PublishKeyCheck::Replace)
+            .await?;
+        assert!(
+            right.remember(numbered_input(1)).await.is_err(),
+            "mismatch again"
+        );
+        assert!(matches!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::Published { .. }
+        ));
+        right.remember(numbered_input(2)).await?;
+        Ok(())
+    }
+
+    /// A server whose key matched a check that is later replaced by another
+    /// key's re-reads it and is refused.
+    ///
+    /// Regression test: a match was kept for the process lifetime, so after a
+    /// wrong check was replaced the servers that had matched it kept writing
+    /// notes their teammates could not read.
+    #[tokio::test]
+    async fn a_server_that_matched_a_replaced_check_is_refused() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right.remember(numbered_input(1)).await?;
+        // A wrong check written directly, as a build that published without
+        // trying the key on the notes did.
+        super::keycheck::write_key_check(
+            blob.as_ref(),
+            TEAM,
+            0,
+            &SecretKey::from_bytes(WRONG_KEY),
+            WriteMode::Replace,
+        )
+        .await?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
+        wrong.remember(numbered_input(2)).await?;
+
+        assert!(matches!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::Published { .. }
+        ));
+
+        let result = wrong.remember(numbered_input(1)).await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
+            "got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A gateway without create-only writes (the default `put_if_absent`
+    /// refuses) can still publish: `Replace` never needs it, and `IfAbsent`
+    /// falls back to a plain PUT after its existence check and says so.
+    #[tokio::test]
+    async fn a_gateway_without_create_only_writes_can_still_publish() -> TestResult {
+        struct PlainOnly(MemoryBlobStore);
+
+        #[async_trait::async_trait]
+        impl BlobStore for PlainOnly {
+            async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+                self.0.put(key, bytes).await
+            }
+
+            async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+                self.0.get(key).await
+            }
+
+            async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+                self.0.list(prefix).await
+            }
+
+            async fn delete(&self, key: &str) -> Result<(), MemError> {
+                self.0.delete(key).await
+            }
+        }
+
+        let blob: Arc<dyn BlobStore> = Arc::new(PlainOnly(MemoryBlobStore::default()));
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::Published { create_only: None }
+        );
+        assert_eq!(
+            right
+                .publish_team_key_check(1, PublishKeyCheck::IfAbsent)
+                .await
+                .err()
+                .map(|err| err.to_string()),
+            Some(MemError::KeyUnavailable { epoch: 1 }.to_string()),
+            "only epoch 0 is held"
+        );
+
+        let other: Arc<dyn BlobStore> = Arc::new(PlainOnly(MemoryBlobStore::default()));
+        let fresh = store_with_team_key(&other, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            fresh
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::NotEnforced)
+            }
+        );
+        Ok(())
+    }
+
+    /// A server that started while no check was published, and so writes,
+    /// re-reads the check and is refused once a right-key operator publishes.
+    ///
+    /// Regression test: the first verdict was kept for the process lifetime,
+    /// so a long-running wrong-key server kept writing.
+    #[tokio::test]
+    async fn a_running_server_re_reads_an_unpublished_check() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right.remember(numbered_input(1)).await?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
+        wrong.check_team_key().await?;
+        wrong.remember(numbered_input(2)).await?;
+
+        assert!(matches!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published { .. }
+        ));
+
+        let result = wrong.remember(numbered_input(1)).await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
+            "got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A wrong-key client must not publish an index checkpoint under the shared
+    /// checkpoint key once the team's key check is published.
+    #[tokio::test]
+    async fn a_wrong_team_key_writes_no_checkpoint() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
+        let checkpoints = || async { blob.list(&snapshot_prefix(TEAM)).await };
+        let before = checkpoints().await?;
+
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        let result = wrong.snapshot().await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(checkpoints().await?, before, "no checkpoint may be written");
+        Ok(())
+    }
+
+    /// A write whose pending record cannot be stored fails with a typed error
+    /// before its op is appended.
+    #[tokio::test]
+    async fn a_write_whose_tip_cannot_be_recorded_appends_nothing() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let dir = tempfile::tempdir()?;
+        // A regular file where the tip file's directory should be.
+        std::fs::write(dir.path().join("state"), b"")?;
+        let lock = WriterLock::new(
+            dir.path().join("writer.lock"),
+            dir.path().join("state/writer-tip-v3.json"),
+            dir.path().join("writer-tip.json"),
+            "test-endpoint".to_owned(),
+        );
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::new(lock)));
+
+        let result = store.remember(sample_input()).await;
+        assert!(
+            matches!(result, Err(MemError::WriterTip { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(op_count(&blob).await?, 0, "nothing appended");
+        assert_eq!(
+            note_blob_count(&blob).await?,
+            0,
+            "the note's blob was reclaimed"
+        );
+        Ok(())
+    }
+
+    /// An anchor that landed while the writer lock stayed busy is persisted by
+    /// the next flush, not anchored again.
+    ///
+    /// Regression test: the busy lock failed the persist, the leaves went back
+    /// to pending, and the next flush anchored the same root a second time,
+    /// which on chain costs a second fee and orphans the first anchor.
+    #[tokio::test]
+    async fn an_anchor_whose_record_could_not_be_persisted_is_not_anchored_again() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let anchor = Arc::new(RecordingAnchor::new());
+        let dir = tempfile::tempdir()?;
+        let lock = WriterLock::new(
+            dir.path().join("writer.lock"),
+            dir.path().join("writer-tip-v3.json"),
+            dir.path().join("writer-tip.json"),
+            "test-endpoint".to_owned(),
+        )
+        .with_acquire_timeout(Duration::from_millis(100));
+        let store = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::clone(&anchor) as Arc<dyn AuditAnchor>,
+            NO_ANCHOR_THRESHOLD,
+        )?
+        .with_writer_lock(Some(Arc::new(lock)));
+        store.remember(sample_input()).await?;
+
+        let peer = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join("writer.lock"))?;
+        peer.lock()?;
+        let busy = store.flush_anchors().await;
+        assert!(
+            matches!(busy, Err(MemError::WriterLockBusy { .. })),
+            "got {busy:?}"
+        );
+        assert_eq!(anchor.anchored().len(), 1, "the root was anchored once");
+        drop(peer);
+
+        store.flush_anchors().await?;
+        assert_eq!(anchor.anchored().len(), 1, "and not anchored again");
+        assert_eq!(
+            read_anchor_records(&blob, TEAM).await?.len(),
+            1,
+            "its record persisted"
+        );
+        Ok(())
+    }
+
+    /// A flush dropped while its anchored record is being persisted keeps the
+    /// record, and the next flush persists it without anchoring again.
+    #[tokio::test]
+    async fn a_flush_dropped_mid_persist_keeps_its_anchor() -> TestResult {
+        let gate = Arc::new(GatedAnchorPut::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&gate) as Arc<dyn BlobStore>;
+        let anchor = Arc::new(RecordingAnchor::new());
+        let store = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::clone(&anchor) as Arc<dyn AuditAnchor>,
+            NO_ANCHOR_THRESHOLD,
+        )?;
+        store.remember(sample_input()).await?;
+
+        tokio::select! {
+            result = store.flush_anchors() => {
+                return Err(format!("the gated record PUT never returns, got {result:?}").into());
+            }
+            () = gate.entered.notified() => {}
+        }
+        assert_eq!(anchor.anchored().len(), 1);
+
+        store.flush_anchors().await?;
+        assert_eq!(anchor.anchored().len(), 1, "not anchored again");
+        assert_eq!(
+            read_anchor_records(&blob, TEAM).await?.len(),
+            1,
+            "its record persisted"
+        );
+        Ok(())
+    }
+
+    /// The other child role: take the writer lock in `dir/state`, say so on
+    /// stdout, and hold it until the parent closes stdin. Runs only when the parent
+    /// sets `HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR`. Ignored for the reason
+    /// [`writer_child_process`] is.
+    #[tokio::test]
+    #[ignore = "a child-process role, run by its parent test"]
+    async fn lock_holder_child_process() -> TestResult {
+        use std::io::{Read as _, Write as _};
+
+        let Some(dir) =
+            std::env::var_os("HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR").map(std::path::PathBuf::from)
+        else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(dir.join("state"))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("state/writer.lock"))?;
+        file.lock()?;
+
+        let mut stdout = std::io::stdout();
+        writeln!(stdout, "lock-held")?;
+        stdout.flush()?;
+        std::io::stdin().read_to_end(&mut Vec::new())?;
+        drop(file);
+        Ok(())
+    }
+
+    /// A peer process holds the writer lock longer than the wait: the write must
+    /// fail with [`MemError::WriterLockBusy`], append nothing, and leave the chain
+    /// unforked for the writes that follow.
+    ///
+    /// Regression test: the write used to proceed unserialized after the timeout
+    /// and mint from its own stale clock, forking the chain against a write the
+    /// peer completed meanwhile.
+    #[tokio::test]
+    async fn a_write_fails_when_another_process_holds_the_writer_lock() -> TestResult {
+        use std::io::BufRead as _;
+
+        let dir = tempfile::tempdir()?;
+        let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.path().join("bucket")));
+        let lock = WriterLock::new(
+            dir.path().join("state/writer.lock"),
+            dir.path().join("state/writer-tip-v3.json"),
+            dir.path().join("state/writer-tip.json"),
+            "test-endpoint".to_owned(),
+        )
+        .with_acquire_timeout(Duration::from_millis(200));
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::new(lock)));
+        let base = store.remember(numbered_input(0)).await?;
+
+        let mut holder = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "store::tests::lock_holder_child_process",
+                "--ignored",
+                "--exact",
+                "--quiet",
+            ])
+            .env("HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR", dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let stdout = holder.stdout.take().ok_or("child stdout is piped")?;
+        // Kept open until the child exits: its test harness still writes to stdout
+        // after the lock is released, and a closed pipe would fail it.
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let held = lines
+            .by_ref()
+            .any(|line| line.is_ok_and(|line| line == "lock-held"));
+        assert!(held, "the lock-holder child must report it holds the lock");
+
+        let ops_before = blob.list(&format!("{TEAM}/_oplog/")).await?.len();
+        let result = store.remember(numbered_input(1)).await;
+        let ops_after = blob.list(&format!("{TEAM}/_oplog/")).await?.len();
+
+        drop(holder.stdin.take());
+        lines.for_each(drop);
+        let status = holder.wait()?;
+        assert!(status.success(), "lock-holder child exited with {status}");
+
+        assert!(
+            matches!(result, Err(MemError::WriterLockBusy { .. })),
+            "a write behind a held lock must fail with WriterLockBusy, got {result:?}"
+        );
+        assert_eq!(ops_before, ops_after, "the refused write must append no op");
+
+        let after = store.remember(numbered_input(2)).await?;
+        assert_fresh_reader_sees_all(&blob, &[base, after]).await
+    }
+
+    /// [`two_authors_on_one_writer_lock_keep_their_own_chains`] across real
+    /// processes: each write is a fresh process that boots, syncs and writes,
+    /// alternating two seeds over one bucket and one state directory.
+    #[tokio::test]
+    async fn two_authors_writing_from_separate_processes_keep_their_own_chains() -> TestResult {
+        let dir = tempfile::tempdir()?;
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            ids.push(write_in_child_process(dir.path(), SOLO_SEED[0], 2 * round)?);
+            ids.push(write_in_child_process(
+                dir.path(),
+                OTHER_SEED[0],
+                2 * round + 1,
+            )?);
+        }
+
+        let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.path().join("bucket")));
+        assert_fresh_reader_sees_all(&blob, &ids).await
     }
 
     /// Minimal [`tracing::Subscriber`] that records the message text of every
@@ -13504,20 +18988,30 @@ mod tests {
         let second = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 1)?
             .with_writer_lock(Some(Arc::clone(&lock)));
 
-        // Three concurrent branches, joined on one task: `first`'s write (which
-        // will block mid-anchor-persist), `second`'s write (which must run WHILE
+        // Three concurrent branches on one task: `first`'s write (which will
+        // block mid-anchor-persist), `second`'s write (which must run WHILE
         // `first` is blocked to reproduce two overlapping processes), and a
         // release trigger kept independent of `second` completing — nesting the
         // release inside `second`'s continuation would deadlock once the fix
-        // makes `second` wait on the very lock `first` is holding.
-        let (first_result, second_result, ()) = tokio::join!(
-            first.remember(sample_input()),
-            second.remember(sample_input()),
-            async {
-                gate.entered.notified().await;
-                gate.release.notify_one();
+        // makes `second` wait on the very lock `first` is holding. Writes that
+        // both end before reaching the persist never trip the gate; they fail
+        // the test here instead of leaving it waiting for the gate.
+        let writes = async {
+            tokio::join!(
+                first.remember(sample_input()),
+                second.remember(sample_input())
+            )
+        };
+        tokio::pin!(writes);
+        let (first_result, second_result) = tokio::select! {
+            ended = &mut writes => {
+                return Err(format!("both writes ended before the anchor persist: {ended:?}").into());
             }
-        );
+            () = gate.entered.notified() => {
+                gate.release.notify_one();
+                writes.await
+            }
+        };
         let id_first = first_result?;
         let id_second = second_result?;
 
@@ -17308,6 +22802,203 @@ mod tests {
             "a lagging head is the safe direction and the whole report must stay clean: \
              {report:?}"
         );
+        Ok(())
+    }
+
+    /// An edit with a version precondition, the first write after this
+    /// machine dropped an unconfirmed op, goes through. The settle step must
+    /// record the dropped op as gone: while the tip file still named it as
+    /// pending, every settle found it again and the edit gave up as busy.
+    #[tokio::test]
+    async fn an_edit_with_a_precondition_after_a_dropped_pending_op_goes_through() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?
+            .with_writer_lock(Some(lock))
+            .with_pending_op_max_age(Duration::ZERO);
+        let id = store.remember(numbered_input(0)).await?;
+
+        fake.arm();
+        let unconfirmed = store.remember(numbered_input(1)).await;
+        assert!(
+            matches!(unconfirmed, Err(MemError::WriteOutcomeUnknown { .. })),
+            "got {unconfirmed:?}"
+        );
+        fake.disarm();
+
+        let version = store.current_version(id)?;
+        let edit = RememberInput {
+            body: "the edited body".to_owned(),
+            ..numbered_input(0)
+        };
+        store
+            .edit_with_precondition(id, edit, Some(version))
+            .await?;
+        assert_eq!(store.hydrate(id).await?.body, "the edited body");
+        Ok(())
+    }
+
+    /// A steady writer's next write reads no op object back: the tip file
+    /// names the op this process wrote itself, which needs no check against
+    /// the bucket. Catches the check running on every write, one GET each.
+    #[tokio::test]
+    async fn a_steady_writers_next_write_reads_no_op_back() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+        store.remember(numbered_input(0)).await?;
+        store.remember(numbered_input(1)).await?;
+
+        bucket.reset();
+        store.remember(numbered_input(2)).await?;
+        assert_eq!(bucket.oplog_gets.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// A blob store that plants an object at the first anchor record key a
+    /// caller looks for and finds missing, as a second machine under the same
+    /// identity taking that seq between the seed and the check would.
+    #[derive(Default)]
+    struct SeqTakenOnceBlob {
+        inner: MemoryBlobStore,
+        planted: Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for SeqTakenOnceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let found = self.inner.get(key).await;
+            if matches!(found, Err(MemError::NotFound { .. })) && key.contains("/_anchors/") {
+                let first = {
+                    let mut planted = self.planted.lock().unwrap_or_else(PoisonError::into_inner);
+                    let first = planted.is_none();
+                    if first {
+                        *planted = Some(key.to_owned());
+                    }
+                    first
+                };
+                if first {
+                    self.inner.put(key, b"{}".to_vec()).await?;
+                    return self.inner.get(key).await;
+                }
+            }
+            found
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// An anchor whose seq another writer took after the seed moves to the
+    /// next free seq instead of failing: one collision is the case the retry
+    /// exists for.
+    #[tokio::test]
+    async fn an_anchor_seq_taken_once_moves_to_the_next_seq() -> TestResult {
+        let bucket = Arc::new(SeqTakenOnceBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        store.flush_anchors().await?;
+
+        let planted = bucket
+            .planted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or("the flush looked for a free anchor seq")?;
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let [record] = records.as_slice() else {
+            return Err(format!("one valid record expected: {records:?}").into());
+        };
+        assert_eq!(
+            format!(
+                "{TEAM}/_anchors/{}/{:020}",
+                record.author_key.to_hex(),
+                record.seq - 1
+            ),
+            planted,
+            "the record took the seq after the one found taken"
+        );
+        Ok(())
+    }
+
+    /// A blob store that counts LISTs of the wrapped-key prefix.
+    #[derive(Default)]
+    struct KeyListCountingBlob {
+        inner: MemoryBlobStore,
+        key_lists: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for KeyListCountingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix.starts_with(&format!("{TEAM}/_keys/")) {
+                self.key_lists.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Writes within `KEY_CHECK_RECHECK` of each other look for a newer epoch
+    /// once, not once per write: the lookup is a LIST of every wrapped key.
+    #[tokio::test]
+    async fn writes_close_together_look_for_a_newer_epoch_once() -> TestResult {
+        let bucket = Arc::new(KeyListCountingBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        let after_first = bucket.key_lists.load(Ordering::SeqCst);
+        assert!(after_first > 0, "the first write looks");
+
+        store.remember(numbered_input(1)).await?;
+        store.remember(numbered_input(2)).await?;
+        assert_eq!(bucket.key_lists.load(Ordering::SeqCst), after_first);
+        Ok(())
+    }
+
+    /// A process refused under epoch 0 because the founder rotated writes as
+    /// soon as it loads the rotated key: the refusal it holds is about sealing
+    /// under epoch 0, not about the epoch it now seals under.
+    #[tokio::test]
+    async fn loading_the_rotated_key_lifts_the_refusal_at_once() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        member.join_as_member(&identity).await?;
+        let rotation = founder.rotate_key(0).await?;
+
+        let refused = member.remember(numbered_input(1)).await;
+        assert!(
+            matches!(refused, Err(MemError::EpochSuperseded { epoch: 0, .. })),
+            "got {refused:?}"
+        );
+        // As the binary's epoch bootstrap does once a newer epoch's wrap loads.
+        let added = member
+            .bootstrap_epoch_keys(&identity, &[0, rotation.new_epoch])
+            .await?;
+        assert_eq!(added, 1, "the rotated epoch's wrap loads");
+        member.set_current_epoch(rotation.new_epoch);
+
+        member.remember(numbered_input(2)).await?;
         Ok(())
     }
 }

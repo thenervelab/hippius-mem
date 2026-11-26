@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use hippius_mem::server::{MemoryServer, WriteRoleGuard};
-use hippius_mem_core::MemoryStore;
+use hippius_mem_core::{KeyProbe, MemoryStore, TeamKeyCheck};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -169,6 +169,11 @@ Usage:
                                        unsigned_anchor_records gauge can reach 0;
                                        every member runs it, then
                                        require_signed_anchors is safe to enable
+  hippius-mem admin keycheck publish [--replace]
+                                       publish the team-key check for every epoch
+                                       this machine holds a key for, so a wrong key
+                                       is refused; --replace overwrites a wrong or
+                                       unusable check
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem invite [--name <label>]  founder: mint a teammate's sub-token and print
                                        the paste-ready invite bundle (--features console)
@@ -281,16 +286,60 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let runtime = boot_serve(ServeKind::Stdio).await?;
-    let service = runtime.server.serve(stdio()).await?;
-    service.waiting().await?;
-
-    // A `store.flush_anchors().await` here would seal any below-threshold batch on
-    // a clean exit. It is deliberately omitted: a stdio server has no orderly
-    // shutdown signal to hang it off (the transport just ends), and the op-log
-    // keeps every op regardless, so the next run re-buffers and anchors the
-    // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
-    // be an optimization, not a correctness fix.
+    let service = runtime.server.clone().serve(stdio()).await?;
+    // The transport ending (the client closed stdin) or SIGTERM ends the
+    // session. Either way, anchor the ops still buffered below the batch
+    // threshold: they live only in this process, and nothing else anchors them
+    // until a later session's own exit picks them up. A SIGKILL skips this.
+    tokio::select! {
+        waited = service.waiting() => {
+            waited?;
+        }
+        () = terminated() => {}
+    }
+    flush_until_signal(&runtime.server).await;
     Ok(())
+}
+
+/// Run [`MemoryServer::flush_on_exit`] until it ends or the process receives
+/// SIGTERM or Ctrl-C, for both `serve` paths.
+///
+/// A flush that anchors on chain has no time bound, since one cancelled after
+/// submission can land on chain with no record of it. A signal during the
+/// flush ends it, so an operator can still stop a session whose chain node
+/// hangs: the session's earlier [`terminated`] installed the SIGTERM and
+/// Ctrl-C handlers, and Tokio keeps them for the life of the process, so a
+/// signal no longer ends the process by itself.
+async fn flush_until_signal(server: &MemoryServer) {
+    tokio::select! {
+        () = server.flush_on_exit() => {}
+        () = terminated() => tracing::warn!(
+            "stopped anchoring the session's last ops at exit on a signal; the next session \
+             anchors them"
+        ),
+    }
+}
+
+/// Resolves when the process receives SIGTERM (or Ctrl-C), the signals a
+/// supervisor or a client sends to end a session.
+async fn terminated() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            // No SIGTERM handler could be installed: wait for Ctrl-C alone.
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// How [`boot_serve`] binds a profile and the MCP `default_repo`.
@@ -402,11 +451,40 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
         }
 
         // Best-effort, and independent of the mnemonic gate above (listing the
-        // `_keys/` prefix needs no identity): warn when the bucket has
-        // published a wrapped-key epoch newer than this machine's configured
-        // `max_epoch` (the recorded `bootstrap_epochs` gotcha's warning-side
-        // counterpart).
-        admin::warn_if_max_epoch_stale(&warmup_store, max_epoch).await;
+        // `_keys/` prefix needs no identity): warn when the founder provisioned
+        // an epoch this process holds no key for, whose writes are then refused.
+        admin::warn_if_epoch_superseded(&warmup_store).await;
+
+        // Compare this machine's team key with the team's published key check.
+        // Before `warm_tx`, so no write runs ahead of the verdict. A mismatch
+        // keeps serving reads (they are empty under a wrong key anyway) and every
+        // write then fails with the error, which reaches the agent in the tool
+        // result rather than only this log. Never publishes: see the core
+        // `keycheck` module docs for who may.
+        match warmup_store.check_team_key().await {
+            Ok(TeamKeyCheck::Mismatch) => tracing::error!(
+                "this machine's team key is not the team's key: writes are refused until \
+                 team_key_hex (or HIPPIUS_MEM_TEAM_KEY_HEX, when set) holds the right key; run \
+                 `hippius-mem doctor` to confirm the fix"
+            ),
+            Ok(TeamKeyCheck::Matches) => tracing::info!("team key matches the team's key check"),
+            Ok(TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::FailsToOpen),
+            }) => tracing::error!(
+                "this machine's team key opens fewer than half of the team's oldest notes it \
+                 tried, so it is probably not the team's key; writes are not refused, because \
+                 the team has published no key check. Fix team_key_hex (or \
+                 HIPPIUS_MEM_TEAM_KEY_HEX) if it is wrong; if it is right, run `hippius-mem \
+                 admin keycheck publish` so a wrong key is refused from then on"
+            ),
+            Ok(TeamKeyCheck::Unpublished { probe }) => tracing::warn!(
+                ?probe,
+                "the team has published no key check for this epoch, so a wrong team key \
+                 would not be refused; ask the founder to run `hippius-mem admin keycheck \
+                 publish` from their machine (a member's typo would lock the team out)"
+            ),
+            Err(err) => tracing::warn!(error = %err, "could not check the team key at boot"),
+        }
 
         // Signal "warmup attempt done" so waiting reads proceed. A send error
         // means every receiver was dropped (the server already exited) — harmless.
@@ -471,7 +549,9 @@ async fn run_http_serve(args: &[String]) -> anyhow::Result<()> {
     };
 
     let runtime = boot_serve(ServeKind::Daemon).await?;
-    http_mcp::serve(bound, runtime.server).await
+    http_mcp::serve(bound, runtime.server.clone(), terminated()).await?;
+    flush_until_signal(&runtime.server).await;
+    Ok(())
 }
 
 /// Run boot-time launch-repo provisioning and thread its outcome into the

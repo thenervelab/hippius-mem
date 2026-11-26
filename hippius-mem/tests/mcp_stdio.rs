@@ -99,11 +99,11 @@
 )]
 
 use std::io::{BufRead as _, Write as _};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -122,6 +122,16 @@ const STDOUT_LINE_DEADLINE: Duration = Duration::from_secs(20);
 /// lifetime. See [`StderrDrain::snapshot_after_grace`] for why this cannot
 /// be an unconditional join instead.
 const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// How long a test waits for the `Reinforce` op a `get` starts in the
+/// background. No reply orders that op, so the test polls the vault, and the
+/// wait ends as soon as the op lands. Arbitrary and generous.
+const REINFORCE_LANDING_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long a read-only session's vault is watched for an op its `get` should
+/// not have started. A wait, not a proof: an op that lands later is missed.
+/// Arbitrary.
+const REINFORCE_ABSENCE_WINDOW: Duration = Duration::from_secs(3);
 
 /// A fixed 32-byte team key, hex-encoded — not a real secret, just a
 /// well-formed fixture for a throwaway local trial vault this test creates
@@ -146,6 +156,28 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// How long a child the test asked to stop gets to exit before the test kills
+/// it and fails. Arbitrary: a clean exit, the exit flush included (bounded at
+/// 4 s), takes well under it, and the margin absorbs a loaded CI runner.
+const EXIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Wait for `child` to exit. Past [`EXIT_DEADLINE`], kill and reap it and fail,
+/// so a child that never exits fails the test instead of hanging the suite.
+fn wait_or_kill(child: &mut Child, what: &str) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= EXIT_DEADLINE {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("{what} did not exit within {EXIT_DEADLINE:?}; killed it").into());
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -442,6 +474,16 @@ impl StdioSession {
         self.stderr.snapshot_after_grace()
     }
 
+    /// Close the child's stdin, the way a client ends a session, and wait for
+    /// the child to exit on its own.
+    fn close_stdin_and_wait(self) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+        let Self {
+            mut child, stdin, ..
+        } = self;
+        drop(stdin);
+        wait_or_kill(&mut child.0, "the server after stdin closed")
+    }
+
     fn recv_json(&mut self, what: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let line = recv_line_or_fail(&self.stdout, &mut self.child, &self.stderr, what)?;
         serde_json::from_str(line.trim()).map_err(|err| {
@@ -613,26 +655,156 @@ fn the_binary_remembers_recalls_and_gets_over_stdio() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// A server launched inside a repository writes an unscoped `remember` to that
-/// repository, and says so. The bug this catches end to end: the launch
-/// repository reaching `recall` but not `remember`, so every note written
-/// without `repo` became team-wide.
+/// A session that ends with fewer writes than an anchor batch holds anchors
+/// them when its client closes stdin. They were buffered in memory only, so a
+/// stdio session (one process per agent session) anchored nothing unless it
+/// wrote a full batch.
 #[test]
-fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn std::error::Error>>
-{
+fn a_session_anchors_its_writes_when_the_client_closes_stdin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut session = StdioSession::spawn()?;
+    for (id, summary) in [(3, "kestrel cache warmup"), (4, "ibis queue drain")] {
+        session.call_tool(
+            id,
+            "remember",
+            &json!({ "note_type": "gotcha", "summary": summary, "body": "body", "repo": "global" }),
+        )?;
+    }
+    let dir = Arc::clone(&session.dir);
+    let status = session.close_stdin_and_wait()?;
+    assert!(
+        status.success(),
+        "the server exits cleanly on EOF: {status}"
+    );
+
+    let anchors = dir.path().join("vault").join("trial").join("_anchors");
+    let records = walk_files(&anchors);
+    assert_eq!(records.len(), 1, "one batch record: {records:?}");
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&records[0])?)?;
+    assert_eq!(
+        record["leaves"].as_array().map(Vec::len),
+        Some(2),
+        "{record}"
+    );
+    Ok(())
+}
+
+/// Every regular file under `dir`, recursively; empty when it does not exist.
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk_files(&path));
+        } else if !entry.file_name().to_string_lossy().starts_with('.') {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// A read-only session's `get` of a note it just recalled appends nothing.
+/// `get` counted the read as a use and appended a signed `Reinforce` op through
+/// the store, which a read-only session must never do.
+#[test]
+fn a_read_only_session_get_appends_no_op() -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = StdioSession::spawn()?;
+    let remembered = writer.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "tapir-index rebuild runs nightly",
+            "body": "it reads every note once",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    let id = stored["id"]
+        .as_str()
+        .ok_or("remember returns an id")?
+        .to_owned();
+
+    let mut reader = writer.spawn_sharing_vault()?;
+    let before = count_oplog_objects(&writer);
+    reader.call_tool(4, "recall", &json!({ "text": "tapir-index rebuild" }))?;
+    let got = reader.call_tool(5, "get", &json!({ "id": id }))?;
+    assert!(
+        call_text(&got).contains("it reads every note once"),
+        "{got}"
+    );
+    // The reinforcement a `get` starts runs detached, so no reply orders it.
+    let watch_until = Instant::now() + REINFORCE_ABSENCE_WINDOW;
+    while Instant::now() < watch_until {
+        assert_eq!(
+            count_oplog_objects(&writer),
+            before,
+            "a read-only session appended an op"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// A writable session's `get` of a note it just recalled appends one
+/// `Reinforce` op, without the reply waiting for it. Catches a server that
+/// never reinforces, or that reinforces only when it does not hold the write
+/// role.
+#[test]
+fn a_writable_session_get_of_a_recalled_note_appends_a_reinforce_op()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut session = StdioSession::spawn()?;
+    let remembered = session.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "okapi-cache warms at boot",
+            "body": "it loads every summary once",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    let id = stored["id"]
+        .as_str()
+        .ok_or("remember returns an id")?
+        .to_owned();
+
+    let before = count_oplog_objects(&session);
+    session.call_tool(4, "recall", &json!({ "text": "okapi-cache warms" }))?;
+    let got = session.call_tool(5, "get", &json!({ "id": id }))?;
+    assert!(
+        call_text(&got).contains("it loads every summary once"),
+        "{got}"
+    );
+
+    let deadline = Instant::now() + REINFORCE_LANDING_DEADLINE;
+    while count_oplog_objects(&session) == before {
+        assert!(
+            Instant::now() < deadline,
+            "no Reinforce op landed within {REINFORCE_LANDING_DEADLINE:?} of the get"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        count_oplog_objects(&session),
+        before + 1,
+        "one get appends one Reinforce op"
+    );
+    Ok(())
+}
+
+/// A temporary directory holding a seeded trial config and vault, made a git
+/// repository whose `origin` is `url`.
+fn trial_repository_with_origin(
+    url: &str,
+) -> Result<Arc<tempfile::TempDir>, Box<dyn std::error::Error>> {
     let dir = Arc::new(tempfile::tempdir()?);
     let vault_root = dir.path().join("vault");
     std::fs::create_dir_all(&vault_root)?;
     seed_trial_config(&dir.path().join("hippius-mem.toml"), &vault_root)?;
-    for args in [
-        &["init", "-q"][..],
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/widget.git",
-        ][..],
-    ] {
+    for args in [&["init", "-q"][..], &["remote", "add", "origin", url][..]] {
         let status = Command::new("git")
             .arg("-C")
             .arg(dir.path())
@@ -640,6 +812,54 @@ fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn 
             .status()?;
         assert!(status.success(), "git {args:?} failed");
     }
+    Ok(dir)
+}
+
+/// A repository whose name holds a dot (`next.js`) takes notes, and a fresh
+/// session reads them back from the vault. `remember` used to fail there,
+/// because the name went into the object key as is and a key component
+/// refuses `.`.
+#[test]
+fn a_dotted_repository_name_round_trips_through_the_vault() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = trial_repository_with_origin("git@github.com:acme/next.js.git")?;
+    let mut writer = StdioSession::spawn_bound(Arc::clone(&dir), &[])?;
+    let remembered = writer.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "gotcha",
+            "summary": "wombat-router prefetch loop",
+            "body": "disable prefetch on the catch-all route",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    assert_eq!(stored["repo"], "next.js", "{stored}");
+    let id = stored["id"]
+        .as_str()
+        .ok_or("remember returns an id")?
+        .to_owned();
+    drop(writer);
+
+    let mut reader = StdioSession::spawn_bound(dir, &[])?;
+    let recalled = reader.call_tool(4, "recall", &json!({ "text": "wombat-router" }))?;
+    assert!(call_text(&recalled).contains("wombat-router"), "{recalled}");
+    let got = reader.call_tool(5, "get", &json!({ "id": id }))?;
+    assert!(
+        call_text(&got).contains("disable prefetch on the catch-all route"),
+        "{got}"
+    );
+    Ok(())
+}
+
+/// A server launched inside a repository writes an unscoped `remember` to that
+/// repository, and says so. The bug this catches end to end: the launch
+/// repository reaching `recall` but not `remember`, so every note written
+/// without `repo` became team-wide.
+#[test]
+fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = trial_repository_with_origin("https://github.com/acme/widget.git")?;
     let mut session = StdioSession::spawn_bound(dir, &[])?;
 
     let remembered = session.call_tool(

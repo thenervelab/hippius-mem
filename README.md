@@ -227,8 +227,9 @@ config flag: a `--features embeddings` build (what `scripts/install.sh` and the
 recommended `cargo install` produce) compiles in a local `bge-small-en-v1.5` model, so
 paraphrases match and no note text leaves the machine — while a lean build, such as the
 Intel macOS prebuilt (`hippius-mem-lean`, for which ONNX Runtime ships no
-library), ranks by keyword overlap only, so a reworded situation can miss its note
-(pass `--from-source` there for semantic recall). The measured gap, the ranking rules, and the per-target table
+library), ranks by keyword overlap only, so a reworded situation can miss its note.
+`--from-source` does not change that on Intel macOS: the embeddings build fails to link
+there unless `ORT_LIB_LOCATION` names an ONNX Runtime you built. The measured gap, the ranking rules, and the per-target table
 are the canonical reference in
 [docs/SECURITY.md § Retrieval honesty](docs/SECURITY.md#retrieval-honesty).
 

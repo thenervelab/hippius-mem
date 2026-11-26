@@ -59,13 +59,18 @@ pub use manifest::{TeamManifest, load_manifest, publish_manifest};
 // re-export would be dead code in a release build.
 #[cfg(test)]
 pub(crate) use manifest::MANIFEST_DOMAIN;
+pub(crate) use manifest::next_free_manifest_version;
 pub use marker::{FileManifestMarker, ManifestMarker};
 #[cfg(test)]
 pub(crate) use teamkey::MEMBERKEY_DOMAIN;
 pub use teamkey::{
-    MemberKey, WrappedKey, fetch_team_key, highest_published_epoch, load_member_keys,
-    provision_team_key, publish_member_key, read_wrapped_key, rotate_team_key, unwrap_team_key,
-    wrap_team_key, wrapped_key_key, wrapped_key_recipients,
+    MemberKey, WrappedKey, fetch_team_key, load_member_keys, provision_team_key,
+    publish_member_key, read_wrapped_key, rotate_team_key, unwrap_team_key, wrap_team_key,
+    wrapped_key_key, wrapped_key_recipients,
+};
+pub(crate) use teamkey::{
+    create_wraps, first_provisioned_epoch, provisioner_authorized, put_wraps, seal_wraps,
+    unauthorized_wrap, wrap_epochs_addressed_to, wrap_keys_above,
 };
 
 use blake2::{Blake2b512, Digest};

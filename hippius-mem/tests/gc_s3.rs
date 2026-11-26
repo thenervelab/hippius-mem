@@ -35,8 +35,9 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
 )]
 
+mod support;
+
 use std::collections::BTreeSet;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,11 +87,12 @@ struct LiveEndpoint {
 impl LiveEndpoint {
     /// # Errors
     ///
-    /// Returns an error if `HIPPIUS_MEM_TEST_BUCKET` is unset.
+    /// Returns an error if `HIPPIUS_MEM_TEST_S3_ENDPOINT` or
+    /// `HIPPIUS_MEM_TEST_BUCKET` is unset.
     fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned()),
+                .context("set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint")?,
             bucket: std::env::var("HIPPIUS_MEM_TEST_BUCKET").context(
                 "set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint",
             )?,
@@ -235,7 +237,7 @@ fn run_gc(dir: &std::path::Path, toml: &str) -> anyhow::Result<std::process::Out
     let config_path = dir.join("hippius-mem.toml");
     std::fs::write(&config_path, toml)?;
 
-    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    support::binary()
         .arg("gc")
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir)

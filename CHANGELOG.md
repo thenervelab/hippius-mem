@@ -7,13 +7,412 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-24
+
+A minor release: it adds a bucket object (`{team}/_keycheck/{epoch}`), a local
+state file (`writer-tip-v3-<bucket>.json`), a CLI command and an MCP result
+field.
+
+### Upgrade notes
+
+- **Restart every hippius-mem session after upgrading** (each agent session's
+  MCP server, and a `serve` daemon). Until then 0.7.1 processes run beside this
+  version. This version keeps 0.7.1's `writer-tip.json` current while it names
+  this author's op on this bucket (never another seed's or another bucket's),
+  so a 0.7.1 process under the same seed chains to its writes, and when it sees
+  that a 0.7.1 process wrote, it checks its own published head too and logs "an
+  older hippius-mem (0.7.1 or earlier) wrote on this machine". What stays as in
+  0.7.1 while both run: a 0.7.1 write whose head publish failed can fork the
+  chain, 0.7.1 processes under two seeds break each other's chains as before,
+  and an edit's `expected_version` does not see a 0.7.1 process's concurrent
+  edit.
+- **Publish the team-key check once.** A server no longer publishes it at boot.
+  On a team that predates it, run `hippius-mem admin keycheck publish` from a
+  machine whose key is the team's (the founder's). Until then a wrong team key
+  is only warned about, not refused. `rotate` and `provision` publish it from
+  now on. 0.7.1 clients ignore the object.
+- **What the storage gateway must support.** Publishing the key check is a
+  create-only write (`If-None-Match: *` on PutObject, answered with 412 when the
+  key exists), which makes two publishers with different keys unable to
+  overwrite each other. `hippius-mem doctor` reports whether the gateway
+  enforces it; Hippius gateway support is not confirmed. Without it, a check
+  read back after it is written still catches every publisher that is not
+  concurrent, and nothing else changes. Nothing else in this release needs new
+  gateway support: completing an unconfirmed op and the same-machine
+  `expected_version` check use plain PUTs, GETs and local files. Edits from
+  two machines that read the same version still converge last-writer-wins.
+- Tool results' `warnings` entries are `{ code, message }` objects.
+
 ### Added
 
+- `hippius-mem admin keycheck publish [--replace]` publishes the team-key check
+  for every epoch this machine holds a key for; `--replace` overwrites a wrong
+  or unreadable one.
+- `doctor` reports whether the storage gateway enforces create-only writes.
 - `hippius-mem doctor` warns when a repository's installed hook scripts differ
   from the ones the binary installs, and names `hippius-mem init` as the fix.
   Upgrading the binary does not upgrade a repository's hooks, and nothing
   reported that before. The warning never fails `doctor`: an edited script
   differs too, and is the user's to keep.
+
+### Security
+
+- `url` 2.5.8 -> 2.5.9 (and `form_urlencoded` 1.2.2 -> 1.2.3, which it
+  requires) for RUSTSEC-2026-0592; `cargo deny check` passes again.
+- `cookie` 0.18.2 -> 0.18.3 for RUSTSEC-2026-0594 (lockfile only).
+
+### Fixed
+
+- Two author seeds writing one team from the same state directory no longer
+  break each other's op chains. `writer-tip.json` held one tip with no author,
+  so the second author chained its op to the first author's op, and a fresh
+  reader dropped almost every note both wrote. This version keeps its own tip
+  file, `writer-tip-v3-<bucket>.json`, with one entry per author key and one
+  file per bucket, so one team name used against two buckets no longer breaks
+  the second bucket's chain either. The file is named after the bucket, not
+  the endpoint URL, so sessions that reach one bucket through different URLs
+  (a trailing slash, a host alias, a proxy) share one tip per author. An
+  author has one entry per endpoint, and a write uses another endpoint's
+  newer entry only after a GET finds that entry's op in this bucket, so two
+  gateways that each hold a bucket of the same name keep separate chains and
+  never erase each other's pending op. It keeps
+  `writer-tip.json` current for 0.7.1 processes still running on the machine;
+  see the upgrade notes. A `writer-tip-v2-<location>.json` from a pre-release
+  build of this version is not read and can be deleted.
+- A session killed after its op reached the bucket, or while its op PUT was
+  still in flight, no longer makes the next same-seed session's acknowledged
+  write vanish. The writer records the signed op as pending before the append,
+  and the next writer completes it (an idempotent PUT of the same bytes) and
+  chains to it.
+- An op append the gateway does not confirm no longer forks the chain when it
+  landed anyway. Under the writer lock the op stays pending and the next write
+  completes it, and the write fails with "may not be stored yet; do not
+  re-issue it" (`MemError::WriteOutcomeUnknown`) instead of a plain storage
+  error. The note's ciphertext is kept.
+- A write that waits more than 30 s (was 10 s) for another process to release
+  the writer lock now fails with an error naming the lock file, and appends
+  nothing. It used to mint without the lock, which forked the author's chain
+  against the other process's write and could drop either one.
+- A wrong but well-formed team key is detected. Each key epoch can have a
+  key-check object at `{team}/_keycheck/{epoch}` (new in the bucket; older
+  clients ignore it). `rotate`, `provision` and the new `hippius-mem admin
+  keycheck publish` publish it, as a create-only write that is read back; a
+  server never publishes one at boot. The server compares its key at boot and
+  re-reads the check about once a minute after that. A mismatch
+  refuses writes and index checkpoints, before any ciphertext is uploaded, with
+  an error naming the fix, and `doctor` fails. Its message names the check's
+  object and says the check may be what was replaced (it is unsigned), so a
+  member compares with a teammate's `doctor` before changing a key. With no check the server only
+  warns, loudly when its key opens fewer than half of the epoch's oldest notes,
+  and the warning and `doctor` ask the founder to publish the check: on an
+  epoch with no notes a publish cannot tell a wrong key.
+  A publish (`--replace` included) tries the key on those notes first and
+  publishes nothing when it opens fewer than half of them, and `doctor` reports
+  that probe and fails on it while no check is published and the team has not
+  rotated past epoch 0 (beside a matching check, or after a rotation, it warns),
+  so a machine with a wrong key can neither publish its check nor pass `doctor`
+  on a team with notes and no check. `rotate` reports in its outcome, and warns, when it could not publish the new epoch's check, including when that epoch already has notes this machine's new key does not open. `admin keycheck publish --replace` replaces a wrong or unreadable
+  check. See
+  [Security](docs/SECURITY.md#team-key-check).
+- `get` on a note whose stored ciphertext was altered, replaced or sealed under
+  another key fails with "failed its integrity check" (`MemError::Integrity`),
+  in a fresh process as in a warm one. A fresh process used to say "not found",
+  and a warm one returned a generic storage error. `reconcile` gains
+  `skipped_malformed_ops`, the count of `_oplog/` objects that do not decode as
+  an op; they used to be skipped with a log line only.
+- Write tools add a `warnings` array of `{ code, message }` entries to their
+  result for what went degraded during that call (a write without the writer
+  lock, a failed tip or head update after the op was durable, a team key that
+  no published check confirms and that opens few of the team's notes), and
+  `recall` and `refresh` add one when notes are left out of recall as
+  undecodable. The key is absent otherwise. These used to reach stderr only.
+  Each call reports only its own degradations, also on a `serve` daemon shared
+  by several sessions.
+- A gateway that accepts a connection and never answers fails an S3 request
+  after 20 s per attempt, instead of holding it for the 5-minute attempt
+  timeout while the session waits. With three attempts and the retry backoff
+  one call fails in about 62 s; a write on a server that started moments before
+  first waits up to 90 s for the warmup read, so it fails after about 2.5
+  minutes (151 s was measured against a hung versitygw). A PUT's bound grows
+  with its body, so a large index checkpoint on a slow link is not cut short.
+- `edit` with a stale `expected_version` conflicts when the newer edit came from
+  another process or machine. The check used the process's own index, so a
+  second session that read v0 could overwrite an edit another session made from
+  v0. On one machine the check now runs under the writer lock against an index
+  that holds every op the machine's sessions committed, so of two concurrent
+  edits from the same version the later one conflicts. The edit also syncs any
+  author whose published head moved before it compares, which catches an edit
+  committed on another machine before the call; one committed on another machine
+  while the call runs still converges last-writer-wins. An edit that cannot see
+  this machine's sessions settle after three syncs fails with
+  `EditPreconditionBusy` and writes nothing.
+- A malformed team key set through `HIPPIUS_MEM_TEAM_KEY_HEX` is reported under
+  that name instead of `team_key_hex`, and the load error no longer tells a
+  machine with an existing but invalid configuration to run `quickstart`.
+- The size limits on `remember` and `edit` are documented in the tool schema and
+  in `docs/REFERENCE.md`: summary 512 characters, body 131072 characters
+  (Unicode scalar values, not bytes), 64 tags of 128 characters.
+- `link` with `rel` `supersedes` (or another typed relation) takes effect in the
+  next `recall` on the same machine; it used to wait for a refresh or restart.
+- `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
+  of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
+- Docs: the founder build line in `docs/TEAMS.md` adds `http-mcp`, so it no
+  longer replaces the installed binary with one where `serve` and the
+  `url`-wired clients stop working. The docs no longer name a `hippius-mem
+  snapshot` command, which does not exist, and no longer offer
+  `--from-source` for semantic recall on Intel macOS, where the embeddings
+  build does not link without a locally built ONNX Runtime.
+- `remember` without `force` refuses a note whose summary matches an existing
+  note in the same scope also when that note has tags. The stored side of the
+  lexical comparison counted the tags as words, so a tagged note sent again
+  was written a second time.
+- A storage error from the S3 gateway is one short line: the HTTP status,
+  the S3 error code, the gateway's message cut to 200 characters, and the
+  request id. It used to carry the SDK's whole error chain, which repeated
+  the access key id and the signed request on a signature mismatch and the
+  full response body however large (20 MiB was measured).
+- `remember` works in a repository whose name holds a character outside
+  `[A-Za-z0-9_-]`, such as `next.js`. The name stays as is in the note and in
+  `recall`; only its object-key segment is escaped (`_repo-next_2Ejs`), so the
+  key alphabet does not change and every existing key keeps its name. A 0.7.1
+  client skips such a note, since it reads the escaped segment as the repo
+  name.
+- A write the gateway did not confirm, followed by `gc` reclaiming its blob
+  before the next write on that machine, no longer leaves the note
+  unreadable for the whole team. The next write used to complete the op,
+  which then named a deleted blob; it now drops that op and logs that the
+  unconfirmed write is lost, and the note keeps its previous version. Such
+  a write is also dropped once it is an hour old, because `gc` on another
+  machine could delete its blob between the check and the op's PUT, and
+  `gc` now refuses `--grace-hours` below 2 for a real sweep (it refused only
+  0), so the two hours cover that hour plus an hour of clock difference.
+- A checkpoint no longer deletes itself when the bucket holds three or more
+  checkpoint objects at higher keys that this machine cannot open (a team
+  re-created under the same name, a foreign upload). The retention sweep
+  counted those, so every honest checkpoint fell outside the three it keeps
+  and was removed right after it was written, and every sync rebuilt in
+  full. The sweep now deletes only checkpoints older than the one just
+  written, and a process downloads a checkpoint that does not open only
+  once.
+- Committing an anchor batch reads the next sequence number from this
+  author's own `_anchors/{author}/` prefix only: one LIST, and a GET of the
+  newest record, whose signature must verify under the author's key. The
+  batch takes the first free number above that record. It used to download
+  every anchor record of every teammate, under the writer lock, on each
+  batch (201 GETs with 200 teammate records), and took the number from any
+  record body that claimed this author, so one record naming the last
+  possible number made every sixteenth write spin forever. A key at the last
+  number that this author did not sign is now stepped over, and a run of
+  collisions gives up after 8 attempts.
+- A member whose `author_seed_hex` is not its mnemonic's seed (the setup
+  `join --bundle` and the installer create, one random seed per machine)
+  now loads the key of an epoch the founder rotated to. Its member key, and
+  so the founder's wrap, is stored under the author address, but the
+  bootstrap looked the wrap up under the mnemonic's address, so after
+  `rotate` or `remove` no such member received the new key and every
+  machine kept sealing under the old one. `doctor` now fails when the team
+  has rotated past epoch 0 and this machine has no wrap of the newest
+  epoch it can open, and `join` logs the address the founder provisions to.
+- `rotate` and `remove` no longer mint an epoch the team already has when
+  this machine's `max_epoch` is stale (for example a founder who rotated,
+  restarted, and did not raise it). The new epoch was one past the local
+  key ring and `max_epoch` only, so a second rotation minted the same epoch
+  with a new key and overwrote its wraps, and notes sealed under the first
+  key could not be opened after a restart. The new epoch is now also past
+  the newest epoch the founder provisioned in the bucket, and it steps over
+  any epoch a wrap or a key check object already holds. A rotation's wraps
+  are create-only writes where the gateway enforces them; one that loses a
+  wrap slot to a concurrent rotation fails (`MemError::EpochTaken`) and
+  deletes the wraps it had written, so no member receives the key it
+  discards. A wrap write that reports a conflict or an error is read back
+  first: a retried write that finds its own wrap counts as written, and a
+  failed write whose wrap was stored is deleted with the others.
+- The founder's `rotate`, `remove`, `provision`, `members` and recovery
+  commands use the same manifest rollback protection as `sync`. They read
+  the bucket's manifest directly, so when the newest manifest object was
+  garbled or gone, a rotation wrapped the new key to a member that manifest
+  had removed, and the next `remove` signed the removed member back in. A
+  manifest this machine publishes, a `recover` included, now raises the
+  watermark and the durable marker at once, and a manifest that differs
+  from the applied one at the same version is refused.
+- A writer tip file that names an op the bucket no longer holds (a team
+  re-created under the same name, or a bucket restored from an older copy,
+  with the machine's state directory kept) no longer orphans every later
+  write. The writer chained new ops to the missing one and a fresh reader
+  dropped them all, a restart included. When this machine's own tip entry
+  is ahead of what the process already holds, the writer now checks with
+  one GET that the bucket holds that op and ignores the entry when it does
+  not.
+- A session anchors the ops it buffered below the 16-op batch threshold when
+  it ends: when the client closes a stdio server's stdin, or on SIGTERM or
+  Ctrl-C (stdio and `serve`). The buffer lived only in memory, so a stdio
+  session, one process per agent session, anchored nothing unless it wrote
+  16 ops, and `reconcile` checked almost no batches. An ending session also
+  anchors this author's earlier ops above its newest signed batch record,
+  such as those of a session that crashed: one LIST of its anchor prefix
+  and one GET, one LIST of the op log and a GET per such op, so the cost
+  does not grow with the author's history. The exit flush is bounded at 4 s,
+  under the Hermes plugin's 5 s grace, and what it leaves is anchored by the
+  next session. A code comment and `docs/SECURITY.md` said this already
+  happened.
+- Docs: `docs/SECURITY.md` and `docs/AGENTS-SUPPORT.md` now state the full
+  cost of one identity writing from two machines: after a fork the losing
+  machine's later writes are dropped too until its process restarts, each
+  still returning an id, and the team view can flip to the longer branch.
+  Behaviour is unchanged.
+- On the shared `serve` daemon, `remember` without `repo` is refused with
+  "invalid repo", naming the two valid forms (a repository name, or
+  `"global"`), as the CLI already refuses it. It used to write the note
+  team-global, into the pool every repository's recall and brief read.
+- `get` no longer waits for the `Reinforce` op it may append after a recent
+  `recall` (the writer lock, up to 30 s when another process holds it, and
+  the op and head PUTs); the server appends it in the background. A
+  read-only session, such as a second session on a trial vault, appends
+  none, and `edit` no longer appends a `Reinforce` ahead of its own `Edit`.
+- The session brief no longer lists a note another live note supersedes or
+  duplicates, frames its notes as reference data teammates wrote rather
+  than instructions, and keeps every summary on one line, so a note synced
+  from another machine with a newline in its summary cannot add a heading
+  or line of its own. A note dated in the future still sorts first.
+- `install` and `install --uninstall` edit Codex's and Grok's
+  `config.toml` in place: comments, key order and inline tables outside the
+  `[mcp_servers.hippius-mem]` table are kept, uninstall gives back the file
+  as it was. A config that is a symlink (a dotfiles checkout) is refused
+  with an error naming it, and neither the link nor its target is changed:
+  writing through the link would put the entry, which can carry the bearer
+  token, into a file the user may commit. Uninstall refuses a linked config
+  only when it holds the entry, so `install --uninstall --all-detected`
+  passes a linked config it never wrote to. An agent whose config is
+  refused is skipped: `install` and `install --uninstall` still handle the
+  other selected agents and the `~/.claude/CLAUDE.md` block, then exit
+  non-zero naming each skipped agent and why. The file used to be
+  re-serialized whole. This adds the `toml_edit` crate to the binary, already in the
+  lockfile.
+- `upgrade` refuses a destination bucket whose team prefix already holds
+  objects this trial vault did not write (another vault upgraded there:
+  every quickstart vault is named `trial` by default), before it copies or
+  touches the config. It used to copy in, mixing two histories under two
+  team keys, and flip the config before its own check failed. A re-run
+  after a partial copy still works, and the copy no longer picks up a team
+  whose name only starts with this one's (`trial2` for `trial`).
+- Without a writer lock (no state directory resolves, or a store built
+  without one), a sync running while an op append fails no longer makes
+  the reclaimed op this author's head. The next acknowledged write chained
+  to the deleted op, and a fresh reader dropped it.
+- `install` checks that the daemon answering on the shared loopback port
+  17432 is this user's before it wires clients to it: the daemon answers a
+  fresh challenge on the new unauthenticated `GET /token-proof?nonce=` with
+  a keyed hash of its bearer token, which never leaves the client, and a
+  wrong answer fails the install naming the cause. On a host
+  with several users it used to accept any daemon whose unauthenticated
+  `/health` answered, and send this user's token and tool calls to it.
+  `serve` on a taken port exits 0 only when the daemon there proves the same
+  token, and fails otherwise (it used to exit 0 for any daemon answering
+  `/health`, so the user's service stopped retrying the port). `call`,
+  `remember`, `recall`, `get` and `path-notes` make the same check before
+  they send the token, in place of their `/health` request. The MCP clients
+  do not: while this user's daemon is not running, another local user who
+  binds the port receives their token and tool calls. SECURITY.md states
+  this limit; on a machine with other users, wire agents over stdio.
+- Hermes plugin: a request to a hippius-mem child that never answers fails
+  after 120 s instead of blocking the turn, a dead child's broken pipe is
+  reported like any other tool failure instead of raising into the turn,
+  `shutdown` returns (closing stdin, then SIGTERM, then SIGKILL) even when
+  a background refresh is waiting on a stuck child, and a failed boot
+  reports the child's last stderr lines.
+- After a `rotate` or `remove`, a process that holds no key for the new
+  epoch refuses to write a note (`EpochSuperseded`, naming both epochs and
+  the fix) instead of sealing it under the older key, which a removed member
+  still holds. This includes the `serve` daemon the installer wires, which
+  runs without `HIPPIUS_MEM_MNEMONIC` and so cannot load rotated keys; its
+  writes stay refused until the member runs a server with the mnemonic. The
+  check costs one LIST of `{team}/_keys/` per minute on the write path.
+- Startup loads the key of every epoch with a wrap addressed to this member
+  (one listing of `{team}/_keys/`; a wrap the founder or the recovery key of
+  the manifest in force did not sign is refused), so a rotation reaches a
+  member's server (one with the mnemonic) without raising `max_epoch`.
+  `max_epoch` is now a floor for the next rotation and the range tried when
+  the listing fails. The manifest that authorizes a wrap is the one `sync`
+  applies, with its rollback protection, not the bucket's newest readable
+  one, so a garbled newest manifest cannot bring back a recovery key it
+  retired. The
+  "max_epoch is stale" warnings in `doctor`, `serve`, `brief`, `report` and
+  `garden` are replaced by a warning that the process holds no key for the
+  team's newest epoch. `rotate` and `remove` no longer ask members to edit
+  `max_epoch`.
+- An epoch counts as rotated (for the next rotation's epoch, for startup,
+  and for the write check above) only when a wrap at it is signed by the
+  founder or the recovery key the manifest names. An object planted under
+  `{team}/_keys/` used to set the next rotation's epoch: one at the highest
+  epoch made every later `rotate` and `remove` fail. An object at the next
+  epoch (a wrap the founder did not sign, or a key check) no longer blocks
+  them either: the rotation steps over that epoch.
+- A membership publish (`publish-membership`, `remove`, `rotate --members`),
+  naming a recovery key and `recover` take the first manifest version above
+  the applied one that no object under `{team}/_manifest/` holds. A founder
+  machine without the manifest marker that found the newest manifest garbled
+  signed that version again from the previous roster and overwrote it, so
+  readers that had applied it refused the new one and the others took a
+  roster the garbled version had changed.
+- Two `doctor` runs against one bucket at the same time (two teammates, or
+  two teams sharing the bucket, including the `doctor` run that ends
+  `upgrade`) no longer fail each other's encryption probe with "not found"
+  or "ciphertext failed authentication". Every run wrote, read and deleted
+  the same `_doctor/encryption-boundary-probe` object; each run now uses its
+  own `_doctor/encryption-boundary-probe-<ulid>` key.
+- `upgrade` no longer refuses a bucket because its own destination probe
+  object (`{team}/_upgrade_probe`) is still there, which happens when the
+  probe's cleanup delete fails (credentials without delete rights, a
+  transient error, an earlier run stopped between write and delete). The
+  check named that object as data from another vault.
+- Ops a session left below the 16-op batch threshold when it ended without
+  anchoring them (a crash, a SIGKILL) are anchored again by the next session
+  under the same identity even when that session fills a batch before it
+  ends. That batch's record moved the author's anchor watermark past them,
+  and the requeue that runs when a session ends then skipped them for good.
+  The first full batch of a session now queues them first.
+- A process that skipped a note because it holds no key for the note's
+  epoch (the `serve` daemon after a `rotate` or `remove`, or a removed
+  member) no longer publishes index checkpoints. Its index lacked those
+  notes, and it wrote its checkpoint, sealed under its older key, at the
+  same key as the team's complete one, so every up-to-date teammate fell
+  back to a full replay on each sync.
+- `doctor` takes the team's current epoch from the newest wrap the founder
+  or the recovery key signed, as the server does, for its rotation failure,
+  its "removed member still holds the current epoch key" and unsigned-wrap
+  warnings, and its wrong-key check. One object anyone with bucket write
+  can put under `{team}/_keys/` made it fail naming an epoch the team never
+  rotated to, hid those warnings for the real epoch, and could turn a
+  wrong-key failure into a warning. Its rotation check now also fails when
+  the wrap addressed to this machine is not one the founder provisioned or
+  does not decode, which the server refuses; it used to pass both.
+- A session's exit flush anchors only ops and reads only anchor records of
+  its own team. A copy of the author's op from another team's log, put at a
+  well-formed key in this team's log, was anchored here, so every reconcile
+  reported a missing op. A copy of the author's anchor record from another
+  team set the anchor watermark to that team's Lamport value, so ops of this
+  team below it stayed unanchored.
+- Three reads that walk keys until one holds a valid object now fetch up
+  to 16 at a time instead of one round trip each: the search for this
+  author's newest signed anchor record (each exit flush, and each batch
+  under the writer lock, every 16th write by default), the search for the
+  newest founder-provisioned epoch (startup, rotation, and the write path's
+  once-a-minute recheck), and the read of ops no anchor record covers yet.
+  Objects planted under `_anchors/` or `_keys/`, or an author whose records
+  all predate signing, could push an exit flush past its 4 s bound on every
+  session. The steady state still costs one GET. The read of uncovered ops
+  also takes the ops this process already verified in a sync from memory.
+- Hermes plugin: a request now fails after 120 s in total. Each line the
+  child printed without answering restarted the wait, so a child that kept
+  printing notifications could hold a turn for up to 64 minutes.
+- Hermes plugin: when `hippius-mem` fails at startup, the error names its
+  last stderr lines again. Shutdown closed the stderr pipe as soon as the
+  child exited, which could drop lines still in the pipe, the boot error
+  among them; it now waits up to 5 s for both pipes to drain.
+- A SIGTERM or Ctrl-C while a stdio session or `serve` anchors its last ops
+  at exit now ends that flush. With on-chain anchoring the flush has no time bound,
+  and the session's signal handler swallowed every later signal, so a hung
+  chain node kept the process alive until SIGKILL.
 
 ## [0.7.1] - 2026-11-19
 
@@ -245,9 +644,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it used to clear a forged checkpoint record (a wrong summary, tags or
   vector written by a current team member) within a sync or two. Such a
   forgery now lasts until the note is edited or the index is rebuilt in full.
-  A full rebuild and `hippius-mem snapshot` embed again every vector that
-  came from a checkpoint, and a machine keeps a vector it computed itself
-  over a checkpoint's. See "A snapshot's ... are not verified" in
+  A full rebuild embeds again every vector that came from a checkpoint,
+  and a machine keeps a vector it computed itself over a checkpoint's. See "A snapshot's ... are not verified" in
   `docs/SECURITY.md`.
 
 ## [0.4.2] - 2026-09-28
@@ -434,7 +832,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/thenervelab/hippius-mem/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/thenervelab/hippius-mem/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thenervelab/hippius-mem/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...v0.6.0

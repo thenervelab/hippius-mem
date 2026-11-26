@@ -29,14 +29,14 @@
     "name": "brief"
   },
   {
-    "description": "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. A note's repository scope is fixed when it is written and `edit` cannot move it: to move a note, `remember` it in the right scope with `force: true` (the copy is otherwise refused as a duplicate of the original), `link` the new note to the old with rel `supersedes`, and `forget` the old one. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }.",
+    "description": "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. A note's repository scope is fixed when it is written and `edit` cannot move it: to move a note, `remember` it in the right scope with `force: true` (the copy is otherwise refused as a duplicate of the original), `link` the new note to the old with rel `supersedes`, and `forget` the old one. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit (returning a conflict, note unchanged) if it changed since you read it. SCOPE: concurrent edits from sessions on this machine are ordered, so of two that read the same version only the first succeeds. Before comparing, the server also syncs any teammate whose published head moved, so an edit made on another machine before this call conflicts; one made on another machine WHILE this call runs is not seen, the two converge last-writer-wins and the losing edit stays in history. It is optimistic concurrency, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }.",
     "input_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "body": {
           "default": null,
-          "description": "New full body; omit to keep the current body.",
+          "description": "New full body (at most 131072 characters, not bytes); omit to keep the\ncurrent body.",
           "type": [
             "string",
             "null"
@@ -56,7 +56,7 @@
         },
         "summary": {
           "default": null,
-          "description": "New one-line summary; omit to keep the current summary.",
+          "description": "New one-line summary (at most 512 characters); omit to keep the current\nsummary.",
           "type": [
             "string",
             "null"
@@ -64,7 +64,7 @@
         },
         "tags": {
           "default": null,
-          "description": "New tag set (replaces the current tags); omit to keep the current tags.",
+          "description": "New tag set (replaces the current tags; at most 64 tags of at most 128\ncharacters each); omit to keep the current tags.",
           "items": {
             "type": "string"
           },
@@ -249,13 +249,13 @@
     "name": "refresh"
   },
   {
-    "description": "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it has none. Returns the new note id and the `repo` it was written to.",
+    "description": "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it was launched outside one, and the shared loopback daemon refuses it. Returns the new note id and the `repo` it was written to.",
     "input_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
         "body": {
-          "description": "Full note body, returned only by `get`.",
+          "description": "Full note body, returned only by `get`: at most 131072 characters\n(Unicode scalar values, not bytes, so up to 512 KiB of UTF-8).",
           "type": "string"
         },
         "force": {
@@ -269,19 +269,19 @@
         },
         "repo": {
           "default": null,
-          "description": "Repository scope: a repo name, or `\"global\"` for a team-wide note. Omitted,\nthe note goes to the repository this server was launched in, or to\nteam-global when it has none (the shared daemon). The result names the\nscope written.",
+          "description": "Repository scope: a repo name, or `\"global\"` for a team-wide note. Omitted,\nthe note goes to the repository this server was launched in, or to\nteam-global when it was launched outside one; the shared loopback daemon\nrefuses an omitted `repo`. The result names the scope written.",
           "type": [
             "string",
             "null"
           ]
         },
         "summary": {
-          "description": "One-line summary surfaced by `recall`.",
+          "description": "One-line summary surfaced by `recall`: one line, at most 512 characters.",
           "type": "string"
         },
         "tags": {
           "default": [],
-          "description": "Free-form tags indexed alongside the summary. A tag `path:<file or\ndirectory>` (relative to the repository root, on a note with `repo` set)\nties the note to that code: an edit hook shows it to an agent about to\nchange a file there.",
+          "description": "Free-form tags indexed alongside the summary. A tag `path:<file or\ndirectory>` (relative to the repository root, on a note with `repo` set)\nties the note to that code: an edit hook shows it to an agent about to\nchange a file there. At most 64 tags, each at most 128 characters.",
           "items": {
             "type": "string"
           },

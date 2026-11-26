@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
+use crate::store::CreateOutcome;
 use crate::{BlobStore, MemError};
 
 /// Counters for one kind of [`BlobStore`] operation.
@@ -183,6 +184,17 @@ impl BlobStore for InstrumentedBlobStore {
         let size = len_u64(bytes.len());
         let result = match self.refuse("put", key) {
             Ok(()) => self.inner.put(key, bytes).await,
+            Err(err) => Err(err),
+        };
+        self.record(|stats| &mut stats.put, started.elapsed(), size);
+        result
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        let started = Instant::now();
+        let size = len_u64(bytes.len());
+        let result = match self.refuse("put", key) {
+            Ok(()) => self.inner.put_if_absent(key, bytes).await,
             Err(err) => Err(err),
         };
         self.record(|stats| &mut stats.put, started.elapsed(), size);

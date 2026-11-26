@@ -9,13 +9,13 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use hippius_mem_core::{
-    AnchorProof, AnchorRef, Blake3Hash, DEFAULT_TOKEN_BUDGET, HistoryEntry, LinkRel, MemError,
-    MemoryStore, MerkleProof, Note, NoteHistory, NoteId, NoteType, ParseNoteIdError,
+    AnchorProof, AnchorRef, Blake3Hash, DEFAULT_TOKEN_BUDGET, Degradation, HistoryEntry, LinkRel,
+    MemError, MemoryStore, MerkleProof, Note, NoteHistory, NoteId, NoteType, ParseNoteIdError,
     ParseNoteTypeError, Pointer, PointerRelation, RecallInput, ReconcileReport, RememberInput,
     RepoScope, path_notes::notes_for_path, render_brief,
 };
@@ -28,6 +28,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 /// Why [`MemoryServer::call_plain`] returned no result.
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +93,16 @@ pub const DEFAULT_RECALL_K: usize = 12;
 /// warmup so it never fires during healthy (merely slow) startup.
 const WARMUP_READ_WAIT: Duration = Duration::from_secs(90);
 
+/// Longest a session's exit waits on its anchor flush. Under the 5 s the
+/// Hermes plugin waits after closing stdin before it sends SIGTERM
+/// (`SHUTDOWN_GRACE` in `integrations/hermes/hippius_mem/__init__.py`), so a
+/// slow gateway ends the flush instead of the process being killed mid-write.
+/// Dropping the flush future mid-way loses the leaves it held in memory, and a
+/// batch anchored but not yet persisted; the next session anchors the ops
+/// again, and the op-log write path never runs inside it. Not applied with an
+/// on-chain anchor, where that second anchor is a second paid transaction.
+const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// How long the pre-read auto-refresh may block before a read gives up and serves
 /// the current (possibly slightly stale) index.
 ///
@@ -125,19 +136,20 @@ struct RememberParams {
     note_type: String,
     /// Repository scope: a repo name, or `"global"` for a team-wide note. Omitted,
     /// the note goes to the repository this server was launched in, or to
-    /// team-global when it has none (the shared daemon). The result names the
-    /// scope written.
+    /// team-global when it was launched outside one; the shared loopback daemon
+    /// refuses an omitted `repo`. The result names the scope written.
     #[serde(default)]
     repo: Option<String>,
     /// Free-form tags indexed alongside the summary. A tag `path:<file or
     /// directory>` (relative to the repository root, on a note with `repo` set)
     /// ties the note to that code: an edit hook shows it to an agent about to
-    /// change a file there.
+    /// change a file there. At most 64 tags, each at most 128 characters.
     #[serde(default)]
     tags: Vec<String>,
-    /// One-line summary surfaced by `recall`.
+    /// One-line summary surfaced by `recall`: one line, at most 512 characters.
     summary: String,
-    /// Full note body, returned only by `get`.
+    /// Full note body, returned only by `get`: at most 131072 characters
+    /// (Unicode scalar values, not bytes, so up to 512 KiB of UTF-8).
     body: String,
     /// Write anyway even if this summary is a near-duplicate of an existing note.
     /// Default `false`: a near-duplicate is refused so recall precision does not
@@ -251,13 +263,16 @@ struct ReconcileParams {}
 struct EditParams {
     /// The `mem_...` id of the note to update.
     id: String,
-    /// New one-line summary; omit to keep the current summary.
+    /// New one-line summary (at most 512 characters); omit to keep the current
+    /// summary.
     #[serde(default)]
     summary: Option<String>,
-    /// New full body; omit to keep the current body.
+    /// New full body (at most 131072 characters, not bytes); omit to keep the
+    /// current body.
     #[serde(default)]
     body: Option<String>,
-    /// New tag set (replaces the current tags); omit to keep the current tags.
+    /// New tag set (replaces the current tags; at most 64 tags of at most 128
+    /// characters each); omit to keep the current tags.
     #[serde(default)]
     tags: Option<Vec<String>>,
     /// Optional compare-and-swap guard: the `version` you received from `get`. If
@@ -285,6 +300,10 @@ struct RememberOutput {
     /// so a caller that omitted `repo` sees where the note landed. A note's
     /// scope is fixed once written (see `MemoryStore::edit`).
     repo: String,
+    /// What went degraded while serving this call; omitted from the wire when
+    /// nothing did. See [`Warning`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// Result of a `recall` call.
@@ -310,6 +329,10 @@ struct RecallOutput {
     /// logs the MCP caller never sees) lets the caller weight an empty result
     /// accordingly instead of trusting a retrieval mode it cannot observe.
     semantic: bool,
+    /// What went degraded while serving this call; omitted from the wire when
+    /// nothing did. See [`Warning`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// Result of a successful `refresh` call.
@@ -317,6 +340,10 @@ struct RecallOutput {
 struct RefreshOutput {
     /// Number of live notes indexed from the shared op-log during the sync.
     indexed: usize,
+    /// What went degraded while serving this call; omitted from the wire when
+    /// nothing did. See [`Warning`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// Result of a `brief` call.
@@ -390,6 +417,10 @@ struct NoteDto {
 struct ForgetOutput {
     /// Always `true`: the note was tombstoned in the shared op-log.
     forgotten: bool,
+    /// What went degraded while serving this call; omitted from the wire when
+    /// nothing did. See [`Warning`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// Result of a successful `link` call.
@@ -397,6 +428,10 @@ struct ForgetOutput {
 struct LinkOutput {
     /// Always `true`: the directed link was appended to the shared op-log.
     linked: bool,
+    /// What went degraded while serving this call; omitted from the wire when
+    /// nothing did. See [`Warning`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// Result of a successful `edit` call.
@@ -404,6 +439,10 @@ struct LinkOutput {
 struct EditOutput {
     /// Always `true`: a new note version was written and an Edit op appended.
     edited: bool,
+    /// What went degraded while serving this call; omitted from the wire when
+    /// nothing did. See [`Warning`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// Result of a successful `redact` call.
@@ -412,6 +451,10 @@ struct RedactOutput {
     /// Always `true`: a signed Redact op was appended and every ciphertext
     /// version of the note was scrubbed. Irreversible.
     redacted: bool,
+    /// What went degraded while serving this call; omitted from the wire when
+    /// nothing did. See [`Warning`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// The op history of a note, returned by `history`.
@@ -692,6 +735,15 @@ pub struct MemoryServer {
     /// per connection, and the syncs being deduplicated all target the one
     /// shared [`MemoryStore`].
     refresh_in_flight: Arc<AtomicBool>,
+    /// The `Reinforce` appends [`reinforce_in_background`] started, which
+    /// [`flush_on_exit`] waits for before the runtime shuts down and drops
+    /// them mid-append. Shared (`Arc`) across per-connection clones, like
+    /// `refresh_in_flight`. Finished tasks are reaped at each spawn, so the set
+    /// holds only the ones still running.
+    ///
+    /// [`reinforce_in_background`]: Self::reinforce_in_background
+    /// [`flush_on_exit`]: Self::flush_on_exit
+    reinforcing: Arc<std::sync::Mutex<JoinSet<()>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -719,6 +771,7 @@ impl MemoryServer {
             provisioning_nudge: None,
             shared_http: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            reinforcing: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -743,6 +796,7 @@ impl MemoryServer {
             provisioning_nudge: None,
             shared_http: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            reinforcing: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -846,7 +900,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it has none. Returns the new note id and the `repo` it was written to."
+        description = "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it was launched outside one, and the shared loopback daemon refuses it. Returns the new note id and the `repo` it was written to."
     )]
     async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> CallToolResult {
         into_call_result(self.logic_remember(params).await)
@@ -909,7 +963,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. A note's repository scope is fixed when it is written and `edit` cannot move it: to move a note, `remember` it in the right scope with `force: true` (the copy is otherwise refused as a duplicate of the original), `link` the new note to the old with rel `supersedes`, and `forget` the old one. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
+        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. A note's repository scope is fixed when it is written and `edit` cannot move it: to move a note, `remember` it in the right scope with `force: true` (the copy is otherwise refused as a duplicate of the original), `link` the new note to the old with rel `supersedes`, and `forget` the old one. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit (returning a conflict, note unchanged) if it changed since you read it. SCOPE: concurrent edits from sessions on this machine are ordered, so of two that read the same version only the first succeeds. Before comparing, the server also syncs any teammate whose published head moved, so an edit made on another machine before this call conflicts; one made on another machine WHILE this call runs is not seen, the two converge last-writer-wins and the losing edit stays in history. It is optimistic concurrency, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
     )]
     async fn edit(&self, Parameters(params): Parameters<EditParams>) -> CallToolResult {
         into_call_result(self.logic_edit(params).await)
@@ -976,10 +1030,111 @@ impl MemoryServer {
         }
     }
 
+    /// Whether this session may write now. Unlike `require_writable` it does
+    /// not re-contest the vault's write role.
+    fn holds_write_role(&self) -> bool {
+        matches!(
+            *self
+                .write_role
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            VaultWriteRole::Writable { .. }
+        )
+    }
+
+    /// Count a `get` of `id` as a use of a recalled note, without making the
+    /// read wait for it, and only in a session that holds the write role.
+    ///
+    /// Reinforcing appends a signed op: it takes the writer lock (up to 30 s
+    /// when another process holds it) and waits for the op and head PUTs. A
+    /// read must not wait on that, and a read-only session never appends.
+    fn reinforce_in_background(&self, id: NoteId) {
+        if !self.holds_write_role() {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let mut reinforcing = self
+            .reinforcing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while let Some(joined) = reinforcing.try_join_next() {
+            warn_if_reinforcement_panicked(joined);
+        }
+        reinforcing.spawn(async move { store.reinforce_use(id).await });
+    }
+
+    /// Wait for the reinforcements still running. `reinforce_use` logs its
+    /// own failures, a panicked task is warned, and a lost `Reinforce` op is
+    /// re-emitted by the next qualifying read.
+    async fn finish_reinforcing(&self) {
+        let mut running = std::mem::take(
+            &mut *self
+                .reinforcing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        while let Some(joined) = running.join_next().await {
+            warn_if_reinforcement_panicked(joined);
+        }
+    }
+
+    /// Anchor what this session buffered below the batch threshold, and this
+    /// author's ops an earlier session left unanchored, when the session ends.
+    ///
+    /// Skipped for a read-only session, which writes nothing to the bucket.
+    /// Waits first for the `Reinforce` appends reads started in the
+    /// background, so their ops are anchored too and the runtime's shutdown
+    /// does not drop them mid-append. Best-effort and bounded by
+    /// [`EXIT_FLUSH_TIMEOUT`] (both steps together) unless the store anchors
+    /// on chain (see [`MemoryStore::anchors_on_chain`]), where the caller
+    /// decides when to stop waiting: a failure or a flush that runs out of
+    /// time is logged, since every op stays in the op-log either way and the
+    /// next session's flush queues what this one left.
+    pub async fn flush_on_exit(&self) {
+        if !self.holds_write_role() {
+            return;
+        }
+        let flush = async {
+            self.finish_reinforcing().await;
+            self.store.flush_anchors().await
+        };
+        let bounded = if self.store.anchors_on_chain() {
+            Ok(flush.await)
+        } else {
+            tokio::time::timeout(EXIT_FLUSH_TIMEOUT, flush).await
+        };
+        match bounded {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "could not anchor the session's last ops at exit");
+            }
+            Err(_) => tracing::warn!(
+                timeout = ?EXIT_FLUSH_TIMEOUT,
+                "anchoring the session's last ops did not finish before exit; the next session \
+                 anchors them"
+            ),
+        }
+    }
+
     /// Parse, store, and report the new id. Transport-free for testability.
     async fn logic_remember(&self, params: RememberParams) -> Result<RememberOutput, HandlerError> {
         self.require_writable()?;
         let note_type = parse_note_type(&params.note_type)?;
+        // The shared daemon has no launch repository, so an omitted `repo`
+        // would land in team-global, which every repository's recall reads.
+        // The CLI refuses the same call; so does the daemon, naming both forms.
+        let omitted = params
+            .repo
+            .as_deref()
+            .is_none_or(|repo| repo.trim().is_empty());
+        if self.shared_http && omitted {
+            return Err(HandlerError::BadInput {
+                field: "repo",
+                detail: "this shared daemon has no launch repository: pass the repository's \
+                         name, or \"global\" for a note every repository should see"
+                    .to_owned(),
+            });
+        }
         let input = RememberInput {
             note_type,
             // An omitted `repo` falls back to the launch repository, as it
@@ -1015,10 +1170,11 @@ impl MemoryServer {
         // scan an empty index and admit a duplicate it would otherwise refuse.
         self.await_warm().await;
         let repo = repo_to_dto(&input.repo);
-        let id = self.store.remember_offloaded(input, embedding).await?;
+        let written = self.store.remember_offloaded(input, embedding).await?;
         Ok(RememberOutput {
-            id: id.to_string(),
+            id: written.value.to_string(),
             repo,
+            warnings: write_warnings(&written.degraded),
         })
     }
 
@@ -1079,6 +1235,9 @@ impl MemoryServer {
             total_matched: result.total_matched,
             pointers,
             semantic: self.store.is_semantic(),
+            warnings: undecodable_warning(self.store.undecodable_notes())
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -1086,7 +1245,12 @@ impl MemoryServer {
     /// Transport-free.
     async fn logic_refresh(&self) -> Result<RefreshOutput, HandlerError> {
         let indexed = self.store.sync().await?;
-        Ok(RefreshOutput { indexed })
+        Ok(RefreshOutput {
+            indexed,
+            warnings: undecodable_warning(self.store.undecodable_notes())
+                .into_iter()
+                .collect(),
+        })
     }
 
     /// Render the session brief from the live index. Transport-free.
@@ -1197,7 +1361,8 @@ impl MemoryServer {
         // (see `logic_recall`); a no-op once warm.
         self.await_warm().await;
         refresh_before_read(&self.store, &self.refresh_in_flight, "get").await;
-        let note = self.store.get(id).await?;
+        let note = self.store.hydrate(id).await?;
+        self.reinforce_in_background(id);
         // The version token the agent round-trips into `edit`'s precondition: the
         // current ciphertext content hash, from the same converged index `get`
         // resolved the note through.
@@ -1218,8 +1383,11 @@ impl MemoryServer {
         // `logic_remember`) for the separate reason that its dedup check reads the
         // same index.
         self.await_warm().await;
-        self.store.forget(id).await?;
-        Ok(ForgetOutput { forgotten: true })
+        let written = self.store.forget(id).await?;
+        Ok(ForgetOutput {
+            forgotten: true,
+            warnings: write_warnings(&written.degraded),
+        })
     }
 
     /// Parse both ids and assert the directed link. Transport-free.
@@ -1230,8 +1398,11 @@ impl MemoryServer {
         let rel = parse_link_rel(params.rel.as_deref())?;
         // Waits for warmup: `relate` locates `from` in the index (see `logic_forget`).
         self.await_warm().await;
-        self.store.relate(from, to, rel).await?;
-        Ok(LinkOutput { linked: true })
+        let written = self.store.relate(from, to, rel).await?;
+        Ok(LinkOutput {
+            linked: true,
+            warnings: write_warnings(&written.degraded),
+        })
     }
 
     /// Parse the id, reconstruct the note's history, and map to a DTO.
@@ -1261,20 +1432,6 @@ impl MemoryServer {
     async fn logic_edit(&self, params: EditParams) -> Result<EditOutput, HandlerError> {
         self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
-        // Waits for warmup: `edit` reads the current note via the index (see `logic_forget`).
-        self.await_warm().await;
-        let current = self.store.get(id).await?;
-        let input = RememberInput {
-            force: false,
-            note_type: current.note_type,
-            repo: current.scope.repo,
-            tags: match params.tags {
-                Some(tags) => tags.into_iter().collect::<BTreeSet<String>>(),
-                None => current.tags,
-            },
-            summary: params.summary.unwrap_or(current.summary),
-            body: params.body.unwrap_or(current.body),
-        };
         // Parse the optional CAS token at the boundary: a malformed hex version is
         // bad input, surfaced before the store is touched.
         let precondition = match params.expected_version.as_deref() {
@@ -1286,6 +1443,27 @@ impl MemoryServer {
                 })?,
             ),
         };
+        // Waits for warmup: `edit` reads the current note via the index (see `logic_forget`).
+        self.await_warm().await;
+        // The store syncs a teammate's newer version before its compare-and-swap.
+        // Omitted fields are filled from the note read below, so that read must see
+        // the same version: filled from a stale note, an edit naming the teammate's
+        // version would pass the swap and write back the stale body or summary.
+        if precondition.is_some() {
+            self.store.refresh_now().await?;
+        }
+        let current = self.store.hydrate(id).await?;
+        let input = RememberInput {
+            force: false,
+            note_type: current.note_type,
+            repo: current.scope.repo,
+            tags: match params.tags {
+                Some(tags) => tags.into_iter().collect::<BTreeSet<String>>(),
+                None => current.tags,
+            },
+            summary: params.summary.unwrap_or(current.summary),
+            body: params.body.unwrap_or(current.body),
+        };
         // Precompute the summary embedding on the blocking pool, then commit through
         // the runtime-free `edit_offloaded`. Besides keeping the ONNX embed off the
         // tokio worker (ASYNCBLOCK), doing it BEFORE the store takes its writer lock
@@ -1293,10 +1471,14 @@ impl MemoryServer {
         // writers (ASYNCBLOCK-002) — the failure mode where one slow edit stalled
         // every concurrent write. Embedded from a clone of the final `input.summary`.
         let embedding = self.embed_offloaded(input.summary.clone()).await?;
-        self.store
+        let written = self
+            .store
             .edit_offloaded(id, input, precondition, embedding)
             .await?;
-        Ok(EditOutput { edited: true })
+        Ok(EditOutput {
+            edited: true,
+            warnings: write_warnings(&written.degraded),
+        })
     }
 
     /// Parse the id and permanently scrub the note's content. Transport-free.
@@ -1305,8 +1487,11 @@ impl MemoryServer {
         let id = parse_note_id(&params.id, "id")?;
         // Waits for warmup: `redact` locates the note in the index (see `logic_forget`).
         self.await_warm().await;
-        self.store.redact(id).await?;
-        Ok(RedactOutput { redacted: true })
+        let written = self.store.redact(id).await?;
+        Ok(RedactOutput {
+            redacted: true,
+            warnings: write_warnings(&written.degraded),
+        })
     }
 }
 
@@ -1405,8 +1590,8 @@ impl ServerHandler for MemoryServer {
         if self.shared_http {
             instructions.push_str(
                 " This process is a shared loopback daemon (not bound to the client's cwd): \
-                 omitted `repo` on recall/brief is team-global only, and on remember \
-                 writes a team-global note — pass `repo` or `\"global\"` explicitly.",
+                 omitted `repo` on recall/brief is team-global only, and remember \
+                 refuses it — pass `repo` or `\"global\"` explicitly.",
             );
         }
         info.instructions = Some(instructions);
@@ -1710,6 +1895,73 @@ fn note_to_dto(note: &Note, version: String) -> NoteDto {
     }
 }
 
+/// One `warnings` entry in a tool result: a stable code an agent can branch on,
+/// and a sentence saying what happened and what to do.
+#[derive(Debug, Serialize)]
+struct Warning {
+    /// Stable, snake-case: `unserialized_write`, `tip_not_recorded`,
+    /// `head_not_published`, `team_key_unverified` or `undecodable_notes`.
+    code: &'static str,
+    /// What went degraded and what to do about it.
+    message: String,
+}
+
+/// The warnings for what went degraded during one write. Each write reports
+/// only its own degradations, so concurrent calls on a shared server do not
+/// see each other's.
+fn write_warnings(degraded: &[Degradation]) -> Vec<Warning> {
+    degraded
+        .iter()
+        .map(|&found| degradation_warning(found))
+        .collect()
+}
+
+fn degradation_warning(found: Degradation) -> Warning {
+    let (code, message) = match found {
+        Degradation::Unserialized => (
+            "unserialized_write",
+            "this write ran without the cross-process writer lock (no state directory, or the \
+             lock file could not be locked), so a concurrent hippius-mem process on this \
+             machine could fork this author's chain; run `reconcile` and re-issue the note if \
+             its author is quarantined",
+        ),
+        Degradation::TipNotRecorded => (
+            "tip_not_recorded",
+            "the write is durable, but the local writer-tip file could not be updated; check \
+             that the state directory is writable",
+        ),
+        Degradation::HeadNotPublished => (
+            "head_not_published",
+            "the write is durable, but its signed head pointer could not be published, so \
+             teammates may see it only after their next full op-log count (up to 5 minutes)",
+        ),
+        Degradation::TeamKeyUnverified => (
+            "team_key_unverified",
+            "this machine's team key opened fewer than half of the team's oldest notes it \
+             tried, and the team has published no key check, so teammates may not be able to \
+             read this note; run `hippius-mem doctor` to check the team key",
+        ),
+    };
+    Warning {
+        code,
+        message: message.to_owned(),
+    }
+}
+
+/// The warning for notes left out of the index as undecodable, if there are
+/// any. Reported on `recall` and `refresh`, which read the index, not on every
+/// write, where the same standing count would repeat on each call.
+fn undecodable_warning(undecodable_notes: usize) -> Option<Warning> {
+    (undecodable_notes > 0).then(|| Warning {
+        code: "undecodable_notes",
+        message: format!(
+            "{undecodable_notes} note(s) are left out of recall because their stored ciphertext \
+             failed its integrity check or does not decrypt under this machine's team key; `get` \
+             on one reports which; run `hippius-mem doctor` to check the team key"
+        ),
+    })
+}
+
 /// Render a handler result as a [`CallToolResult`].
 ///
 /// `Ok` serializes to a single JSON text block; `Err` becomes a user-visible
@@ -1729,6 +1981,14 @@ fn into_call_result<T: Serialize>(result: Result<T, HandlerError>) -> CallToolRe
     }
 }
 
+/// Warn about a background reinforcement that panicked; one that finished,
+/// with or without an error it logged itself, needs nothing.
+fn warn_if_reinforcement_panicked(joined: Result<(), tokio::task::JoinError>) {
+    if let Err(err) = joined {
+        tracing::warn!(error = %err, "a background reinforcement panicked");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -1742,9 +2002,9 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, HeadWatermarks, InMemoryIndex, MemError, MemoryBlobStore,
-        MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer,
-        Sr25519Signer, read_heads,
+        AnchorReceipt, AuditAnchor, BatchMeta, Blake3Hash, BlobStore, HashEmbedder, HeadWatermarks,
+        InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor,
+        OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer, read_heads,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -1847,6 +2107,105 @@ mod tests {
         MemoryServer::new(Arc::new(store))
     }
 
+    /// An anchor sink whose submission never completes: a chain node that
+    /// accepted the connection and stalled, or a gateway that stopped answering.
+    #[derive(Debug)]
+    struct StalledAnchor;
+
+    #[async_trait::async_trait]
+    impl AuditAnchor for StalledAnchor {
+        async fn anchor(
+            &self,
+            _root: Blake3Hash,
+            _meta: BatchMeta,
+        ) -> Result<AnchorReceipt, MemError> {
+            std::future::pending().await
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A session whose exit flush never finishes still ends: off chain, the
+    /// flush is cut at `EXIT_FLUSH_TIMEOUT`. Catches a flush awaited without
+    /// that bound, which keeps a closed session's process alive for good.
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_flush_that_never_finishes_ends_at_the_timeout() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            index,
+            OpLogStore::new(blob),
+            Arc::new(StalledAnchor),
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        );
+        let server = MemoryServer::new(Arc::new(store));
+        server.logic_remember(sample_remember()).await.unwrap();
+
+        // Ten times the bound, so only a flush that ignores it runs into this.
+        let outer = super::EXIT_FLUSH_TIMEOUT * 10;
+        let started = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(outer, server.flush_on_exit())
+                .await
+                .is_ok(),
+            "the exit flush outlived its {:?} bound",
+            super::EXIT_FLUSH_TIMEOUT
+        );
+        // A timeout never fires early, so this shows the flush reached the
+        // stalled anchor instead of finding nothing to anchor.
+        assert!(
+            started.elapsed() >= super::EXIT_FLUSH_TIMEOUT,
+            "the flush never reached the stalled anchor"
+        );
+    }
+
+    /// The exit flush waits for the `Reinforce` append a `get` started in the
+    /// background, so that op is in the batch the flush anchors. The append
+    /// used to run detached: the flush could anchor without it, and the
+    /// runtime's shutdown after the flush dropped it mid-append.
+    #[tokio::test]
+    async fn the_exit_flush_waits_for_a_reads_reinforcement() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let anchor = Arc::new(RecordingAnchor::new());
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            index,
+            OpLogStore::new(blob),
+            Arc::clone(&anchor) as Arc<dyn AuditAnchor>,
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        );
+        let server = MemoryServer::new(Arc::new(store));
+        let id = server.logic_remember(sample_remember()).await.unwrap().id;
+        server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets table".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+        server.logic_get(super::GetParams { id }).await.unwrap();
+
+        server.flush_on_exit().await;
+
+        let batches = anchor.anchored();
+        assert_eq!(batches.len(), 1, "{batches:?}");
+        assert_eq!(batches[0].1.op_count, 2, "the remember and the reinforce");
+    }
+
     fn sample_remember() -> RememberParams {
         RememberParams {
             force: false,
@@ -1858,11 +2217,178 @@ mod tests {
         }
     }
 
+    /// A second note distinct from [`sample_remember`], for tests that need two
+    /// writes past the dedup gate.
+    fn second_remember() -> RememberParams {
+        RememberParams {
+            summary: "index the widgets table on its owner column".to_owned(),
+            ..sample_remember()
+        }
+    }
+
     #[tokio::test]
     async fn remember_returns_mem_id() {
         let server = test_server();
         let out = server.logic_remember(sample_remember()).await.unwrap();
         assert!(out.id.starts_with("mem_"), "id was {}", out.id);
+    }
+
+    /// A write that ran without the cross-process lock its deployment requires
+    /// says so in the tool result, and a clean write's result carries no
+    /// `warnings` key at all, so existing callers see the old shape.
+    ///
+    /// Regression test: the degradation reached stderr only and the agent got a
+    /// plain success.
+    #[tokio::test]
+    async fn an_unserialized_write_reports_a_warning_in_the_tool_result() {
+        let clean = test_server();
+        let out = clean.logic_remember(sample_remember()).await.unwrap();
+        assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+        let wire = serde_json::to_value(&out).unwrap();
+        assert!(wire.get("warnings").is_none(), "no key when clean: {wire}");
+
+        let store = Arc::try_unwrap(test_store())
+            .expect("the fresh store has one owner")
+            .with_writer_lock_required(true);
+        let degraded = MemoryServer::new(Arc::new(store));
+        let out = degraded.logic_remember(sample_remember()).await.unwrap();
+        assert_eq!(out.warnings.len(), 1, "got {:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "unserialized_write");
+        assert!(
+            out.warnings[0]
+                .message
+                .contains("without the cross-process writer lock"),
+            "got {:?}",
+            out.warnings
+        );
+        let wire = serde_json::to_value(&out).unwrap();
+        assert_eq!(wire["warnings"][0]["code"], "unserialized_write", "{wire}");
+    }
+
+    /// A blob store that holds the first armed note-blob PUT until released,
+    /// and fails head PUTs while `fail_heads` is set.
+    struct PausedWriteAndHeadFault {
+        inner: MemoryBlobStore,
+        pause_next_note: std::sync::atomic::AtomicBool,
+        paused: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        fail_heads: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PausedWriteAndHeadFault {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            use std::sync::atomic::Ordering;
+            if !key.contains("/_") && self.pause_next_note.swap(false, Ordering::SeqCst) {
+                self.paused.notify_one();
+                self.release.notified().await;
+            }
+            if key.contains("/_heads/") && self.fail_heads.load(Ordering::SeqCst) {
+                return Err(MemError::Storage("head put failed (injected)".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Two writes on one shared server: a clean one held mid-call while another
+    /// one's head publish fails. Each reports only its own degradation.
+    ///
+    /// Regression test: warnings were the difference of store-wide counters
+    /// taken around the call, so the held write reported the other write's
+    /// failed head publish.
+    #[tokio::test]
+    async fn concurrent_writes_report_only_their_own_warnings() {
+        use std::sync::atomic::Ordering;
+
+        let fake = Arc::new(PausedWriteAndHeadFault {
+            inner: MemoryBlobStore::default(),
+            pause_next_note: std::sync::atomic::AtomicBool::new(false),
+            paused: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            fail_heads: std::sync::atomic::AtomicBool::new(false),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        );
+        let server = MemoryServer::new(Arc::new(store));
+        let params = |summary: &str| {
+            let mut params = sample_remember();
+            params.summary = summary.to_owned();
+            params.force = true;
+            params
+        };
+
+        fake.pause_next_note.store(true, Ordering::SeqCst);
+        let (held, other) = tokio::join!(
+            server.logic_remember(params("a note held inside its write")),
+            async {
+                fake.paused.notified().await;
+                fake.fail_heads.store(true, Ordering::SeqCst);
+                let out = server
+                    .logic_remember(params("a note whose head publish fails"))
+                    .await;
+                fake.fail_heads.store(false, Ordering::SeqCst);
+                fake.release.notify_one();
+                out
+            }
+        );
+
+        let other = other.unwrap();
+        assert_eq!(other.warnings.len(), 1, "{:?}", other.warnings);
+        assert_eq!(other.warnings[0].code, "head_not_published");
+        let held = held.unwrap();
+        assert!(
+            held.warnings.is_empty(),
+            "not the other write's: {:?}",
+            held.warnings
+        );
+    }
+
+    #[test]
+    fn each_degradation_has_its_own_code_and_the_gauge_is_separate() {
+        use hippius_mem_core::Degradation;
+
+        let warnings = super::write_warnings(&[
+            Degradation::TipNotRecorded,
+            Degradation::HeadNotPublished,
+            Degradation::TeamKeyUnverified,
+        ]);
+        let codes: Vec<&str> = warnings.iter().map(|warning| warning.code).collect();
+        assert_eq!(
+            codes,
+            [
+                "tip_not_recorded",
+                "head_not_published",
+                "team_key_unverified"
+            ]
+        );
+        assert!(super::write_warnings(&[]).is_empty());
+
+        assert!(super::undecodable_warning(0).is_none());
+        let gauge = super::undecodable_warning(3).expect("a nonzero count warns");
+        assert_eq!(gauge.code, "undecodable_notes");
+        assert!(gauge.message.starts_with("3 note(s)"));
     }
 
     #[tokio::test]
@@ -3084,7 +3610,7 @@ mod tests {
     }
 
     /// An explicit `"global"` still writes a team-wide note on a bound server,
-    /// and an unbound server (the shared daemon) keeps writing team-wide and
+    /// and an unbound server keeps writing team-wide and
     /// says so in its result.
     #[tokio::test]
     async fn remember_names_the_scope_it_wrote_to() {
@@ -3237,7 +3763,7 @@ mod tests {
         // fully-covered, clean log and reports ok with the anchored-op count.
         let server = anchoring_server();
         server.logic_remember(sample_remember()).await.unwrap();
-        server.logic_remember(sample_remember()).await.unwrap();
+        server.logic_remember(second_remember()).await.unwrap();
 
         let report = server.logic_reconcile().await.unwrap();
         assert!(report.ok, "a clean anchored log reconciles ok: {report:?}");
@@ -3298,7 +3824,7 @@ mod tests {
             .last()
             .cloned()
             .expect("the first write publishes a head");
-        server.logic_remember(sample_remember()).await.unwrap();
+        server.logic_remember(second_remember()).await.unwrap();
 
         // The write path already recorded the higher head (publish succeeded), so
         // this machine is a returning one without needing a prior audit.

@@ -22,6 +22,7 @@ mod writer_lock;
 pub use converge::{
     ConvergedState, NotePointer, NoteState, TypedLink, converge, lamport_tip, next_lamport,
 };
+pub(crate) use head::read_own_head;
 pub use head::{HeadPointer, VerifiedHeads, publish_head, read_heads};
 #[cfg(test)]
 pub(crate) use op::SIGNING_DOMAIN;
@@ -36,4 +37,37 @@ pub use store::{
 pub use verified::VerifiedOps;
 pub use watermark::{HeadRegression, HeadWatermarks};
 pub use writer_lock::WriterLock;
-pub(crate) use writer_lock::{SharedTip, WriterLockGuard};
+pub(crate) use writer_lock::{
+    AuthorTip, OtherEndpointTip, SharedTip, TipSnapshot, WriterLockGuard,
+};
+
+/// Fixtures shared by this module's tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::domain::{NetworkPrefix, NoteId};
+    use crate::oplog::{GENESIS_PREV, Op, OpContent, OpKind, Sr25519Signer};
+    use crate::ulid::Ulid;
+
+    /// A validly signed `Remember` op at `lamport`, under a fixed test seed.
+    #[expect(
+        clippy::expect_used,
+        reason = "a fixed 32-byte seed always derives a signer; a test fixture may panic"
+    )]
+    pub(crate) fn signed_op(lamport: u64) -> Op {
+        let signer = Sr25519Signer::from_seed_with_prefix(&[7; 32], NetworkPrefix::HIPPIUS)
+            .expect("a 32-byte seed always derives a signer");
+        Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: NoteId::new(),
+                object_key: "team/repo/note/op".to_owned(),
+                cid: crate::crypto::content_hash(b"ciphertext"),
+                prev_op_hash: GENESIS_PREV,
+            },
+        )
+    }
+}

@@ -36,6 +36,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::atomic_file::write_atomically;
+use crate::objkey::ESCAPED_REPO_PREFIX;
+use crate::store::CreateOutcome;
 use crate::{BlobStore, MemError, SecretKey, open, seal};
 
 /// A [`BlobStore`] decorator that caches immutable objects on local disk,
@@ -154,7 +156,8 @@ impl CachingBlobStore {
 /// mutable `{team}/_snapshots/...` and `{team}/_anchors/...` records, the
 /// `{team}/_heads/{author_key}` head pointers, and any manifest/marker. The
 /// reserved-prefix guard on the four-segment arm keeps a mutable key that happens
-/// to have four segments out of the cache.
+/// to have four segments out of the cache; an escaped repo segment is the one
+/// `_` segment that holds note blobs.
 ///
 /// `_heads` is worth naming explicitly because it is the most mutable key in the
 /// store — rewritten on EVERY write, unlike the append-at-a-fresh-key snapshots and
@@ -169,7 +172,9 @@ fn is_cacheable(key: &str) -> bool {
     let parts: Vec<&str> = key.split('/').collect();
     match parts.as_slice() {
         [_team, "_oplog", ..] => true,
-        [_team, repo, _mem, _ver] => !repo.starts_with('_'),
+        [_team, repo, _mem, _ver] => {
+            !repo.starts_with('_') || repo.starts_with(ESCAPED_REPO_PREFIX)
+        }
         _ => false,
     }
 }
@@ -185,6 +190,13 @@ impl BlobStore for CachingBlobStore {
             self.write_cache(key, &bytes);
         }
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        // Never cached: the caller of a create-only write reads the object back
+        // to learn whose bytes landed, and a cached copy of our own bytes would
+        // answer that question wrongly.
+        self.inner.put_if_absent(key, bytes).await
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
@@ -300,6 +312,10 @@ mod tests {
     fn classifies_only_immutable_keys() {
         assert!(is_cacheable(OP_KEY), "op-log entry is immutable");
         assert!(is_cacheable(NOTE_KEY), "note version blob is immutable");
+        assert!(
+            is_cacheable("team/_repo-next_2Ejs/mem_1/ver_1"),
+            "a note blob under an escaped repo name is immutable"
+        );
         assert!(!is_cacheable(SNAP_KEY), "snapshots are rewritten");
         assert!(
             !is_cacheable("team/_anchors/0001"),

@@ -56,6 +56,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::oplog::SharedTip;
+use crate::ulid::Ulid;
 use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey};
 
 /// One author whose chain broke on a verified read, and how many of their ops
@@ -446,6 +448,17 @@ pub struct OpLogStore {
     verify_calls: Arc<AtomicUsize>,
 }
 
+/// One verified read of a team's op-log, with what it left out.
+#[derive(Debug)]
+pub(crate) struct AuditedRead {
+    /// The verified ops, as [`OpLogStore::read_all`] returns them.
+    pub(crate) ops: VerifiedOps,
+    /// The authors whose chain this read quarantined.
+    pub(crate) quarantined: Vec<QuarantinedAuthor>,
+    /// Objects under the op-log prefix that did not deserialize as an op.
+    pub(crate) malformed: usize,
+}
+
 impl std::fmt::Debug for OpLogStore {
     // `dyn BlobStore` is not `Debug`; name the type without trying to render the
     // backend so `OpLogStore` can still satisfy `missing_debug_implementations`.
@@ -493,8 +506,45 @@ impl OpLogStore {
         self.blob.put(&key, bytes).await
     }
 
+    /// Whether `team`'s op-log in this bucket holds `author`'s op with id
+    /// `op_id` that `tip` names.
+    ///
+    /// One GET of the op's key, compared by [`Op::hash`], so another op at that
+    /// key (none in an honest bucket) does not count. Any local cached copy is
+    /// evicted first: the op cache is keyed by team, not by bucket, so a copy
+    /// cached from another bucket of the same name would otherwise answer.
+    /// Exact when the gateway's GET is read-after-write consistent. Used to
+    /// tell whether a writer tip recorded through another endpoint is this
+    /// bucket's.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] when the GET fails for any reason but a missing key.
+    pub(crate) async fn holds_op(
+        &self,
+        team: &str,
+        author: &VerifyingKey,
+        tip: SharedTip,
+        op_id: Ulid,
+    ) -> Result<bool, MemError> {
+        let key = op_key(team, tip.lamport, op_id, author);
+        self.blob.evict_cache(&key).await;
+        match self.blob.get(&key).await {
+            Ok(bytes) => {
+                Ok(serde_json::from_slice::<Op>(&bytes).is_ok_and(|op| op.hash() == tip.tip_hash))
+            }
+            Err(MemError::NotFound { .. }) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Best-effort delete of the op object a FAILED `append` may nonetheless have
     /// left durable.
+    ///
+    /// Used only by a writer that holds no cross-process lock. A writer that holds
+    /// one records the op as pending instead and the next writer completes it,
+    /// because a PUT still in flight can land after this delete (see the
+    /// `writer_lock` module docs).
     ///
     /// `append` is a single `blob.put`, so a gateway that commits the object and
     /// then loses the response returns `Err` to the caller while the object is
@@ -515,13 +565,16 @@ impl OpLogStore {
     /// # Precondition: caller holds the writer guard, one writer per identity
     ///
     /// This delete is safe only while the CALLER still holds `MemoryStore`'s
-    /// writer guard. `read_and_filter` (the `sync`/`refresh_if_stale` path) takes
-    /// that same guard and, once it does, adopts this author's latest VISIBLE op
-    /// in the read as the new cached chain head — and a durable-but-"failed" op
-    /// is a valid, signed, genesis-reachable, newest op of its author, exactly
-    /// what gets adopted. Release the guard before calling this and a concurrent
-    /// `read_and_filter` can adopt the about-to-be-deleted orphan as the head in
-    /// that gap; this delete then removes an op the process's own cache now
+    /// writer guard and records the op as reclaimed under it. `read_and_filter`
+    /// (the `sync`/`refresh_if_stale` path) reads the op-log WITHOUT that guard,
+    /// then takes it to adopt this author's latest VISIBLE op in the read as the
+    /// new cached chain head — and a durable-but-"failed" op is a valid, signed,
+    /// genesis-reachable, newest op of its author, exactly what gets adopted.
+    /// The guard alone does not stop that, because the read may have listed the
+    /// op before the delete: the store skips ops it recorded as reclaimed when
+    /// it adopts. Without that record (or with the guard released before this
+    /// call) a concurrent `read_and_filter` adopts the deleted orphan as the
+    /// head; this delete then removes an op the process's own cache now
     /// points at, so every later write of this author chains onto a hash nothing
     /// durable holds — `longest_rooted_chain` can never root them at genesis, so
     /// EVERY later op of that author is quarantined, not just the one orphan.
@@ -633,7 +686,79 @@ impl OpLogStore {
     /// they drop bad ops — so a quarantined fork or a forged op degrades the read
     /// quietly, by design.
     pub async fn read_all(&self, team: &str) -> Result<VerifiedOps, MemError> {
-        Ok(self.read_verified(team).await?.0)
+        Ok(self.read_verified(team).await?.ops)
+    }
+
+    /// `author`'s ops with a Lamport value above `after` (all of them when
+    /// `None`), in Lamport order.
+    ///
+    /// One LIST of the team's op-log keys, then the ops at the keys that name
+    /// this author and a Lamport value above `after`: from the verified cache
+    /// a [`read_all`](Self::read_all) in this process filled, and one
+    /// concurrent GET (at most [`OPLOG_FETCH_CONCURRENCY`] in flight) for each
+    /// key it has not seen. No other author's op is fetched. Each op must carry
+    /// a valid signature by `author`, name an object under `{team}/`, and sit
+    /// at the key its own fields name; one that does not, or does not decode,
+    /// is skipped. The team check is the one `read_all` applies: a copy of this
+    /// author's op from another team's log has a valid signature and can sit
+    /// at a well-formed key here. Chain links are not checked, unlike
+    /// `read_all`: the caller anchors the ops, and an op this author signed is
+    /// this author's whatever chain it is on. Leaves the cache as it is.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the listing or a GET reports, except a key that vanished
+    /// between the two.
+    pub(crate) async fn read_own_after(
+        &self,
+        team: &str,
+        author: &VerifyingKey,
+        after: Option<u64>,
+    ) -> Result<Vec<Op>, MemError> {
+        let prefix = oplog_prefix(team);
+        let suffix = format!("_{}", author.to_hex());
+        let keys: Vec<String> = self
+            .blob
+            .list(&prefix)
+            .await?
+            .into_iter()
+            .filter(|key| {
+                key.strip_prefix(&prefix)
+                    .filter(|rest| rest.ends_with(&suffix))
+                    .and_then(|rest| rest.get(..20))
+                    .and_then(|lamport| lamport.parse::<u64>().ok())
+                    .is_some_and(|lamport| after.is_none_or(|after| lamport > after))
+            })
+            .collect();
+
+        let (cached, to_fetch) = partition_cached(&self.verified_cache, &keys);
+        let mut pairs = cached;
+        for (key, bytes) in fetch_bytes(&self.blob, to_fetch).await {
+            let bytes = match bytes {
+                Ok(bytes) => bytes,
+                Err(MemError::NotFound { .. }) => continue,
+                Err(err) => return Err(err),
+            };
+            if let Ok(op) = serde_json::from_slice::<Op>(&bytes)
+                && op.verify_sig()
+                && op.verify_identity()
+            {
+                pairs.push((key, op));
+            }
+        }
+
+        let team_prefix = format!("{team}/");
+        let mut ops: Vec<Op> = pairs
+            .into_iter()
+            .filter(|(key, op)| {
+                op.author_key == *author
+                    && op.object_key.starts_with(&team_prefix)
+                    && op_key(team, op.lamport, op.op_id, author) == *key
+            })
+            .map(|(_, op)| op)
+            .collect();
+        ops.sort_by_key(|op| op.lamport);
+        Ok(ops)
     }
 
     /// [`read_all`](Self::read_all), plus the authors this read quarantined.
@@ -655,6 +780,20 @@ impl OpLogStore {
         &self,
         team: &str,
     ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
+        let read = self.read_verified(team).await?;
+        Ok((read.ops, read.quarantined))
+    }
+
+    /// [`read_all_reporting_quarantine`](Self::read_all_reporting_quarantine),
+    /// plus how many objects under the op-log prefix this read skipped because
+    /// they do not deserialize as an [`Op`], for `reconcile`.
+    ///
+    /// The count belongs to this read: a concurrent read cannot change it.
+    ///
+    /// # Errors
+    ///
+    /// Exactly what [`read_all`](Self::read_all) returns.
+    pub(crate) async fn read_for_audit(&self, team: &str) -> Result<AuditedRead, MemError> {
         self.read_verified(team).await
     }
 
@@ -1030,10 +1169,7 @@ impl OpLogStore {
     /// See `verified_cache`'s own doc for why a hit can never let the untrusted
     /// bucket sneak in different bytes for an already-verified key, and why the
     /// chain walk still runs on cached ops too, from scratch, every read.
-    async fn read_verified(
-        &self,
-        team: &str,
-    ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
+    async fn read_verified(&self, team: &str) -> Result<AuditedRead, MemError> {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
 
@@ -1060,6 +1196,7 @@ impl OpLogStore {
         // OUR fetch fault from an op quarantined because the bucket tampered.
         let mut failed_keys: Vec<String> = Vec::new();
         let mut fetched_ok = 0_usize;
+        let mut malformed = 0_usize;
         for (key, bytes) in fetched {
             // A per-object GET failure is skipped like a decode fault, not a
             // whole-read abort: under an eventually-consistent bucket a listed key
@@ -1090,11 +1227,14 @@ impl OpLogStore {
                 // A junk object under the op-log prefix (foreign write, truncated
                 // upload) is a per-object data fault: skip it, don't abort the read
                 // for the whole team. A genuine bad op still fails the crypto checks.
-                Err(err) => tracing::warn!(
-                    object_key = %key,
-                    error = %err,
-                    "skipping object under the op-log prefix that does not deserialize as an Op"
-                ),
+                Err(err) => {
+                    malformed += 1;
+                    tracing::warn!(
+                        object_key = %key,
+                        error = %err,
+                        "skipping object under the op-log prefix that does not deserialize as an Op"
+                    );
+                }
             }
         }
 
@@ -1300,7 +1440,11 @@ impl OpLogStore {
         // binding, team-prefix, and per-author chain verification, so this is where
         // the raw `Vec<Op>` becomes a `VerifiedOps` witness (axiom
         // rust_quality_182 — one construction site, listed).
-        Ok((VerifiedOps::from_verified(ops), quarantined))
+        Ok(AuditedRead {
+            ops: VerifiedOps::from_verified(ops),
+            quarantined,
+            malformed,
+        })
     }
 }
 
@@ -1740,12 +1884,12 @@ fn oplog_prefix(team: &str) -> String {
 /// untrusted-bucket gap the module header covers, and the read path's per-op
 /// verification + chain quarantine is what contains it.)
 fn object_key(team: &str, op: &Op) -> String {
-    format!(
-        "{team}/_oplog/{:020}_{}_{}",
-        op.lamport,
-        op.op_id,
-        op.author_key.to_hex()
-    )
+    op_key(team, op.lamport, op.op_id, &op.author_key)
+}
+
+/// The key of `author`'s op `op_id` at `lamport` in `team`'s op-log.
+fn op_key(team: &str, lamport: u64, op_id: Ulid, author: &VerifyingKey) -> String {
+    format!("{team}/_oplog/{lamport:020}_{op_id}_{}", author.to_hex())
 }
 
 /// The `Op::hash`es of `chain`'s longest genesis-rooted, hash-linked path — the

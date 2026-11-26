@@ -9,7 +9,7 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
 )]
 
-use std::process::Command;
+mod support;
 
 /// 64 hex chars decoding to 32 bytes — valid team-key/seed material.
 fn hex64(byte: &str) -> String {
@@ -28,7 +28,7 @@ fn offline_toml() -> String {
 fn run_doctor_offline(home: &std::path::Path) -> anyhow::Result<std::process::Output> {
     let config_path = home.join("hippius-mem.toml");
     std::fs::write(&config_path, offline_toml())?;
-    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    support::binary()
         .args(["doctor", "--offline"])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", home)
@@ -99,7 +99,7 @@ fn doctor_offline_passes_when_hermes_is_wired() -> anyhow::Result<()> {
         serde_json::to_vec_pretty(&sidecar)?,
     )?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["doctor", "--offline"])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())
@@ -146,7 +146,7 @@ fn doctor_offline_fails_when_plugin_omits_system_prompt_block() -> anyhow::Resul
         serde_json::to_vec_pretty(&sidecar)?,
     )?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["doctor", "--offline"])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())

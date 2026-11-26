@@ -11,8 +11,9 @@ use std::io::IsTerminal as _;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    DropClass, Identity, MemError, MemoryStore, NetworkPrefix, QuarantinedAuthorDetail, Signer,
-    Sr25519Signer, Ss58, TeamManifest, derive_identity,
+    CreateOnly, DropClass, Identity, KeyCheckPublished, MemError, MemoryStore, NetworkPrefix,
+    PublishKeyCheck, QuarantinedAuthorDetail, Signer, Sr25519Signer, Ss58, TeamManifest,
+    derive_identity,
 };
 use zeroize::Zeroizing;
 
@@ -109,6 +110,23 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
         team = %cfg.team,
         "provisioned the team key to authorized published member keys"
     );
+
+    // The founder holds the team's keys by construction, so this is a place a
+    // team-key check can be published without trusting anyone's judgment. Only
+    // where none exists: a check that disagrees is reported, never replaced.
+    // Best effort, like `rotate`'s: the members are provisioned already, and the
+    // recovery key below must still be generated.
+    match publish_key_checks(&store, PublishKeyCheck::IfAbsent).await {
+        Ok(unpublished) => {
+            for (epochs, message) in provision_unpublished_warnings(&unpublished) {
+                tracing::warn!(epochs = ?epochs, "{message}");
+            }
+        }
+        Err(err) => tracing::warn!(
+            error = %format!("{err:#}"),
+            "could not publish the team-key check; run `hippius-mem admin keycheck publish`"
+        ),
+    }
 
     if generate_recovery {
         generate_and_print_recovery_key(&store, &cfg.team).await?;
@@ -281,9 +299,12 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
     store.join_as_member(&identity).await?;
     // Pick up any epoch keys the founder already provisioned to this member.
     bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    // The member key, and so the founder's wrap, is under the author address,
+    // not the mnemonic's (`join_as_member`).
+    let member = cfg.primary_profile().signer()?.author_ss58();
     tracing::info!(
         team = %cfg.team,
-        member = %identity.ss58.as_str(),
+        member = %member.as_str(),
         "published member key; the founder can now `provision` the team key to it"
     );
     Ok(())
@@ -505,7 +526,7 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
 /// never-a-member typo; [`plan_removal`] cannot and need not tell those
 /// apart) does not rotate: nothing changed in this invocation, so rotating
 /// again would mint a gratuitous new epoch and force every remaining
-/// member to bump `max_epoch`, for no security benefit — Task 12's
+/// member to restart, for no security benefit — Task 12's
 /// churn-avoidance, preserved.
 ///
 /// One residual, documented rather than silently reintroduced: a HALF-DONE
@@ -640,10 +661,7 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     } else {
-        tracing::warn!(
-            "HIPPIUS_MEM_MNEMONIC is unset: rotating with only the configured key-ring; \
-             the new epoch is floored by max_epoch, not by the epochs in the bucket"
-        );
+        tracing::warn!("HIPPIUS_MEM_MNEMONIC is unset: rotating with only the configured key-ring");
     }
 
     Ok((cfg, store))
@@ -748,8 +766,9 @@ async fn publish_and_rotate(
 
     // Operator-facing output goes to the stdout handle directly (the workspace
     // denies the `print!` family); write failures are ignored like `members`'.
-    // The ACTION REQUIRED block is the point of the command: a rotation nobody's
-    // config follows silently hides every post-rotation note from the team.
+    // The ACTION REQUIRED block is the point of the command: until a member's
+    // server restarts with its mnemonic, it refuses writes and shows none of the
+    // post-rotation notes.
     let mut out = std::io::stdout();
     let _ = writeln!(
         out,
@@ -764,19 +783,32 @@ async fn publish_and_rotate(
     for member in &outcome.wrapped {
         let _ = writeln!(out, "  {}", member.as_str());
     }
+    match outcome.key_check {
+        Ok(KeyCheckPublished::Published { .. } | KeyCheckPublished::AlreadyPublished) => {}
+        Ok(KeyCheckPublished::Refused) => tracing::warn!(
+            "a key check for the new epoch already exists and is not this key's; run \
+             `hippius-mem admin keycheck publish --replace` from this machine"
+        ),
+        Ok(KeyCheckPublished::KeyFailsOnNotes) => tracing::warn!(
+            "no team-key check was published for the new epoch: this machine's new key \
+             opens fewer than half of that epoch's oldest notes it tried; run \
+             `hippius-mem doctor`, or `hippius-mem admin keycheck publish` from a machine \
+             whose key opens those notes"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "could not publish the new epoch's team-key check; run `hippius-mem admin \
+             keycheck publish` from this machine"
+        ),
+    }
     let _ = writeln!(
         out,
         "\n==================== ACTION REQUIRED ====================\n\
-         Every member must now update their machine:\n\
-         \n\
-           1. Set max_epoch = {epoch} in hippius-mem.toml\n\
-              (or export HIPPIUS_MEM_MAX_EPOCH={epoch}).\n\
-           2. Restart the MCP server — and any running `dashboard`, which\n\
-              caches stores per vault — so each bootstraps the new epoch key.\n\
-         \n\
-         A stale max_epoch fails SILENTLY: startup only bootstraps epochs\n\
-         0..=max_epoch, so notes sealed under epoch {epoch} simply never\n\
-         appear on that machine — no error is raised.\n\
+         Every member must now restart the MCP server, and any running\n\
+         `dashboard` (it caches stores per vault), with HIPPIUS_MEM_MNEMONIC\n\
+         set, so each loads the epoch {epoch} key. A process without it,\n\
+         such as the `serve` daemon, cannot load the key: it refuses every\n\
+         write and does not show notes sealed under epoch {epoch}.\n\
          ==========================================================",
         epoch = outcome.new_epoch
     );
@@ -1051,7 +1083,7 @@ pub(crate) async fn members(args: &[String]) -> anyhow::Result<()> {
 /// would keep sealing new notes under epoch 0 — a key a removed member still
 /// holds. The ring's max is by construction an epoch this member can decrypt, so
 /// sealing under it is always safe for the writer; teammates see those notes once
-/// their own `max_epoch` catches up (the loud instruction `rotate` prints).
+/// their own servers restart with their mnemonic (the instruction `rotate` prints).
 ///
 /// Non-fatal by contract: a fresh bucket, an un-provisioned epoch, or a derivation
 /// failure is logged and skipped — the server still serves with its configured
@@ -1068,14 +1100,26 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             return;
         }
     };
-    // Inclusive 0..=max_epoch: there is no on-bucket epoch discovery, so the
-    // operator names the highest rotated epoch via `max_epoch` and we try each.
-    let epochs: Vec<u64> = (0..=max_epoch).collect();
+    // Every epoch with a wrap addressed to this member, so a rotation reaches
+    // this machine without anyone raising `max_epoch` first. Listed, not
+    // walked as a range: rotations step over epochs another object holds, and
+    // a planted wrap at a huge epoch then costs one GET instead of a walk.
+    // `max_epoch` is the range tried when the listing fails.
+    let epochs = match store.wrapped_epochs().await {
+        Ok(epochs) => epochs,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not list this member's wrapped keys; trying epochs up to max_epoch"
+            );
+            (0..=max_epoch).collect()
+        }
+    };
     match store.bootstrap_epoch_keys(&identity, &epochs).await {
         Ok(added) => {
             // Seal future writes under the newest epoch this member holds. Only
-            // ever advances (never rolls back): a member who could not unwrap
-            // the newest epoch keeps writing under their newest readable one.
+            // ever advances (never rolls back). A member who could not unwrap
+            // the newest epoch has its writes refused (`EpochSuperseded`).
             if let Some(top) = store.highest_epoch()
                 && top > store.current_epoch()
             {
@@ -1087,7 +1131,7 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             }
             tracing::info!(
                 added,
-                max_epoch,
+                tried = epochs.len(),
                 "bootstrapped accessible epoch keys from the bucket"
             );
         }
@@ -1098,59 +1142,36 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
     }
 }
 
-/// Best-effort: warn (loudly, at WARN level) when `store`'s bucket has
-/// published a wrapped-key epoch newer than `configured_max_epoch`.
+/// Best-effort: warn when the team's founder provisioned an epoch newer than
+/// the one `store` seals under, so this process neither reads the notes
+/// sealed under it nor writes (its writes are refused with
+/// [`MemError::EpochSuperseded`]).
 ///
-/// This is the warning-side counterpart to [`bootstrap_epochs`]: that function
-/// only tries epochs `0..=max_epoch` because it has no way to see what the
-/// bucket actually holds, so a `max_epoch` an operator forgets to raise after
-/// a teammate's `rotate` silently hides every note sealed under the new epoch
-/// — the recorded, twice-recurred `bootstrap_epochs` gotcha. Calling this
-/// after every store build closes that: it needs no identity (unlike
-/// `bootstrap_epochs`, it only lists the `_keys/` prefix), so it runs
-/// unconditionally, not gated on `HIPPIUS_MEM_MNEMONIC`.
-///
-/// Never raises `max_epoch` itself — the pin is security-relevant (it bounds
-/// how many epoch keys startup tries to fetch), so only the operator decides
-/// to widen it. A fetch failure (offline, missing permissions) is silent: this
-/// check exists to add a hint on top of whatever already runs, never to become
-/// a new failure mode of its own.
-pub(crate) async fn warn_if_max_epoch_stale(store: &MemoryStore, configured_max_epoch: u64) {
-    let Ok(published) = store.highest_published_epoch().await else {
-        return;
-    };
-    if published > configured_max_epoch {
-        let message = max_epoch_stale_message(published);
-        tracing::warn!(configured = configured_max_epoch, published, "{message}");
+/// Needs no identity, only the `_keys/` listing (and a wrap GET when it names a
+/// newer epoch), so it runs whether or not `HIPPIUS_MEM_MNEMONIC` is set: that
+/// is the case it exists for, the `serve` daemon. A lookup failure is silent:
+/// the write path reports its own.
+pub(crate) async fn warn_if_epoch_superseded(store: &MemoryStore) {
+    let sealing = store.current_epoch();
+    if let Ok(Some(newest)) = store.newest_provisioned_epoch(sealing).await {
+        let team = store.team();
+        tracing::warn!(
+            sealing,
+            newest,
+            "team {team} rotated its key to epoch {newest}, and this process holds keys only up \
+             to epoch {sealing}: notes sealed under the newer key stay unreadable here and writes \
+             are refused; set HIPPIUS_MEM_MNEMONIC to this member's mnemonic and restart (the \
+             `serve` daemon cannot load rotated keys)"
+        );
     }
-}
-
-/// The stale-`max_epoch` warning's message text, extracted so it is directly
-/// unit-testable without capturing `tracing` output (mirrors
-/// `doctor::stale_max_epoch_line`, which is a pure `String`-returning
-/// function for the same reason).
-///
-/// `max_epoch` is a TOP-LEVEL [`crate::config::Config`] field, never a
-/// `[[teams]]` profile one — [`crate::config::TeamProfile`] carries
-/// `#[serde(deny_unknown_fields)]`, so an operator who follows a message
-/// pointing at a team profile would add `max_epoch` there and break parsing
-/// for every subsequent command (including the MCP server). The wording
-/// below must therefore always point at the top level, never at a team
-/// profile.
-fn max_epoch_stale_message(published: u64) -> String {
-    format!(
-        "this machine's max_epoch hides rotated notes: raise max_epoch to {published} at the \
-         TOP LEVEL of hippius-mem.toml -- it is a top-level setting, never a per-team \
-         profile field -- or new-epoch notes stay invisible"
-    )
 }
 
 /// Usage line shared by every `admin quarantine` refusal.
 const QUARANTINE_USAGE: &str = "usage: admin quarantine [--remove <object-key> [--yes]]";
 
 /// Usage line for the `admin` namespace router, naming every subcommand.
-const ADMIN_USAGE: &str =
-    "usage: admin quarantine [--remove <object-key> [--yes]] | admin resign-anchors";
+const ADMIN_USAGE: &str = "usage: admin quarantine [--remove <object-key> [--yes]] | admin \
+     resign-anchors | admin keycheck publish [--replace]";
 
 /// Run `admin <subcommand>`: the operator-maintenance namespace — `quarantine`
 /// (persistent op-log quarantine inspection and safety-railed remediation) and
@@ -1163,10 +1184,169 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
         Some((sub, rest)) => match sub.as_str() {
             "quarantine" => quarantine(rest).await,
             "resign-anchors" => resign_anchors(rest).await,
+            "keycheck" => keycheck(rest).await,
             other => bail!("unknown admin subcommand `{other}`; {ADMIN_USAGE}"),
         },
         None => bail!("admin requires a subcommand; {ADMIN_USAGE}"),
     }
+}
+
+/// Run `admin keycheck publish [--replace]`: publish this machine's team-key
+/// check for every epoch it holds a key for (the configured key, plus the
+/// rotated epochs `HIPPIUS_MEM_MNEMONIC` unwraps).
+///
+/// For a team that predates the check, run once from the founder's machine:
+/// on an epoch with no notes the probe below cannot tell a wrong key, so a
+/// member with a mistyped key would publish a check that refuses the rest of
+/// the team. Without
+/// `--replace` an existing check is never overwritten, so a wrong one is
+/// reported and the command fails. `--replace` overwrites it: the recovery
+/// for a wrong or unusable check, and a decision that this machine's key IS
+/// the team's, since every client with another key is refused afterwards.
+/// Either way, an epoch whose oldest notes this machine's key mostly fails to
+/// open is not published, and the command fails; an epoch with no notes is
+/// published.
+///
+/// # Errors
+///
+/// A usage error, a store that cannot be built, a failed read or write, an
+/// epoch whose published check is another key's (without `--replace`), or an
+/// epoch whose notes this machine's key does not open.
+async fn keycheck(args: &[String]) -> anyhow::Result<()> {
+    let mode = parse_keycheck_args(args)?;
+
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+    let store = cfg.build_store().await?;
+    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    }
+
+    let unpublished = publish_key_checks(&store, mode).await?;
+    let problems = keycheck_problems(&unpublished);
+    if !problems.is_empty() {
+        bail!("{}", problems.join("; "));
+    }
+    Ok(())
+}
+
+/// Parse `admin keycheck`'s arguments: `publish`, optionally `--replace`.
+///
+/// # Errors
+///
+/// A usage error for anything else, before any configuration is read.
+fn parse_keycheck_args(args: &[String]) -> anyhow::Result<PublishKeyCheck> {
+    match args {
+        [verb] if verb == "publish" => Ok(PublishKeyCheck::IfAbsent),
+        [verb, flag] if verb == "publish" && flag == "--replace" => Ok(PublishKeyCheck::Replace),
+        _ => bail!("usage: admin keycheck publish [--replace]"),
+    }
+}
+
+/// The epochs [`publish_key_checks`] published nothing for, by reason.
+#[derive(Debug, Default)]
+pub(crate) struct Unpublished {
+    /// The team's check is another key's, or cannot be read.
+    pub(crate) other_check: Vec<u64>,
+    /// This machine's key fails to open most of the epoch's oldest notes.
+    pub(crate) key_fails_on_notes: Vec<u64>,
+}
+
+/// Publish this store's key check for every epoch it holds a key for, logging
+/// each outcome, and return the epochs it published nothing for.
+///
+/// # Errors
+///
+/// Whatever [`MemoryStore::publish_team_key_check`] reports.
+pub(crate) async fn publish_key_checks(
+    store: &MemoryStore,
+    mode: PublishKeyCheck,
+) -> anyhow::Result<Unpublished> {
+    let mut unpublished = Unpublished::default();
+    for epoch in store.held_epochs() {
+        match store
+            .publish_team_key_check(epoch, mode)
+            .await
+            .with_context(|| format!("publishing the team-key check for epoch {epoch} failed"))?
+        {
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::Enforced),
+            } => tracing::info!(epoch, "published the team-key check"),
+            KeyCheckPublished::Published { create_only: None } => {
+                tracing::info!(epoch, "replaced the team-key check with this key's");
+            }
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::NotEnforced),
+            } => tracing::warn!(
+                epoch,
+                "published the team-key check, but the storage gateway does not enforce \
+                 create-only writes, so a publisher with another key at the same moment could \
+                 have overwritten it or been overwritten; run `hippius-mem doctor` from both \
+                 machines to confirm"
+            ),
+            KeyCheckPublished::AlreadyPublished => {
+                tracing::info!(epoch, "the team-key check is already this key's");
+            }
+            KeyCheckPublished::Refused => unpublished.other_check.push(epoch),
+            KeyCheckPublished::KeyFailsOnNotes => unpublished.key_fails_on_notes.push(epoch),
+        }
+    }
+    Ok(unpublished)
+}
+
+/// Warning lines `provision` emits for epochs it published no check for.
+/// Extracted so a unit test can pin the empty/non-empty conditions without
+/// loading a configured store.
+fn provision_unpublished_warnings(unpublished: &Unpublished) -> Vec<(Vec<u64>, String)> {
+    let mut warnings = Vec::new();
+    if !unpublished.other_check.is_empty() {
+        warnings.push((
+            unpublished.other_check.clone(),
+            String::from(
+                "the team's published key check for these epochs is not this founder's key; \
+                 if this machine's key is the team's, run `hippius-mem admin keycheck \
+                 publish --replace`",
+            ),
+        ));
+    }
+    if !unpublished.key_fails_on_notes.is_empty() {
+        warnings.push((
+            unpublished.key_fails_on_notes.clone(),
+            String::from(
+                "no team-key check was published for these epochs: this founder's key opens \
+                 fewer than half of their oldest notes it tried; run `hippius-mem doctor`",
+            ),
+        ));
+    }
+    warnings
+}
+
+/// Error messages `admin keycheck publish` returns for epochs it published
+/// nothing for. Extracted so a unit test can pin the empty/non-empty conditions
+/// without loading a configured store.
+fn keycheck_problems(unpublished: &Unpublished) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !unpublished.key_fails_on_notes.is_empty() {
+        problems.push(format!(
+            "this machine's team key opens fewer than half of the oldest notes of epoch(s) {:?} \
+             it tried, so it is probably not the team's key, and publishing it would refuse the \
+             clients whose key those notes were sealed under; nothing was published for them. \
+             Fix team_key_hex (or HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) and run \
+             `hippius-mem doctor`, or publish from a machine whose key opens the team's notes. \
+             If this machine's key is the team's and those notes were sealed under another key, \
+             the founder's `hippius-mem rotate` moves the team to a new epoch, whose check is \
+             published",
+            unpublished.key_fails_on_notes
+        ));
+    }
+    if !unpublished.other_check.is_empty() {
+        problems.push(format!(
+            "the team's published key check for epoch(s) {:?} is another key's (or cannot be \
+             read), so it was left alone; if this machine's key is the team's, rerun with \
+             --replace, and otherwise fix team_key_hex",
+            unpublished.other_check
+        ));
+    }
+    problems
 }
 
 /// Run `admin resign-anchors`: re-sign THIS author's own legacy (unsigned)
@@ -1575,16 +1755,18 @@ mod tests {
 
     use hippius_mem_core::{
         BlobStore, DropClass, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
-        MemoryStore, NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
-        derive_identity, provision_team_key, publish_member_key, signer_from_mnemonic,
+        MemoryStore, NoopAnchor, OpLogStore, PublishKeyCheck, SecretKey, Signer, Sr25519Signer,
+        Ss58, TeamManifest, derive_identity, provision_team_key, publish_member_key,
+        signer_from_mnemonic,
     };
 
     use super::{
-        HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, admin,
-        bootstrap_epochs, max_epoch_stale_message, parse_members, parse_provision_args,
-        parse_publish_membership_args, parse_quarantine_args, parse_remove_args, parse_rotate_args,
-        pending_revoke_reminder, plan_removal, plan_warnings, print_recovery_outcome,
-        print_recovery_seed, publish_and_rotate, reject_args, reject_recover_args,
+        HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, Unpublished, admin,
+        bootstrap_epochs, keycheck_problems, parse_keycheck_args, parse_members,
+        parse_provision_args, parse_publish_membership_args, parse_quarantine_args,
+        parse_remove_args, parse_rotate_args, pending_revoke_reminder, plan_removal, plan_warnings,
+        print_recovery_outcome, print_recovery_seed, provision_unpublished_warnings,
+        publish_and_rotate, publish_key_checks, reject_args, reject_recover_args,
         removal_requires_rotation, sr25519_signer_from_hex_seed,
     };
     use crate::config::Config;
@@ -1823,6 +2005,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keycheck_accepts_only_publish_with_an_optional_replace() {
+        for args in [&[][..], &["publish", "--force"][..], &["show"][..]] {
+            let mut argv = vec!["keycheck".to_owned()];
+            argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+            let err = admin(&argv)
+                .await
+                .expect_err("a malformed keycheck invocation must refuse");
+            assert!(
+                err.to_string()
+                    .contains("admin keycheck publish [--replace]"),
+                "the refusal shows the usage: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn resign_anchors_rejects_stray_arguments() {
         // `admin resign-anchors` takes no arguments; a typo or a flag meant
         // for another command must fail loudly BEFORE any store/S3 operation
@@ -1862,6 +2060,107 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn keycheck_parses_publish_and_replace() -> anyhow::Result<()> {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_keycheck_args(&args(&["publish"]))?,
+            hippius_mem_core::PublishKeyCheck::IfAbsent
+        );
+        assert_eq!(
+            parse_keycheck_args(&args(&["publish", "--replace"]))?,
+            hippius_mem_core::PublishKeyCheck::Replace
+        );
+        assert!(parse_keycheck_args(&args(&["replace", "--publish"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn keycheck_problems_follow_each_unpublished_reason() {
+        let none = Unpublished {
+            other_check: vec![],
+            key_fails_on_notes: vec![],
+        };
+        assert!(keycheck_problems(&none).is_empty());
+        assert!(provision_unpublished_warnings(&none).is_empty());
+
+        let failed = Unpublished {
+            other_check: vec![],
+            key_fails_on_notes: vec![0],
+        };
+        let problems = keycheck_problems(&failed);
+        assert_eq!(problems.len(), 1);
+        assert!(
+            problems[0].contains("opens fewer than half"),
+            "{problems:?}"
+        );
+        let warnings = provision_unpublished_warnings(&failed);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].0, [0]);
+        assert!(warnings[0].1.contains("opens fewer than half"));
+
+        let other = Unpublished {
+            other_check: vec![1],
+            key_fails_on_notes: vec![],
+        };
+        let problems = keycheck_problems(&other);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("is another key's"), "{problems:?}");
+        let warnings = provision_unpublished_warnings(&other);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].0, [1]);
+        assert!(warnings[0].1.contains("not this founder's key"));
+
+        let both = Unpublished {
+            other_check: vec![2],
+            key_fails_on_notes: vec![0],
+        };
+        assert_eq!(keycheck_problems(&both).len(), 2);
+        assert_eq!(provision_unpublished_warnings(&both).len(), 2);
+    }
+
+    /// `publish_key_checks` sorts each epoch it published nothing for by
+    /// reason: another key's check (without `--replace`), or a key that does
+    /// not open the epoch's notes (with it, too).
+    #[tokio::test]
+    async fn publish_key_checks_reports_the_epochs_it_left_unpublished() -> anyhow::Result<()> {
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let first = epoch0_store(&bucket)?;
+        let published = publish_key_checks(&first, PublishKeyCheck::IfAbsent).await?;
+        assert!(published.other_check.is_empty() && published.key_fails_on_notes.is_empty());
+        first
+            .remember(hippius_mem_core::RememberInput {
+                note_type: hippius_mem_core::NoteType::Decision,
+                repo: hippius_mem_core::RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: "a note the first key opens".to_owned(),
+                body: "body".to_owned(),
+                force: true,
+            })
+            .await?;
+
+        let blob: Arc<dyn BlobStore> = bucket.clone();
+        let other_key = MemoryStore::new(
+            blob.clone(),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(blob),
+            Arc::new(NoopAnchor),
+            Arc::new(signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([2u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            16,
+        );
+        let if_absent = publish_key_checks(&other_key, PublishKeyCheck::IfAbsent).await?;
+        assert_eq!(if_absent.other_check, [0]);
+        assert!(if_absent.key_fails_on_notes.is_empty());
+
+        let replace = publish_key_checks(&other_key, PublishKeyCheck::Replace).await?;
+        assert!(replace.other_check.is_empty());
+        assert_eq!(replace.key_fails_on_notes, [0]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bootstrap_advances_the_write_epoch_to_the_newest_unwrapped_key() -> anyhow::Result<()>
     {
@@ -1896,7 +2195,9 @@ mod tests {
         .await?;
 
         let store = epoch0_store(&bucket)?;
-        bootstrap_epochs(&store, MNEMONIC, 1).await;
+        // `max_epoch` 0: the fallback range stops at epoch 0, so epoch 1 comes
+        // only from the listing of this member's wraps.
+        bootstrap_epochs(&store, MNEMONIC, 0).await;
         assert_eq!(
             store.current_epoch(),
             1,
@@ -2528,26 +2829,5 @@ mod tests {
             "the banner must show the fresh recovery seed: {rendered}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn max_epoch_stale_message_points_at_the_top_level_not_a_teams_profile() {
-        // Finding #15: max_epoch is a TOP-LEVEL Config field; TeamProfile
-        // carries `#[serde(deny_unknown_fields)]`, so an operator who
-        // follows a message pointing at "[[teams]]" would add max_epoch
-        // there and break parsing for every subsequent command.
-        let message = max_epoch_stale_message(5);
-        assert!(
-            message.to_lowercase().contains("top level"),
-            "the message must name the top level: {message}"
-        );
-        assert!(
-            !message.contains("[[teams]]"),
-            "the message must not point at a [[teams]] profile: {message}"
-        );
-        assert!(
-            message.contains("raise max_epoch to 5"),
-            "the message must name the actionable fix: {message}"
-        );
     }
 }

@@ -92,6 +92,49 @@ fn head_watermarks_path(team: &str) -> Option<PathBuf> {
     Some(state_dir_for(team)?.join("head-watermarks.json"))
 }
 
+/// A short, stable id for the bucket `profile` stores its objects in: the S3
+/// bucket name, or the local trial root. Part of the writer tip file's name, so
+/// one team name used against two buckets keeps two tips.
+///
+/// Deliberately not the endpoint URL: one bucket reached through two URLs (a
+/// trailing slash, a host alias, a proxy) must share one tip per author, or two
+/// live sessions each chain to their own stale tip and fork the author's chain.
+/// Two gateways holding a bucket of the same name share the file too; each entry
+/// records [`endpoint_id`], and the store checks an entry from another endpoint
+/// against the bucket before chaining to it (the core `writer_lock` module docs).
+///
+/// 16 hex characters of a BLAKE3 hash: a file name, not a secret, and 64 bits
+/// keep two buckets on one machine from colliding.
+fn bucket_id(profile: &TeamProfile) -> String {
+    let bucket = match profile.storage {
+        StorageBackend::S3 => format!("s3\n{}", profile.bucket),
+        StorageBackend::Local => match profile.local_trial_root() {
+            Ok(root) => format!("local\n{}", root.display()),
+            Err(_) => "local\n".to_owned(),
+        },
+    };
+    short_hash(&bucket)
+}
+
+/// A short, stable id for the endpoint `profile` reaches its bucket through,
+/// stored with each writer tip entry: the S3 endpoint URL as written, or one
+/// constant for a local trial vault, which has no endpoint. A cosmetic change to
+/// the URL only makes the next write check the entry against the bucket.
+///
+/// Hashed like [`bucket_id`], so the tip file holds no URL.
+fn endpoint_id(profile: &TeamProfile, shared: &Config) -> String {
+    match profile.storage {
+        StorageBackend::S3 => short_hash(&format!("s3\n{}", shared.s3_endpoint)),
+        StorageBackend::Local => short_hash("local"),
+    }
+}
+
+/// The first 16 hex characters of `text`'s BLAKE3 hash.
+fn short_hash(text: &str) -> String {
+    let hash = hippius_mem_core::content_hash(text.as_bytes()).to_hex();
+    hash[..16].to_owned()
+}
+
 /// This machine's durable state directory for `team`, or `None` when no base
 /// resolves from the environment.
 ///
@@ -124,7 +167,11 @@ pub(crate) const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
 /// `quickstart` FIRST — it is the zero-to-working path a brand-new user needs, and
 /// its absence from this message (which every zero-state user hits) was a
 /// documented onboarding gap. Centralized so the 15+ call sites cannot drift.
-pub(crate) const CONFIG_LOAD_HELP: &str = "failed to load configuration; run `hippius-mem quickstart` to set up a trial vault, or set HIPPIUS_MEM_* env vars / create a hippius-mem.toml";
+///
+/// The same context wraps a configuration that exists but is invalid, where the
+/// cause below it names the setting to fix, so it offers `quickstart` only for a
+/// machine that has no configuration yet.
+pub(crate) const CONFIG_LOAD_HELP: &str = "failed to load configuration; on a machine with none yet, run `hippius-mem quickstart` to set up a trial vault (or set HIPPIUS_MEM_* env vars / create a hippius-mem.toml); otherwise fix the setting named below";
 
 /// The config file the bare-CLI read path ([`Config::from_env_and_file`]) consults
 /// when `HIPPIUS_MEM_CONFIG` is unset, given whether a cwd-local `./hippius-mem.toml`
@@ -244,13 +291,13 @@ pub(crate) struct Config {
     /// dirty git-tracked instruction file refuses the whole provisioning in
     /// favor of the nudge (see `setup::provision_on_serve`).
     pub(crate) auto_init: bool,
-    /// Highest team-key epoch to bootstrap from the bucket at startup.
+    /// The range of team-key epochs startup tries when it cannot list this
+    /// member's wraps, and a floor for the next rotation's epoch.
     ///
-    /// Defaults to 0 (only the founding epoch). When `HIPPIUS_MEM_MNEMONIC` is
-    /// set, startup attempts to load the wrapped keys for epochs `0..=max_epoch`
-    /// this member can unwrap, so a member provisioned after a team-key rotation
-    /// can read notes sealed under the newer epochs. Key discovery is not
-    /// automatic — set this to the highest epoch the team has rotated to.
+    /// Defaults to 0. When `HIPPIUS_MEM_MNEMONIC` is set, startup loads the key
+    /// of every epoch with a wrap addressed to this member, from one listing,
+    /// so a rotation reaches this machine without editing it. Only when that
+    /// listing fails does it try epochs 0 through `max_epoch`.
     pub(crate) max_epoch: u64,
     /// The team founder's SS58 address, pinned out of band.
     ///
@@ -344,6 +391,31 @@ pub(crate) struct Config {
     /// was a silent no-op where the nudge is delivered.
     #[serde(skip)]
     pub(crate) source_path: Option<std::path::PathBuf>,
+    /// Where `team_key_hex` came from, so a malformed key error names the place
+    /// the operator must fix. Never read from TOML.
+    #[serde(skip)]
+    pub(crate) team_key_source: KeySource,
+}
+
+/// Where a config's team key came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum KeySource {
+    /// `team_key_hex` in the config file (or no key at all).
+    #[default]
+    ConfigFile,
+    /// The `HIPPIUS_MEM_TEAM_KEY_HEX` environment variable, which overrides the
+    /// file.
+    EnvVar,
+}
+
+impl KeySource {
+    /// The name the operator sets this key under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ConfigFile => "team_key_hex",
+            Self::EnvVar => "HIPPIUS_MEM_TEAM_KEY_HEX",
+        }
+    }
 }
 
 impl Default for Config {
@@ -384,6 +456,7 @@ impl Default for Config {
             teams: Vec::new(),
             source_dir: None,
             source_path: None,
+            team_key_source: KeySource::ConfigFile,
         }
     }
 }
@@ -418,6 +491,7 @@ impl fmt::Debug for Config {
             .field("teams", &self.teams)
             .field("source_dir", &self.source_dir)
             .field("source_path", &self.source_path)
+            .field("team_key_source", &self.team_key_source)
             .finish()
     }
 }
@@ -590,6 +664,7 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_TEAM_KEY_HEX") {
             self.team_key_hex = v;
+            self.team_key_source = KeySource::EnvVar;
         }
         if let Some(v) = lookup("HIPPIUS_MEM_AUTHOR_SEED_HEX") {
             self.author_seed_hex = v;
@@ -661,15 +736,15 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_MAX_EPOCH") {
             // A malformed override leaves the file/default value in place, matching
-            // the lenient `anchor_threshold` overlay above — and WARNS, because a
-            // silent fallback to 0 caps epoch-key bootstrap and makes every note
-            // under a rotated epoch undecryptable with no diagnostic.
+            // the lenient `anchor_threshold` overlay above — and WARNS, because the
+            // value was meant to change which epochs startup tries when it cannot
+            // list this member's wraps, and where a rotation's epoch starts.
             match v.parse::<u64>() {
                 Ok(parsed) => self.max_epoch = parsed,
                 Err(err) => tracing::warn!(
                     value = %v,
                     error = %err,
-                    "ignoring malformed HIPPIUS_MEM_MAX_EPOCH; keeping the file/default value (this caps epoch-key bootstrap)"
+                    "ignoring malformed HIPPIUS_MEM_MAX_EPOCH; keeping the file/default value"
                 ),
             }
         }
@@ -758,8 +833,9 @@ impl Config {
             });
         }
         // A 0 threshold would anchor every op as its own batch; an unbounded
-        // max_epoch makes startup load one wrapped key per epoch (one S3 GET each),
-        // turning a config typo into a startup denial of service. Bound both.
+        // max_epoch makes a startup that cannot list the member's wraps try one
+        // wrapped key per epoch (one S3 GET each), turning a config typo into a
+        // startup denial of service. Bound both.
         if self.anchor_threshold == 0 {
             return Err(ConfigError::OutOfRange {
                 field: "anchor_threshold",
@@ -770,7 +846,7 @@ impl Config {
             return Err(ConfigError::OutOfRange {
                 field: "max_epoch",
                 detail: format!(
-                    "must be <= {MAX_BOOTSTRAP_EPOCH}; startup loads one wrapped key per epoch 0..=max_epoch"
+                    "must be <= {MAX_BOOTSTRAP_EPOCH}; startup tries one wrapped key per epoch 0..=max_epoch when it cannot list the bucket"
                 ),
             });
         }
@@ -857,7 +933,7 @@ impl Config {
     /// Returns [`ConfigError::InvalidKey`] if the hex is malformed or does not
     /// decode to exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
-        decode_team_key(&self.team_key_hex)
+        decode_team_key(&self.team_key_hex, self.team_key_source.name())
     }
 
     /// The [`UnsignedAnchorPolicy`] this config's `require_signed_anchors`
@@ -1116,18 +1192,20 @@ fn signer_from_seed(seed: &Zeroizing<[u8; 32]>) -> Result<Sr25519Signer, ConfigE
 /// # Errors
 ///
 /// [`ConfigError::InvalidKey`] if the hex is malformed or not exactly 32 bytes.
-fn decode_team_key(team_key_hex: &str) -> Result<SecretKey, ConfigError> {
+fn decode_team_key(team_key_hex: &str, setting: &'static str) -> Result<SecretKey, ConfigError> {
     // Fixed detail, never the hex crate's message (it names the offending SECRET
     // char/position). `Zeroizing` wraps each transient copy of the raw key;
     // `SecretKey` takes the array by value and zeroizes its own copy, so the
     // residual stack array is wiped here.
     let bytes = Zeroizing::new(hippius_mem_core::hex::decode(team_key_hex).map_err(|_| {
         ConfigError::InvalidKey {
+            setting,
             detail: "not valid hex".to_owned(),
         }
     })?);
     if bytes.len() != 32 {
         return Err(ConfigError::InvalidKey {
+            setting,
             detail: format!(
                 "expected 32 bytes (64 hex chars), got {} bytes",
                 bytes.len()
@@ -1372,7 +1450,7 @@ impl TeamProfile {
     ///
     /// [`ConfigError::InvalidKey`] if the hex is malformed or not exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
-        decode_team_key(&self.team_key_hex)
+        decode_team_key(&self.team_key_hex, KeySource::ConfigFile.name())
     }
 
     fn author_seed(&self) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
@@ -1477,12 +1555,30 @@ impl TeamProfile {
     /// This profile's cross-process write lock, when a state directory resolves.
     ///
     /// Keyed on the profile NAME, alongside the head watermarks, because that name
-    /// is also the object-key prefix — so two profiles pointing at different
-    /// buckets never contend, and two processes on one profile always do. Keying on
-    /// the bucket instead would wrongly merge two profiles that share a bucket
-    /// under different author keys, and keying on the config path would wrongly
-    /// separate two processes started with different `HIPPIUS_MEM_CONFIG` copies of
-    /// the same profile.
+    /// is also the object-key prefix, so two processes on one profile always
+    /// contend, whatever config file started them. Keying on the config path would
+    /// wrongly separate two processes started with different `HIPPIUS_MEM_CONFIG`
+    /// copies of the same profile.
+    ///
+    /// The name is not an identity: two profiles with the same team name and
+    /// different author seeds (a second agent seed, `import` under another
+    /// identity, a CI runner sharing `HOME`) share this lock. Sharing the lock
+    /// only orders their writes. The tip file keeps one entry per author key, and
+    /// a writer reads only its own, so neither author ever chains to the other's
+    /// op.
+    ///
+    /// Nor does the name identify a bucket: one team name can be used against
+    /// two buckets (staging and production, say) from one machine. So the tip
+    /// file is named after the bucket as well (`writer-tip-v3-{bucket}.json`,
+    /// see [`bucket_id`]); a tip recorded for one bucket names an op the other
+    /// does not hold. It is not named after the endpoint URL, so one bucket
+    /// reached through two URLs (a trailing slash, an alias, a proxy) has one
+    /// tip per author. Each entry records the endpoint that wrote it
+    /// ([`endpoint_id`]), and an entry from another endpoint is used only once
+    /// the bucket is found to hold its op, which keeps two gateways that each
+    /// hold a bucket of the same name apart. The legacy `writer-tip.json`
+    /// beside it is the file 0.7.1 and earlier use, kept current for them (see
+    /// the core `writer_lock` module docs).
     ///
     /// Applies to EVERY backend, unlike
     /// [`try_lock_vault_writer`](Self::try_lock_vault_writer). That one guards a
@@ -1495,12 +1591,15 @@ impl TeamProfile {
     /// `None` when no state directory resolves, which
     /// [`build_store`](Self::build_store) already warns about for the watermarks
     /// that share the path.
-    pub(crate) fn writer_lock(&self) -> Option<Arc<WriterLock>> {
+    pub(crate) fn writer_lock(&self, shared: &Config) -> Option<Arc<WriterLock>> {
         let dir = state_dir_for(&self.name)?;
+        let bucket = bucket_id(self);
 
         Some(Arc::new(WriterLock::new(
             dir.join("writer.lock"),
+            dir.join(format!("writer-tip-v3-{bucket}.json")),
             dir.join("writer-tip.json"),
+            endpoint_id(self, shared),
         )))
     }
 
@@ -1822,7 +1921,7 @@ impl TeamProfile {
         // Shared (not per-profile), like the anchor threshold: strictness about
         // unsigned anchor records is a deployment posture, not a team property.
         .with_unsigned_anchor_policy(shared.unsigned_anchor_policy())
-        .with_writer_lock(self.writer_lock())
+        .with_writer_lock(self.writer_lock(shared))
         // Only an S3 (shared team bucket) profile structurally needs
         // cross-process write serialization: a second same-identity process is
         // the routine consequence of this product's user-global MCP
@@ -2180,11 +2279,11 @@ fn canonical_org_hint(pattern: &str) -> String {
     }
 }
 
-/// Upper bound on `max_epoch`: startup loads one wrapped team key per epoch in
-/// `0..=max_epoch` (one S3 GET each), so an unbounded value is a startup denial
-/// of service via a config typo. 1024 epochs is far beyond any realistic
+/// Upper bound on `max_epoch`: when it cannot list the member's wraps, startup
+/// tries one wrapped team key per epoch in `0..=max_epoch` (one S3 GET each), so
+/// an unbounded value is a startup denial of service via a config typo. 1024 epochs is far beyond any realistic
 /// key-rotation count while keeping the bootstrap bounded.
-const MAX_BOOTSTRAP_EPOCH: u64 = 1024;
+pub(crate) const MAX_BOOTSTRAP_EPOCH: u64 = 1024;
 
 /// Why a configuration could not be loaded into a usable [`Config`].
 #[derive(Debug, thiserror::Error)]
@@ -2200,9 +2299,12 @@ pub(crate) enum ConfigError {
         field: &'static str,
     },
 
-    /// `team_key_hex` did not decode to a 32-byte key.
-    #[error("team_key_hex is invalid: {detail}; expected 64 hex characters (32 bytes)")]
+    /// The team key did not decode to a 32-byte key.
+    #[error("{setting} is invalid: {detail}; expected 64 hex characters (32 bytes)")]
     InvalidKey {
+        /// Where the key was set: `team_key_hex`, or the
+        /// `HIPPIUS_MEM_TEAM_KEY_HEX` environment variable that overrides it.
+        setting: &'static str,
         /// What was wrong with the supplied key.
         detail: String,
     },
@@ -2421,7 +2523,9 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
     )]
 
-    use super::{Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt};
+    use super::{
+        Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt, bucket_id, endpoint_id,
+    };
     use hippius_mem_core::{BlobStore, NoteType, RememberInput, RepoScope, Signer, verify};
     // Only the offline `build_store_uses_fs_backend_for_local_profiles` test
     // below needs this one; the round-trip imports above are shared with the
@@ -2623,6 +2727,78 @@ mod tests {
             cfg.source_path, None,
             "an unread path must not be recorded as a source"
         );
+    }
+
+    /// A malformed key from the environment names the variable, and one from the
+    /// file names the field. Regression test: both said `team_key_hex`, so an
+    /// operator with a bad `HIPPIUS_MEM_TEAM_KEY_HEX` kept editing a correct file.
+    #[test]
+    fn a_malformed_team_key_error_names_where_the_key_was_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("never-created.toml");
+        let err = Config::load_from_paths(
+            Some(missing.to_string_lossy().as_ref()),
+            "./unused-default.toml",
+            |key| match key {
+                "HIPPIUS_MEM_BUCKET" => Some("memories".to_owned()),
+                "HIPPIUS_MEM_ACCESS_KEY_ID" => Some("AKID".to_owned()),
+                "HIPPIUS_MEM_SECRET" => Some(SECRET.to_owned()),
+                "HIPPIUS_MEM_TEAM" => Some("ourovoros".to_owned()),
+                "HIPPIUS_MEM_TEAM_KEY_HEX" => Some("abc".to_owned()),
+                "HIPPIUS_MEM_AUTHOR_SEED_HEX" => Some(VALID_SEED.to_owned()),
+                _ => None,
+            },
+        )
+        .expect_err("a malformed env key is rejected");
+        assert!(
+            err.to_string()
+                .starts_with("HIPPIUS_MEM_TEAM_KEY_HEX is invalid"),
+            "got: {err}"
+        );
+
+        let toml = valid_toml().replace(VALID_KEY, "abc");
+        let err = Config::from_toml_str(&toml).expect_err("a malformed file key is rejected");
+        assert!(
+            err.to_string().starts_with("team_key_hex is invalid"),
+            "got: {err}"
+        );
+    }
+
+    /// One team name against two buckets must not share a writer tip: a tip
+    /// recorded for one bucket names an op the other does not hold. One bucket
+    /// through two endpoint URLs must share it, or two live sessions chain to
+    /// two stale tips and fork the author's chain; the entries then differ by
+    /// endpoint id, which makes the store check them against the bucket.
+    ///
+    /// Regression test: the tip file was keyed on the team name alone, and
+    /// then on the endpoint URL as well.
+    #[test]
+    fn the_writer_tip_is_scoped_to_the_bucket_not_the_endpoint() {
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        let profile = cfg.primary_profile();
+        let other_bucket = TeamProfile {
+            bucket: format!("{}-staging", profile.bucket),
+            ..profile.clone()
+        };
+        let other_spelling = Config {
+            s3_endpoint: format!("{}/", cfg.s3_endpoint),
+            ..cfg.clone()
+        };
+
+        assert_eq!(
+            profile.writer_lock(&cfg).is_some(),
+            super::state_dir_for(&profile.name).is_some(),
+            "a profile gets a writer lock wherever a state directory resolves"
+        );
+
+        let id = bucket_id(&profile);
+        assert_eq!(id.len(), 16);
+        assert_ne!(id, bucket_id(&other_bucket));
+
+        let endpoint = endpoint_id(&profile, &cfg);
+        assert_eq!(endpoint.len(), 16);
+        assert_ne!(endpoint, endpoint_id(&profile, &other_spelling));
+        assert_eq!(endpoint, endpoint_id(&other_bucket, &cfg));
     }
 
     #[test]
@@ -4281,9 +4457,9 @@ mod tests {
 
     /// The live endpoint coordinates, read from the same environment contract
     /// `hippius-mem-core/tests/blob_contract.rs` and `tests/upgrade_cli.rs` use,
-    /// so one `MinIO` job configures every live suite. Only the bucket has no
-    /// default: a wrong guess would write into a bucket the operator did not
-    /// create for this test.
+    /// so one `MinIO` job configures every live suite. The endpoint and the
+    /// bucket have no default: a wrong guess would write into, and clear a team
+    /// prefix of, a server or bucket the operator did not set up for this test.
     struct LiveS3 {
         endpoint: String,
         bucket: String,
@@ -4295,8 +4471,9 @@ mod tests {
     impl LiveS3 {
         fn from_env() -> Self {
             Self {
-                endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
-                    .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned()),
+                endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT").expect(
+                    "set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint for live tests",
+                ),
                 bucket: std::env::var("HIPPIUS_MEM_TEST_BUCKET").expect(
                     "set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint",
                 ),
@@ -4343,7 +4520,22 @@ mod tests {
     /// path that could drift. Both are per-team subdirectories, so neither
     /// removal can reach another team's state. Best-effort: an absent directory
     /// is the normal first-run case, not a failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `HIPPIUS_MEM_CACHE_DIR` and `HIPPIUS_MEM_STATE_DIR` both name
+    /// a directory. Without them the two paths resolve under the developer's real
+    /// `$HOME`, and this test would delete local state a real profile of the same
+    /// team name owns. These tests cannot set the variables themselves: the
+    /// environment is process-wide and other tests in this binary read it.
     fn clear_live_team_local_state(team: &str) {
+        for var in ["HIPPIUS_MEM_CACHE_DIR", "HIPPIUS_MEM_STATE_DIR"] {
+            let dir = std::env::var_os(var).unwrap_or_default();
+            assert!(
+                !dir.is_empty() && !dir.eq_ignore_ascii_case("off"),
+                "set {var} to a throwaway directory before running the live tests"
+            );
+        }
         if let Some(cache) = super::blob_cache_dir(team) {
             let _ = std::fs::remove_dir_all(cache);
         }
@@ -4492,6 +4684,91 @@ mod tests {
 
         clear_live_team(&bucket, LIVE_TEAM).await;
         clear_live_team_local_state(LIVE_TEAM);
+    }
+
+    /// The team namespace the live two-endpoint test below owns, cleared before
+    /// and after like [`LIVE_TEAM`].
+    const LIVE_ALIAS_TEAM: &str = "hippius-mem-tipalias-live";
+
+    /// Two live sessions under one seed reach one bucket through two spellings
+    /// of its endpoint URL and write in turn, through the production wiring.
+    /// Every acknowledged write must reach a fresh reader, and no chain may
+    /// fork.
+    ///
+    /// Regression test: the writer tip file was named after the endpoint URL,
+    /// so each session read its own stale tip and the author's chain forked
+    /// from the second round on, dropping acknowledged writes.
+    #[tokio::test]
+    #[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+    async fn one_bucket_through_two_endpoint_spellings_keeps_every_write() -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+
+        let live = LiveS3::from_env();
+        let bucket = live.raw_bucket();
+        clear_live_team(&bucket, LIVE_ALIAS_TEAM).await;
+        clear_live_team_local_state(LIVE_ALIAS_TEAM);
+
+        let config_via = |endpoint: &str| {
+            Config::from_toml_str(&format!(
+                "s3_endpoint = \"{endpoint}\"\n\
+                 s3_region = \"{region}\"\n\
+                 bucket = \"{bucket_name}\"\n\
+                 access_key_id = \"{access_key_id}\"\n\
+                 secret = \"{secret}\"\n\
+                 team = \"{LIVE_ALIAS_TEAM}\"\n\
+                 team_key_hex = \"{VALID_KEY}\"\n\
+                 author_seed_hex = \"{VALID_SEED}\"\n\
+                 semantic_embeddings = false\n",
+                region = live.region,
+                bucket_name = live.bucket,
+                access_key_id = live.access_key_id,
+                secret = live.secret,
+            ))
+        };
+        let plain = config_via(&live.endpoint)?;
+        let slashed = config_via(&format!("{}/", live.endpoint))?;
+        let first = plain.build_store().await?;
+        let second = slashed.build_store().await?;
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            for (session, store) in [("first", &first), ("second", &second)] {
+                let id = store
+                    .remember(RememberInput {
+                        note_type: NoteType::Reference,
+                        repo: RepoScope::Global,
+                        tags: BTreeSet::new(),
+                        summary: format!(
+                            "two endpoint spellings, {session} session, round {round}"
+                        ),
+                        body: "body".to_owned(),
+                        force: true,
+                    })
+                    .await?;
+                ids.push(id);
+            }
+        }
+
+        let reader = plain.build_store().await?;
+        reader.sync().await?;
+        let mut missing = Vec::new();
+        for id in &ids {
+            if reader.get(*id).await.is_err() {
+                missing.push(*id);
+            }
+        }
+        let report = reader.reconcile().await?;
+
+        clear_live_team(&bucket, LIVE_ALIAS_TEAM).await;
+        clear_live_team_local_state(LIVE_ALIAS_TEAM);
+
+        assert!(missing.is_empty(), "acknowledged writes lost: {missing:?}");
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "the author's chain forked: {:?}",
+            report.quarantined_authors
+        );
+        Ok(())
     }
 
     #[test]

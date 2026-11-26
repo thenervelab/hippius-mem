@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -66,6 +69,45 @@ class ProviderTests(unittest.TestCase):
             for line in self.last_call.read_text(encoding="utf-8").splitlines()
             if line
         ]
+
+    def test_shutdown_returns_while_a_refresh_waits_on_a_stuck_child(self) -> None:
+        # A background refresh is blocked waiting for a reply that never comes,
+        # and the child ignores EOF and SIGTERM. shutdown closed stdout under
+        # the blocked reader and never returned; it must kill the child.
+        os.environ["HIPPIUS_MEM_FAKE_STUBBORN"] = "1"
+        os.environ["HIPPIUS_MEM_FAKE_NEVER_ANSWER"] = "refresh"
+        try:
+            provider = self._provider()
+            proc = provider._proc
+            provider.sync_turn("user", "assistant")
+            time.sleep(0.2)
+            started = time.monotonic()
+            provider.shutdown()
+            self.assertLess(time.monotonic() - started, 30.0)
+            self.assertIsNotNone(proc.poll(), "the child is gone")
+        finally:
+            os.environ.pop("HIPPIUS_MEM_FAKE_STUBBORN", None)
+            os.environ.pop("HIPPIUS_MEM_FAKE_NEVER_ANSWER", None)
+
+    def test_a_failed_handshake_reports_the_childs_last_stderr_line(self) -> None:
+        # The stderr reader starts late, so the child is gone before its pipe
+        # is drained; shutdown used to close the pipe under the reader and
+        # drop the line. A real reader lags only by milliseconds, so the lag
+        # is injected.
+        drain = hippius_mem._drain_stderr
+
+        def late_drain(stream: Any, tail: collections.deque[str]) -> None:
+            time.sleep(0.3)
+            drain(stream, tail)
+
+        os.environ["HIPPIUS_MEM_FAKE_BOOT_ERROR"] = "1"
+        hippius_mem._drain_stderr = late_drain
+        try:
+            with self.assertRaisesRegex(RuntimeError, "no team configured"):
+                self._provider()
+        finally:
+            hippius_mem._drain_stderr = drain
+            os.environ.pop("HIPPIUS_MEM_FAKE_BOOT_ERROR", None)
 
     def test_initialize_requires_hermes_home(self) -> None:
         provider = HippiusMemProvider()

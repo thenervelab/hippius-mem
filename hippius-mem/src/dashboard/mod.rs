@@ -1239,8 +1239,10 @@ async fn get_note(
         .parse()
         .map_err(|err: ParseNoteIdError| ApiError::BadRequest(err.to_string()))?;
     let _ = store.refresh_if_stale().await;
-    // `get` errors `MemError::NotFound` for an unindexed id, which `From` maps to a 404.
-    let note = store.get(note_id).await?;
+    // `hydrate` errors `MemError::NotFound` for an unindexed id, which `From`
+    // maps to a 404. Not `get`: browsing the dashboard is not a use that should
+    // append a `Reinforce` op while the request waits.
+    let note = store.hydrate(note_id).await?;
     let version = store.current_version(note_id)?.to_hex();
     Ok(Json(detail_from(&note, version)))
 }

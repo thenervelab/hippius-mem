@@ -21,11 +21,75 @@ use crate::resolve_and_build_store;
 
 /// Default grace window in hours. An unreferenced blob younger than this is kept:
 /// its op may still be in flight, or the op-log listing may lag its writes. Orphans
-/// are permanent and harmless, so a full day trades promptness for zero
-/// wrongful-delete risk.
+/// are permanent and harmless, so a full day trades promptness for safety. It is
+/// not zero risk: a write whose op PUT was not confirmed keeps its blob
+/// unreferenced until the next write on that machine completes the op, which it
+/// does only while the op is under an hour old (`PENDING_OP_MAX_AGE` in the
+/// core); an older one is dropped. If `gc` reclaims the blob first, that next
+/// write drops the op instead of completing it, so the write is lost, but no op
+/// names a missing blob.
 const DEFAULT_GRACE_HOURS: u64 = 24;
 
 const SECS_PER_HOUR: u64 = 3600;
+
+/// The parsed `gc` arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct GcArgs {
+    dry_run: bool,
+    grace_hours: u64,
+}
+
+/// Parse the args following `gc`, before any configuration is read.
+///
+/// # Errors
+///
+/// On an unknown argument, a missing or non-numeric `--grace-hours` value, or a
+/// zero grace window outside `--dry-run`.
+fn parse_args(args: &[String]) -> anyhow::Result<GcArgs> {
+    let mut dry_run = false;
+    let mut grace_hours = DEFAULT_GRACE_HOURS;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--grace-hours" => {
+                let raw = rest
+                    .next()
+                    .context("--grace-hours needs a value, e.g. `--grace-hours 24`")?;
+                grace_hours = raw
+                    .parse()
+                    .with_context(|| format!("invalid --grace-hours value {raw:?}"))?;
+            }
+            other => {
+                bail!("unknown gc argument {other:?}; usage: gc [--dry-run] [--grace-hours N]")
+            }
+        }
+    }
+
+    // Refuse a zero window unless nothing is deleted. The grace period is the
+    // sweep's ONLY defense against deleting a blob whose op is mid-append: a
+    // remember/edit between blob.put and oplog.append whose blob is listed while
+    // both op-log reads missed the not-yet-appended op would, at grace 0, be
+    // deleted immediately; then the op lands and names a blob that is gone,
+    // permanently losing the note body. The window must dominate the worst-case
+    // in-flight-write duration plus cross-machine clock skew, so 0 is never safe
+    // for a real sweep. A dry run deletes nothing, so it may preview at 0; checking
+    // after the loop is what lets `--dry-run` come before or after the value.
+    let min_hours = hippius_mem_core::MIN_GC_GRACE.as_secs() / SECS_PER_HOUR;
+    if grace_hours < min_hours && !dry_run {
+        bail!(
+            "--grace-hours {grace_hours} is shorter than the in-flight-write safety window and \
+             can permanently delete a note whose op is still being appended; use at least \
+             {min_hours} (the default is {DEFAULT_GRACE_HOURS}), or add --dry-run to preview \
+             what it would reclaim"
+        );
+    }
+
+    Ok(GcArgs {
+        dry_run,
+        grace_hours,
+    })
+}
 
 /// Run the `gc` subcommand over the args following `gc`.
 ///
@@ -42,40 +106,10 @@ const SECS_PER_HOUR: u64 = 3600;
 /// store that cannot be built, or an op-log read / keyspace listing failure inside
 /// the sweep (individual blob deletes are best-effort and never abort the run).
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
-    let mut dry_run = false;
-    let mut grace_hours = DEFAULT_GRACE_HOURS;
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            "--dry-run" => dry_run = true,
-            "--grace-hours" => {
-                let raw = rest
-                    .next()
-                    .context("--grace-hours needs a value, e.g. `--grace-hours 24`")?;
-                grace_hours = raw
-                    .parse()
-                    .with_context(|| format!("invalid --grace-hours value {raw:?}"))?;
-                // Refuse a zero window. The grace period is the sweep's ONLY defense
-                // against deleting a blob whose op is mid-append: a remember/edit
-                // between blob.put and oplog.append whose blob is listed while both
-                // op-log reads missed the not-yet-appended op would, at grace 0, be
-                // deleted immediately — then the op lands and names a blob that is
-                // gone, permanently losing the note body. The window must dominate
-                // the worst-case in-flight-write duration plus cross-machine clock
-                // skew, so 0 is never safe. `--dry-run` previews without deleting.
-                if grace_hours == 0 {
-                    bail!(
-                        "--grace-hours 0 disables the in-flight-write safety window and can \
-                         permanently delete a note whose op is still being appended; use at \
-                         least 1 (the default is {DEFAULT_GRACE_HOURS}), or --dry-run to preview"
-                    );
-                }
-            }
-            other => {
-                bail!("unknown gc argument {other:?}; usage: gc [--dry-run] [--grace-hours N]")
-            }
-        }
-    }
+    let GcArgs {
+        dry_run,
+        grace_hours,
+    } = parse_args(args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     // `gc` reclaims across the whole team keyspace regardless of the launch repo, so
@@ -254,7 +288,7 @@ mod tests {
 
     /// The safety-critical direction: a blob a live note's durable op still names
     /// must never be deleted, even at the most aggressive grace setting `run`'s own
-    /// `--grace-hours 0` guard refuses to allow through the CLI. Exercises the
+    /// minimum grace guard refuses to allow through the CLI. Exercises the
     /// keep/delete decision on BOTH a referenced and an unreferenced blob in the
     /// same sweep, so it also proves gc actually distinguishes them rather than
     /// merely keeping (or merely deleting) everything.
@@ -330,21 +364,51 @@ mod tests {
     // configuration or store — they exercise the one piece of decision logic that
     // actually lives in this file rather than in `sweep_orphan_blobs`.
 
-    #[tokio::test]
-    async fn run_rejects_a_zero_grace_window() -> anyhow::Result<()> {
-        match run(&["--grace-hours".to_owned(), "0".to_owned()]).await {
-            Err(err) => {
-                assert!(
-                    err.to_string()
-                        .contains("disables the in-flight-write safety window"),
-                    "the error must explain why 0 is refused, got: {err}"
-                );
-                Ok(())
-            }
-            Ok(()) => Err(anyhow::anyhow!(
-                "--grace-hours 0 must be refused, but run() succeeded"
-            )),
+    /// A grace window under two hours is refused for a real sweep: an op the
+    /// gateway did not confirm is completed by the next write on its machine
+    /// for up to one hour, and its blob must outlive that on every `gc`
+    /// machine's clock.
+    #[test]
+    fn a_grace_window_under_two_hours_is_refused() -> anyhow::Result<()> {
+        for hours in ["0", "1"] {
+            let args = ["--grace-hours".to_owned(), hours.to_owned()];
+            let err = super::parse_args(&args)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("--grace-hours {hours} must be refused"))?;
+            assert!(
+                err.to_string().contains("in-flight-write safety window"),
+                "the error must explain the refusal, got: {err}"
+            );
         }
+        let args = ["--grace-hours".to_owned(), "2".to_owned()];
+        assert_eq!(
+            super::parse_args(&args)?,
+            super::GcArgs {
+                dry_run: false,
+                grace_hours: 2
+            }
+        );
+        Ok(())
+    }
+
+    /// Regression test: the zero-window refusal suggested `--dry-run`, then refused
+    /// `--dry-run --grace-hours 0` too, because it ran before `--dry-run` was read.
+    #[test]
+    fn a_dry_run_may_preview_a_zero_grace_window() -> anyhow::Result<()> {
+        for args in [
+            ["--dry-run", "--grace-hours", "0"],
+            ["--grace-hours", "0", "--dry-run"],
+        ] {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert_eq!(
+                super::parse_args(&args)?,
+                super::GcArgs {
+                    dry_run: true,
+                    grace_hours: 0
+                }
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]

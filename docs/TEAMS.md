@@ -78,7 +78,10 @@ still there to force a replay on demand (and `history`/`reconcile` always read t
 op-log directly, so they never go stale).
 
 **Fixing and removing notes.** `edit` updates a note in place (optionally with a
-compare-and-swap that refuses if it changed since you read it). `forget` tombstones a
+compare-and-swap that refuses if it changed since you read it: concurrent edits from one
+machine's sessions are ordered and the later one conflicts, an edit committed on another
+machine before the call conflicts, and one committed on another machine during the call
+converges last-writer-wins). `forget` tombstones a
 note so it stops surfacing in `recall` while its signed op stays in the audit trail.
 `redact` **permanently** scrubs a note's content (leaked secret, PII, deletion request)
 yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-tools).
@@ -88,8 +91,9 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 > `--features embeddings` build; a lean build (including the Intel macOS prebuilt) ranks
 > **lexically** (keyword overlap only), so a reworded situation may miss its stored note.
 > `scripts/install.sh` installs the GitHub Release prebuilt: embeddings everywhere
-> except Intel macOS (`hippius-mem-lean`). On Intel mac, pass `--from-source` for
-> semantic recall (`cargo install --path hippius-mem --features embeddings --locked`).
+> except Intel macOS (`hippius-mem-lean`). Intel mac has no semantic build: ort-sys
+> ships no ONNX Runtime for that target, so `--from-source` and a `--features embeddings`
+> build fail to link there unless `ORT_LIB_LOCATION` names an ONNX Runtime you built.
 > The measured gap and ranking rules are the canonical reference in
 > [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
@@ -101,7 +105,7 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 > `scripts/install.sh` nor the prebuilt release enables it. Build once with the feature
 > on (it also keeps semantic recall and the dashboard the installer gives everyone else):
 > ```sh
-> cargo install --path hippius-mem --features embeddings,dashboard,console --locked
+> cargo install --path hippius-mem --features embeddings,dashboard,http-mcp,console --locked
 > ```
 > Everything below that says "built `--features console`" is this build. Teammates who
 > only `join` never need it.
@@ -259,8 +263,11 @@ sub-token revocation, is the manual step above):
    (the same path as `rotate --members`). Older epochs stay wrapped, so previously
    shared notes remain readable; writes sealed under the new epoch are unreadable to
    the removed member. It then prints the ACTION REQUIRED block: every remaining
-   member raises `max_epoch` and restarts, or post-rotation notes silently never
-   appear on their machine.
+   member restarts their MCP server with `HIPPIUS_MEM_MNEMONIC` set, which loads the
+   new epoch's key. No config edit is needed: startup loads keys up to the newest epoch
+   the founder provisioned. A server that cannot load the new key, such as the `serve`
+   daemon (it runs without the mnemonic), refuses every write with an error naming the
+   new epoch instead of sealing notes under the old key the removed member holds.
 
 **Resumable.** Steps 2 and 3 are not atomic (they are `rotate --members`'s
 semantics): the rotation can refuse — typically `NothingToRotate` because no
@@ -277,10 +284,10 @@ remaining member has `join`ed yet — after the shrunk membership already landed
   rotation entirely and says so; nothing else needs fixing. If they still do —
   either a fresh removal, or a half-done resume where rotation never completed —
   it rotates exactly as before. This matters because **every real rotation forces
-  a team-wide `max_epoch` raise**: without this check, re-running `remove` (or
-  simply re-running it against an address that was never a member) after the
-  removal had already fully completed would mint a needless new epoch and force
-  every remaining member to bump `max_epoch` and restart for no security benefit.
+  a team-wide restart**: without this check, re-running `remove` (or simply
+  re-running it against an address that was never a member) after the removal had
+  already fully completed would mint a needless new epoch and force every remaining
+  member to restart for no security benefit.
 - A rotation that could not run yet (`NothingToRotate`) is reported to stdout, not
   treated as a command failure — `remove`'s own job (shrinking membership) is done
   regardless. Have the remaining members `join`, then re-run `hippius-mem remove

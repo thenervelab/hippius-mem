@@ -143,8 +143,9 @@ impl Drop for AtomicFile {
 /// no site drifts back to a bare `std::fs::write` by omission.
 ///
 /// The directory entry itself is not fsynced: a crash right after the rename
-/// may still surface the previous file, which every caller tolerates (all of
-/// it is best-effort or re-derivable state).
+/// may still surface the previous file. Callers whose state is best-effort or
+/// re-derivable tolerate that; a caller that does not uses
+/// [`write_durably`].
 ///
 /// # Errors
 ///
@@ -162,6 +163,33 @@ pub fn write_atomically(path: &Path, prefix: &str, suffix: &str, bytes: &[u8]) -
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path)
+}
+
+/// [`write_atomically`], then fsync `path`'s directory, so the rename itself
+/// survives a power loss once this returns.
+///
+/// For state a later run relies on after a crash, such as the writer tip's
+/// record of an op it is about to append. Costs one more fsync than
+/// [`write_atomically`].
+///
+/// # Errors
+///
+/// Whatever [`write_atomically`] reports, or the failure to open or fsync the
+/// directory. On unix only: elsewhere a directory cannot be opened for sync, so
+/// the second step is skipped.
+pub fn write_durably(path: &Path, prefix: &str, suffix: &str, bytes: &[u8]) -> io::Result<()> {
+    write_atomically(path, prefix, suffix, bytes)?;
+
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(dir)?.sync_all()?;
+    }
+
+    Ok(())
 }
 
 /// 16 lowercase hex chars from 64 bits of OS entropy.

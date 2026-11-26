@@ -65,8 +65,8 @@ pub use audit::{
     MissingOp, ReconcileReport, RootMismatch, SuppressedTail, Verification, find_suppressed_tails,
     reconcile, reconcile_with_watermarks,
 };
-pub use brief::{DEFAULT_TOKEN_BUDGET, render_brief};
-pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal};
+pub use brief::{DEFAULT_TOKEN_BUDGET, render_brief, single_line};
+pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal, token_proof};
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidNetworkPrefix, InvalidSs58, NetworkPrefix, Note, NoteId,
     NoteType, ParseNoteIdError, ParseNoteTypeError, RepoScope, Scope, Ss58, Timestamp,
@@ -75,14 +75,14 @@ pub use garden::{GardenNote, GardenReport, LikelyDuplicate, MAX_GARDEN_ENTRIES, 
 // `Result` is re-exported as `MemResult` so it never silently shadows
 // `std::result::Result` in sibling modules that glob-import the crate root.
 pub use crate::ulid::Ulid;
-pub use error::{MemError, Result as MemResult};
+pub use error::{IntegrityFailure, MemError, Result as MemResult};
 pub use identity::{
     ChallengeResp, DEFAULT_CONSOLE_BASE_URL, FileManifestMarker, Identity, ManifestMarker,
     MemberKey, MnemonicChallengeReq, S3Creds, SessionData, SubTokenReq, SubTokenResp, TeamManifest,
-    VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key, highest_published_epoch,
-    load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
-    read_wrapped_key, rotate_team_key, signer_from_mnemonic, ss58_decode, ss58_encode,
-    unwrap_team_key, wrap_team_key, wrapped_key_key, wrapped_key_recipients,
+    VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key, load_manifest,
+    load_member_keys, provision_team_key, publish_manifest, publish_member_key, read_wrapped_key,
+    rotate_team_key, signer_from_mnemonic, ss58_decode, ss58_encode, unwrap_team_key,
+    wrap_team_key, wrapped_key_key, wrapped_key_recipients,
 };
 #[cfg(feature = "console")]
 pub use identity::{ConsoleClient, eth_signer_from_mnemonic};
@@ -104,8 +104,10 @@ pub use report::{
     ActivityCounts, MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport, build_report,
 };
 pub use store::{
-    AnchorProof, BlobStats, BlobStore, CachingBlobStore, FsBlobStore, HistoryEntry, IndexSnapshot,
-    InstrumentedBlobStore, MemoryBlobStore, MemoryStore, NoteHistory, OpKindLabel, OpStats,
-    RecallInput, RememberInput, RotationOutcome, S3BlobStore, SealedRecord, copy_store,
-    load_latest_snapshot, save_snapshot,
+    AnchorProof, BlobStats, BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, Degradation,
+    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, KeyCheckMatch,
+    KeyCheckPublished, KeyProbe, MIN_GC_GRACE, MemoryBlobStore, MemoryStore, NoteHistory,
+    OpKindLabel, OpStats, PublishKeyCheck, RecallInput, RememberInput, RotationOutcome,
+    S3BlobStore, SealedRecord, TeamKeyCheck, copy_store, key_check_key, load_latest_snapshot,
+    matches_published_key_check, probe_create_only, save_snapshot,
 };

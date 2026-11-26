@@ -270,6 +270,45 @@ pub async fn publish_head(
     blob.put(&head_key(team, &head.author_key), bytes).await
 }
 
+/// Read `author_key`'s own head pointer in `team`, or `None` when it has none or
+/// the object fails any check [`read_heads`] applies.
+///
+/// One GET, for a writer that needs only its own position (see
+/// `MemoryStore::refresh_clock_under_lock`), where listing every author's head
+/// would cost a LIST plus a GET per author on every such write.
+///
+/// # Errors
+///
+/// [`MemError::Storage`] if the GET fails for any reason other than a missing
+/// object.
+pub(crate) async fn read_own_head(
+    blob: &Arc<dyn BlobStore>,
+    team: &str,
+    author_key: &VerifyingKey,
+) -> Result<Option<HeadPointer>, MemError> {
+    let key = head_key(team, author_key);
+    let bytes = match blob.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(MemError::NotFound { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    let Ok(head) = serde_json::from_slice::<HeadPointer>(&bytes) else {
+        tracing::warn!(object_key = %key, "ignoring own head pointer that does not deserialize");
+        return Ok(None);
+    };
+    let valid = head.team == team
+        && head.author_key == *author_key
+        && head.verify_identity()
+        && head.verify_sig();
+    if !valid {
+        tracing::warn!(object_key = %key, "ignoring own head pointer that fails verification");
+        return Ok(None);
+    }
+
+    Ok(Some(head))
+}
+
 /// Read every VERIFIED head pointer for `team`, in a deterministic `author_key`
 /// order.
 ///
@@ -566,6 +605,35 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_own_head_ignores_a_head_signed_for_another_team() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let author = signer(1)?;
+        let foreign = HeadPointer::create_signed(&author, "other-team", 3, tip());
+        blob.put(
+            &head_key(TEAM, &author.verifying_key()),
+            serde_json::to_vec(&foreign)?,
+        )
+        .await?;
+
+        assert!(
+            super::read_own_head(&blob, TEAM, &author.verifying_key())
+                .await?
+                .is_none(),
+            "a head for another team at this author's key is not this author's head here"
+        );
+
+        let own = HeadPointer::create_signed(&author, TEAM, 4, tip());
+        publish_head(&blob, TEAM, &own).await?;
+        assert_eq!(
+            super::read_own_head(&blob, TEAM, &author.verifying_key())
+                .await?
+                .map(|head| head.lamport),
+            Some(4)
+        );
         Ok(())
     }
 

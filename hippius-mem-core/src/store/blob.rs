@@ -13,35 +13,65 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::error::{DisplayErrorContext, SdkError};
+use aws_sdk_s3::config::http::HttpResponse;
+use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object;
+use futures_util::stream::{self, Stream, StreamExt};
 
 use crate::error::MemError;
+use crate::ulid::Ulid;
 
-/// Render an `aws-sdk-s3` error with its FULL source chain, not just the outer
-/// variant label.
+/// Render an `aws-sdk-s3` error as a short line a 403/404 triage can act on.
 ///
-/// `SdkError`'s own `Display` prints only the category — "service error",
-/// "dispatch failure" — so mapping a failure via `err.to_string()` throws away
-/// the modeled error code (`AccessDenied`, `NoSuchBucket`) and HTTP status that a
-/// 403/404 triage actually needs, and the caller sees the useless "storage error:
-/// service error". `DisplayErrorContext` walks the error's `source()` chain, which
-/// carries that detail. Generic over the operation error so every `SdkError` call
-/// site (`put`/`get`/`delete`/`list`) gets the same faithful rendering. (The
-/// per-chunk streamed-body read in `read_capped` fails with a different error
-/// type — an `aws_smithy_types` byte-stream error, not an `SdkError` — so it does
-/// not route through here.)
-fn storage_error<E, R>(err: SdkError<E, R>) -> MemError
+/// A service error becomes its HTTP status, S3 error code, the gateway's message
+/// cut to [`MAX_ERROR_MESSAGE_CHARS`], and the request id. Nothing else of the
+/// response goes in: the SDK's full error chain (`DisplayErrorContext`) carries
+/// the raw response, which held the access key id and the string the request
+/// signed on a signature mismatch, and the whole body however large (a 20 MiB
+/// body gave a 20 MiB error). `SdkError`'s own `Display` is no better the other
+/// way: it prints only the category ("service error").
+///
+/// Any other failure (dispatch, timeout, construction, an unparsable response)
+/// keeps the source chain, which names the transport cause and holds no
+/// response body, cut to [`MAX_ERROR_DETAIL_CHARS`] all the same.
+fn storage_error<E>(err: SdkError<E, HttpResponse>) -> MemError
 where
-    E: std::error::Error + Send + Sync + 'static,
-    R: std::fmt::Debug + Send + Sync + 'static,
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    // Consume `err` INTO `DisplayErrorContext` (it owns its `E: Error`), so the
-    // helper takes the error by value — the shape `.map_err(storage_error)` needs
-    // at every call site, and what keeps `needless_pass_by_value` quiet.
-    MemError::Storage(DisplayErrorContext(err).to_string())
+    let detail = match err {
+        SdkError::ServiceError(service) => {
+            let status = service.raw().status().as_u16();
+            let meta = service.err().meta();
+            let code = meta.code().unwrap_or("no error code");
+            let message = clamp_chars(meta.message().unwrap_or(""), MAX_ERROR_MESSAGE_CHARS);
+            let request_id = meta.request_id().unwrap_or("none");
+            format!("S3 status {status}, {code}: {message} (request id {request_id})")
+        }
+        other => clamp_chars(
+            &DisplayErrorContext(other).to_string(),
+            MAX_ERROR_DETAIL_CHARS,
+        ),
+    };
+    MemError::Storage(detail)
+}
+
+/// The most characters of a gateway's error message [`storage_error`] keeps.
+/// Arbitrary: S3's own messages are one sentence, well under this.
+const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// The most characters of a non-service SDK error chain [`storage_error`] keeps.
+/// Arbitrary: a dispatch or timeout chain is a few hundred characters.
+const MAX_ERROR_DETAIL_CHARS: usize = 400;
+
+/// `text` cut to at most `max` characters, marked with an ellipsis when cut.
+fn clamp_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 /// Maximum bytes a single [`S3BlobStore::get`] will buffer.
@@ -156,6 +186,31 @@ pub trait BlobStore: Send + Sync {
     /// Returns [`MemError::Storage`] if the backend write fails.
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError>;
 
+    /// Store `bytes` at `key` only if no object exists there: a create-only
+    /// write (`If-None-Match: *` on S3).
+    ///
+    /// Whether the backend ENFORCES it is a property of the backend, not of
+    /// this call: [`MemoryBlobStore`] and [`FsBlobStore`](crate::FsBlobStore)
+    /// do, and an S3 gateway that ignores the header overwrites the object and
+    /// reports [`CreateOutcome::Created`]. [`probe_create_only`] tells which.
+    /// An S3 call retried after a lost response can also report
+    /// [`CreateOutcome::AlreadyExists`] for the object it created itself, so a
+    /// caller that must know whose bytes are stored reads them back.
+    ///
+    /// The default refuses, so a wrapper that does not forward this call fails
+    /// instead of quietly writing without the condition.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the backend write fails, or if this store does
+    /// not offer create-only writes.
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        drop(bytes);
+        Err(MemError::Storage(format!(
+            "this blob store does not offer create-only writes, so {key} was not written"
+        )))
+    }
+
     /// Fetch the object at `key`.
     ///
     /// # Errors
@@ -198,6 +253,86 @@ pub trait BlobStore: Send + Sync {
     async fn evict_cache(&self, _key: &str) {}
 }
 
+/// What a [`BlobStore::put_if_absent`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// No object existed at the key, and it now holds the bytes.
+    Created,
+    /// An object already existed at the key, and nothing was written.
+    AlreadyExists,
+}
+
+/// How many GETs [`get_in_order`] keeps in flight past the first key.
+/// Arbitrary: it bounds the objects fetched past the one a caller accepts to
+/// 15, and cuts a walk past rejected objects 16-fold in round trips.
+const ORDERED_FETCH_AHEAD: usize = 16;
+
+/// The GETs of `keys` as a stream in the order given, for a caller that walks
+/// them and stops at the first object it accepts. Each item carries its key's
+/// tag.
+///
+/// The first key is fetched alone, so a caller that accepts it pays that one
+/// GET. The rest are fetched with up to [`ORDERED_FETCH_AHEAD`] in flight: a
+/// walk past objects the caller rejects (planted, legacy or malformed) costs
+/// one round trip per that many keys instead of one per key. A caller that
+/// stops early drops the GETs still in flight.
+pub(crate) fn get_in_order<'b, T: 'b>(
+    blob: &'b dyn BlobStore,
+    keys: Vec<(T, String)>,
+) -> impl Stream<Item = (T, Result<Vec<u8>, MemError>)> + 'b {
+    let get = move |(tag, key): (T, String)| async move { (tag, blob.get(&key).await) };
+    let mut keys = keys.into_iter();
+    let first = keys.next();
+    stream::iter(first)
+        .then(get)
+        .chain(stream::iter(keys).map(get).buffered(ORDERED_FETCH_AHEAD))
+}
+
+/// Whether a blob store enforces create-only writes, as [`probe_create_only`]
+/// measured it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOnly {
+    /// A second create-only write of one key was refused.
+    Enforced,
+    /// A second create-only write of one key succeeded: the backend ignores the
+    /// condition, so a create-only write there is an ordinary overwrite.
+    NotEnforced,
+}
+
+/// Measure whether `blob` enforces create-only writes: create a fresh probe
+/// object under `{team}/_probe/`, try to create it again, and delete it.
+///
+/// The Hippius gateway's support for `If-None-Match` is not documented, so a
+/// caller that relies on a create-only write for exclusivity asks this first
+/// and says what it cannot guarantee when the answer is
+/// [`CreateOnly::NotEnforced`]. Costs two PUTs and one DELETE. The probe object
+/// is deleted best-effort; one left behind is a few bytes that no reader
+/// lists, and `gc` skips the prefix like every other non-note key.
+///
+/// # Errors
+///
+/// [`MemError::Storage`] when a PUT fails, the store offers no create-only
+/// write, or the first create-only write found an object at a fresh random key.
+pub async fn probe_create_only(blob: &dyn BlobStore, team: &str) -> Result<CreateOnly, MemError> {
+    let key = format!("{team}/_probe/create-only-{}", Ulid::new());
+
+    if blob.put_if_absent(&key, b"first".to_vec()).await? != CreateOutcome::Created {
+        return Err(MemError::Storage(format!(
+            "a create-only write of the fresh probe key {key} found an object already there"
+        )));
+    }
+    let second = blob.put_if_absent(&key, b"second".to_vec()).await;
+
+    if let Err(err) = blob.delete(&key).await {
+        tracing::warn!(object_key = %key, error = %err, "could not delete the create-only probe object");
+    }
+
+    Ok(match second? {
+        CreateOutcome::AlreadyExists => CreateOnly::Enforced,
+        CreateOutcome::Created => CreateOnly::NotEnforced,
+    })
+}
+
 /// In-memory [`BlobStore`] backed by a `BTreeMap`, for tests and offline use.
 ///
 /// The `BTreeMap` keeps keys sorted, so `list` needs no extra sort. The map is
@@ -231,6 +366,16 @@ impl BlobStore for MemoryBlobStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
         self.lock()?.insert(key.to_owned(), bytes);
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        match self.lock()?.entry(key.to_owned()) {
+            std::collections::btree_map::Entry::Occupied(_) => Ok(CreateOutcome::AlreadyExists),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(bytes);
+                Ok(CreateOutcome::Created)
+            }
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
@@ -274,6 +419,9 @@ impl BlobStore for MemoryBlobStore {
 pub struct S3BlobStore {
     client: Client,
     bucket: String,
+    /// The first-byte bound every request starts from:
+    /// [`S3_FIRST_BYTE_TIMEOUT`] outside tests.
+    first_byte: Duration,
 }
 
 impl S3BlobStore {
@@ -292,23 +440,33 @@ impl S3BlobStore {
         secret: String,
         region: String,
     ) -> Self {
+        Self::with_first_byte_timeout(
+            endpoint_url,
+            bucket,
+            access_key_id,
+            secret,
+            region,
+            S3_FIRST_BYTE_TIMEOUT,
+        )
+    }
+
+    /// [`new`](Self::new) with a first-byte bound other than
+    /// [`S3_FIRST_BYTE_TIMEOUT`], so a test of a hung gateway does not wait the
+    /// production minute.
+    fn with_first_byte_timeout(
+        endpoint_url: String,
+        bucket: String,
+        access_key_id: String,
+        secret: String,
+        region: String,
+        first_byte: Duration,
+    ) -> Self {
         // `Credentials::new` over `from_keys` avoids the `hardcoded-credentials`
         // feature gate; the two differ only in the provider label string.
         let credentials =
             aws_credential_types::Credentials::new(access_key_id, secret, None, None, "Static");
 
-        // Bound how long a single request can hang. The SDK defaults give only a
-        // connect timeout and stalled-STREAM protection; a hostile/degraded gateway
-        // that ACCEPTS the connection and then never sends response headers would
-        // otherwise hang the call forever — and because a write holds the writer lock
-        // across its PUTs, one hung request would wedge every write in the process
-        // indefinitely. Generous enough for a legitimate large-blob transfer on a
-        // slow link (a 512 MiB `get` at the ~1.7 MiB/s floor still fits 300s), but
-        // finite. `operation_timeout` bounds the whole call across retries.
-        let timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-            .operation_attempt_timeout(Duration::from_mins(5))
-            .operation_timeout(Duration::from_mins(10))
-            .build();
+        let timeouts = s3_timeouts(first_byte);
 
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -329,22 +487,120 @@ impl S3BlobStore {
         Self {
             client: Client::from_conf(config),
             bucket,
+            first_byte,
         }
     }
+
+    /// The per-request timeouts for a PUT of `len` bytes.
+    ///
+    /// The first-byte bound runs from when the request starts, so it includes
+    /// sending the body: a large checkpoint on a slow link would otherwise time
+    /// out on every attempt. The bound grows by the time the body takes at
+    /// [`SLOW_LINK_BYTES_PER_SEC`], rounded up to a whole second.
+    fn put_timeouts(&self, len: usize) -> aws_sdk_s3::config::Builder {
+        let upload = Duration::from_secs((len as u64).div_ceil(SLOW_LINK_BYTES_PER_SEC));
+        aws_sdk_s3::config::Builder::new().timeout_config(s3_timeouts(self.first_byte + upload))
+    }
+}
+
+/// How long one S3 request may wait for the gateway to start answering: from
+/// sending the request (its body included) to the first byte of the response,
+/// as the SDK's `read_timeout` is defined.
+///
+/// A gateway that accepts the connection and then never answers used to hold a
+/// call for the whole 5-minute attempt timeout, and a `remember` makes several
+/// calls, so a session sat blocked for minutes while holding the writer lock. The
+/// Hippius gateway normally answers in hundreds of milliseconds, so 20 s is tens of
+/// times that. A PUT's bound grows with its body (see
+/// `S3BlobStore::put_timeouts`), so a large upload is not cut short by it.
+/// Downloads are not cut short by it either: once the response has started, the
+/// stalled-stream protection and the attempt timeout bound the body. Chosen by
+/// that arithmetic, not measured.
+///
+/// What a caller waits on a hung gateway: three attempts of 20 s plus the
+/// standard retry backoff (under 1 s, then under 2 s, with jitter), so about
+/// 62 s per call. A write on a server that started moments before waits first
+/// for the warmup read (up to 90 s, the binary's `WARMUP_READ_WAIT`), which is
+/// how the evaluation measured 151 s end to end against a hung versitygw.
+const S3_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the SDK waits to open a connection: its own default for current
+/// behaviour versions (3.1 s, `DEFAULT_CONNECT_TIMEOUT` in aws-smithy-runtime
+/// 1.16.2 `client/defaults.rs`), set here so a per-request timeout override
+/// keeps it. The override is stored in its own config layer and read in place
+/// of the client's timeouts: aws-sdk-s3 1.157.0 `Builder::set_timeout_config`
+/// merges only with a timeout config already in the same builder, which an
+/// override builder never has.
+const S3_CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
+
+/// How long one attempt may take once started, a slow transfer included.
+const S3_ATTEMPT_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// The slowest link a transfer must survive: the largest blob a `get` reads
+/// ([`MAX_BLOB_BYTES`]) within one attempt, about 1.7 MiB/s.
+const SLOW_LINK_BYTES_PER_SEC: u64 = MAX_BLOB_BYTES as u64 / S3_ATTEMPT_TIMEOUT.as_secs();
+
+/// The timeouts an [`S3BlobStore`] request runs under, with `first_byte` as
+/// the read timeout.
+///
+/// The SDK defaults give only a connect timeout and stalled-stream protection, so
+/// a gateway that accepted the connection and never sent response headers hung
+/// the call forever; because a write holds the writer lock across its PUTs, one
+/// hung request wedged every write on the machine. The first-byte bound covers
+/// that case. The attempt and operation timeouts bound a slow transfer once it
+/// has started: generous enough for a legitimate large-blob transfer on a slow
+/// link ([`SLOW_LINK_BYTES_PER_SEC`]), but finite. `operation_timeout` bounds
+/// the whole call across retries.
+fn s3_timeouts(first_byte: Duration) -> aws_sdk_s3::config::timeout::TimeoutConfig {
+    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+        .connect_timeout(S3_CONNECT_TIMEOUT)
+        .read_timeout(first_byte)
+        .operation_attempt_timeout(S3_ATTEMPT_TIMEOUT)
+        .operation_timeout(Duration::from_mins(10))
+        .build()
 }
 
 #[async_trait]
 impl BlobStore for S3BlobStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+        let timeouts = self.put_timeouts(bytes.len());
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(bytes))
+            .customize()
+            .config_override(timeouts)
             .send()
             .await
             .map_err(storage_error)?;
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        let timeouts = self.put_timeouts(bytes.len());
+        let result = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(ByteStream::from(bytes))
+            .customize()
+            .config_override(timeouts)
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(CreateOutcome::Created),
+            // 412 Precondition Failed is S3's answer to `If-None-Match: *` on an
+            // existing key; the SDK does not model it for PutObject, so the
+            // status is the signal.
+            Err(err) if err.raw_response().map(|raw| raw.status().as_u16()) == Some(412) => {
+                Ok(CreateOutcome::AlreadyExists)
+            }
+            Err(err) => Err(storage_error(err)),
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
@@ -479,8 +735,6 @@ fn map_get_object_error(err: SdkError<GetObjectError>, key: &str) -> MemError {
     {
         MemError::NotFound { id: key.to_owned() }
     } else {
-        // Delegate to `storage_error` so the full source chain (code + HTTP
-        // status) is rendered here too, not just the `SdkError` category label.
         storage_error(err)
     }
 }
@@ -578,10 +832,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_if_absent_creates_once_and_never_overwrites() {
+        let store = MemoryBlobStore::new();
+        assert_eq!(
+            store.put_if_absent("k", b"first".to_vec()).await.unwrap(),
+            CreateOutcome::Created
+        );
+        assert_eq!(
+            store.put_if_absent("k", b"second".to_vec()).await.unwrap(),
+            CreateOutcome::AlreadyExists
+        );
+        assert_eq!(store.get("k").await.unwrap(), b"first");
+    }
+
+    #[tokio::test]
+    async fn the_probe_reports_enforcement_and_cleans_up() {
+        let store = MemoryBlobStore::new();
+        assert_eq!(
+            probe_create_only(&store, "team").await.unwrap(),
+            CreateOnly::Enforced
+        );
+        assert!(
+            store.list("team/").await.unwrap().is_empty(),
+            "probe deleted"
+        );
+    }
+
+    /// A backend that accepts the create-only header and ignores it, like a
+    /// gateway without conditional-write support.
+    struct IgnoresCondition(MemoryBlobStore);
+
+    #[async_trait]
+    impl BlobStore for IgnoresCondition {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.0.put(key, bytes).await?;
+            Ok(CreateOutcome::Created)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_probe_detects_a_backend_that_ignores_the_condition() {
+        let store = IgnoresCondition(MemoryBlobStore::new());
+        assert_eq!(
+            probe_create_only(&store, "team").await.unwrap(),
+            CreateOnly::NotEnforced
+        );
+    }
+
+    /// A store that does not forward create-only writes refuses them rather
+    /// than writing without the condition.
+    #[tokio::test]
+    async fn the_default_create_only_write_refuses() {
+        struct PlainPutOnly(MemoryBlobStore);
+
+        #[async_trait]
+        impl BlobStore for PlainPutOnly {
+            async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+                self.0.put(key, bytes).await
+            }
+
+            async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+                self.0.get(key).await
+            }
+
+            async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+                self.0.list(prefix).await
+            }
+
+            async fn delete(&self, key: &str) -> Result<(), MemError> {
+                self.0.delete(key).await
+            }
+        }
+
+        let store = PlainPutOnly(MemoryBlobStore::new());
+        assert!(store.put_if_absent("k", b"x".to_vec()).await.is_err());
+        assert!(store.list("").await.unwrap().is_empty(), "nothing written");
+        assert!(probe_create_only(&store, "team").await.is_err());
+    }
+
+    #[tokio::test]
     async fn usable_as_arc_dyn_blob_store() {
         let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         store.put("dyn/key", b"v".to_vec()).await.unwrap();
         assert_eq!(store.get("dyn/key").await.unwrap(), b"v");
+    }
+
+    /// A gateway that never answers must fail a request within the first-byte
+    /// bound. Regression guard: with no read timeout a hung gateway held each
+    /// call for the whole 5-minute attempt timeout.
+    #[test]
+    fn s3_requests_bound_the_wait_for_the_first_response_byte() {
+        let timeouts = s3_timeouts(S3_FIRST_BYTE_TIMEOUT);
+        assert_eq!(timeouts.read_timeout(), Some(S3_FIRST_BYTE_TIMEOUT));
+        assert_eq!(timeouts.connect_timeout(), Some(S3_CONNECT_TIMEOUT));
+        assert_eq!(
+            timeouts.operation_attempt_timeout(),
+            Some(S3_ATTEMPT_TIMEOUT)
+        );
+    }
+
+    /// A PUT's first-byte bound grows with its body, so a large upload on a
+    /// slow link is not timed out before the gateway could answer; a small one
+    /// keeps the client's bound.
+    #[test]
+    fn a_large_put_gets_time_to_send_its_body() {
+        let store = S3BlobStore::new(
+            "http://127.0.0.1:1".to_owned(),
+            "bucket".to_owned(),
+            "id".to_owned(),
+            "secret".to_owned(),
+            "region".to_owned(),
+        );
+        let read_timeout = |len| {
+            store
+                .put_timeouts(len)
+                .build()
+                .timeout_config()
+                .and_then(aws_sdk_s3::config::timeout::TimeoutConfig::read_timeout)
+        };
+        assert_eq!(read_timeout(0), Some(S3_FIRST_BYTE_TIMEOUT));
+
+        let hundred_mib = 100 * 1024 * 1024;
+        let read = read_timeout(hundred_mib).unwrap();
+        let upload = Duration::from_secs((hundred_mib as u64).div_ceil(SLOW_LINK_BYTES_PER_SEC));
+        assert_eq!(read, S3_FIRST_BYTE_TIMEOUT + upload);
+        assert!(
+            upload > Duration::from_secs(50) && upload < Duration::from_secs(70),
+            "100 MiB at about 1.7 MiB/s is about a minute: {upload:?}"
+        );
+    }
+
+    /// A gateway that accepts connections and never answers fails a request
+    /// within its bound instead of holding it for the attempt timeout.
+    ///
+    /// Regression test: with no read timeout a hung gateway held each call for
+    /// the whole 5-minute attempt timeout. The bound here is 200 ms per attempt,
+    /// so three attempts and the retry backoff end well inside the outer
+    /// 60 s guard; without the read timeout the guard fires first.
+    #[tokio::test]
+    async fn a_hung_gateway_fails_a_request_within_its_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept and hold every connection without answering.
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let store = S3BlobStore::with_first_byte_timeout(
+            format!("http://{address}"),
+            "bucket".to_owned(),
+            "id".to_owned(),
+            "secret".to_owned(),
+            "region".to_owned(),
+            Duration::from_millis(200),
+        );
+
+        let result = tokio::time::timeout(Duration::from_mins(1), store.get("team/key")).await;
+        let err = result.unwrap().unwrap_err();
+        assert!(matches!(err, MemError::Storage(_)), "got {err:?}");
     }
 
     #[test]
@@ -597,6 +1027,49 @@ mod tests {
         assert!(matches!(mapped, MemError::Storage(_)));
     }
 
+    /// A refused request whose response body is large (here 1 MiB of XML
+    /// message) yields an error of a few hundred bytes. The error used to render
+    /// the raw response, body included.
+    #[tokio::test]
+    async fn a_large_error_response_yields_a_short_storage_error() {
+        use aws_sdk_s3::primitives::SdkBody;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        let message = "x".repeat(1 << 20);
+        let body = format!(
+            "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code>\
+             <Message>{message}</Message></Error>"
+        );
+        let rule = mock!(Client::list_objects_v2).then_http_response(move || {
+            let mut response =
+                HttpResponse::new(403.try_into().unwrap(), SdkBody::from(body.clone()));
+            // S3 reads the request id from this header, not from the body.
+            response.headers_mut().insert("x-amz-request-id", "req-1");
+            response
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule], |b| b
+            .force_path_style(true));
+        let store = S3BlobStore {
+            client,
+            bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
+        };
+
+        let err = store.list("team/").await.unwrap_err();
+        assert!(matches!(err, MemError::Storage(_)), "{err:?}");
+        let rendered = err.to_string();
+        assert!(rendered.len() < 400, "{} bytes", rendered.len());
+        assert!(rendered.contains("403"), "{rendered}");
+        assert!(rendered.contains("AccessDenied"), "{rendered}");
+        assert!(rendered.contains("req-1"), "{rendered}");
+    }
+
+    #[test]
+    fn clamp_chars_cuts_on_a_character_boundary() {
+        assert_eq!(clamp_chars("ééé", 2), "éé...");
+        assert_eq!(clamp_chars("éé", 2), "éé");
+    }
+
     #[tokio::test]
     async fn get_no_such_key_maps_to_not_found() {
         use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -610,6 +1083,7 @@ mod tests {
         let store = S3BlobStore {
             client,
             bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
         };
 
         let err = store.get("team/global/mem_x/ver_1").await.unwrap_err();
@@ -700,6 +1174,7 @@ mod tests {
         let store = S3BlobStore {
             client,
             bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
         };
 
         let keys = store.list("team/").await.unwrap();
@@ -734,6 +1209,7 @@ mod tests {
         let store = S3BlobStore {
             client,
             bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
         };
 
         let keys = store.list("team/").await.unwrap();

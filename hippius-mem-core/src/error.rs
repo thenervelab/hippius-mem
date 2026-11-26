@@ -75,6 +75,28 @@ pub enum MemError {
         /// The epoch whose key is missing from the ring.
         epoch: u64,
     },
+    /// A write would seal under an epoch older than the newest one the team's
+    /// founder provisioned, so it is refused.
+    //
+    // A rotation exists to keep new notes from a removed member, who still
+    // holds the older keys. A process that never loaded the new key (no
+    // mnemonic, or it started before the rotation) would otherwise keep
+    // sealing under the old one with nothing reported.
+    #[error(
+        "team {team} rotated its key to epoch {newest}, and this process holds keys only up to \
+         epoch {epoch}, so it refuses to seal a write under the older key; restart it with \
+         HIPPIUS_MEM_MNEMONIC set to this member's mnemonic so it loads the new key (the \
+         `serve` daemon runs without it and cannot), and ask the founder to `provision` if it \
+         still holds no key"
+    )]
+    EpochSuperseded {
+        /// The team that rotated.
+        team: String,
+        /// The epoch the refused write would have sealed under.
+        epoch: u64,
+        /// The newest epoch the founder provisioned.
+        newest: u64,
+    },
     /// A semantic-embedding model could not be loaded or failed to embed text.
     //
     // Its own category, not `Storage` (the S3 gateway) or `Malformed` (bad
@@ -114,9 +136,11 @@ pub enum MemError {
     // mismatch means a concurrent write landed first. A caller should re-read and
     // retry, never blind-retry — the same precondition would fail again. The
     // hashes are rendered hex (not raw `Blake3Hash`) so the whole contract lives
-    // in the `Display` string. Scope: the check is against this machine's converged
-    // state, so it catches the realistic post-`sync` race, not an unsynced
-    // concurrent writer (those still converge last-writer-wins).
+    // in the `Display` string. Scope: the check runs under this machine's
+    // writer lock against an index that holds every op this machine committed,
+    // and the edit first syncs any author whose head moved, so an edit from this
+    // machine, or from another machine before the call, conflicts; one committed
+    // on another machine during the call still converges last-writer-wins.
     #[error(
         "edit precondition failed: note changed since it was read (expected {expected}, now {actual})"
     )]
@@ -167,6 +191,19 @@ pub enum MemError {
         /// The team whose rotation found no authorized wrap target.
         team: String,
     },
+    /// A wrap slot of the epoch a rotation picked was taken while it wrote (a
+    /// concurrent rotation), so finishing would split that epoch between two
+    /// keys. The rotation deleted the wraps it had written.
+    #[error(
+        "team {team} already has a key for epoch {epoch}; refusing to mint it again (another \
+         rotation published it while this one ran)"
+    )]
+    EpochTaken {
+        /// The team whose epoch is taken.
+        team: String,
+        /// The epoch that already has a key.
+        epoch: u64,
+    },
     /// A pinned-founder team has no membership manifest signed by that founder,
     /// so a membership-shaped operation (e.g. key rotation) fails closed.
     //
@@ -200,6 +237,138 @@ pub enum MemError {
         /// The byte cap that was exceeded.
         cap: usize,
     },
+
+    /// A note's stored ciphertext failed its integrity check: its hash is not the
+    /// one its signed op attests, or it does not decrypt under this machine's key.
+    //
+    // Distinct from `NotFound` (the note exists in the op-log; re-creating it
+    // would duplicate it) and from `Storage` (the gateway answered; the bytes are
+    // wrong, so a retry returns the same bytes). `reason` is a fixed string, never
+    // data from the note.
+    #[error(
+        "note {id} failed its integrity check: {reason}; the stored object was altered, \
+         replaced, or sealed under another key, so it is not served; run `hippius-mem \
+         reconcile`, and `hippius-mem doctor` to check the team key"
+    )]
+    Integrity {
+        /// The note whose ciphertext failed the check.
+        id: String,
+        /// Which check failed.
+        reason: IntegrityFailure,
+    },
+
+    /// Another process on this machine held the cross-process writer lock for the
+    /// whole wait, so the write was refused before anything was appended.
+    //
+    // A refusal, not a degraded write: minting without the lock while a live
+    // peer holds it forks this author's chain against the peer's write, and the
+    // fork can drop either op. Nothing was written, so a retry is safe.
+    #[error(
+        "the writer lock {} stayed held for {waited:?}, so nothing was written; the holder is \
+         another hippius-mem write on this machine, usually one waiting on a slow or \
+         unresponsive storage gateway, or a stuck hippius-mem process; retry the write",
+        path.display()
+    )]
+    WriterLockBusy {
+        /// The lock file that stayed held.
+        path: std::path::PathBuf,
+        /// How long the write waited.
+        waited: std::time::Duration,
+    },
+
+    /// This machine's team key for an epoch is not the team's: the team's
+    /// published key check is another key's, so the write was refused.
+    //
+    // A wrong but well-formed key decrypts nothing and fails nothing on its own:
+    // reads come back empty and writes are sealed where no teammate can read
+    // them. The message names both places the key comes from.
+    #[error(
+        "this machine's team key for team {team} epoch {epoch} does not match the team's \
+         published key check {object_key}, so writes are refused; set the correct key in \
+         team_key_hex, or in HIPPIUS_MEM_TEAM_KEY_HEX if that is set, restart, and run \
+         `hippius-mem doctor` to confirm. If this key is the right one and the check is wrong, \
+         `hippius-mem admin keycheck publish --replace` replaces it"
+    )]
+    TeamKeyMismatch {
+        /// The team whose key check failed.
+        team: String,
+        /// The epoch whose key does not match.
+        epoch: u64,
+        /// The key-check object the key was compared against.
+        object_key: String,
+    },
+
+    /// The gateway did not confirm an op append, so whether the write landed is
+    /// unknown. The op stays recorded as pending on this machine, and the next
+    /// write under this identity here completes it, so the write lands then,
+    /// unless `gc` reclaimed the note's blob in between: that write drops it.
+    //
+    // Not a plain failure: the PUT may have landed (the response was lost), and
+    // reporting "failed" invited a retry that duplicated the note. Reclaiming
+    // the op instead could not be made safe, because a PUT still in flight can
+    // land after the reclaim and fork the chain.
+    #[error(
+        "the storage gateway did not confirm the write of note {note_id}, so it may not be \
+         stored yet; do not re-issue it: the next write from this machine under this \
+         identity completes it, and `get` then finds the note (unless `gc` reclaims the \
+         note's blob first, which drops this write)"
+    )]
+    WriteOutcomeUnknown {
+        /// The note the unconfirmed op acts on.
+        note_id: String,
+        /// Why the append was not confirmed.
+        #[source]
+        source: Box<MemError>,
+    },
+
+    /// An edit with `expected_version` could not confirm it had seen every write
+    /// made on this machine: other processes here kept committing while it
+    /// synced, so nothing was written.
+    #[error(
+        "other hippius-mem processes on this machine kept writing while this edit synced to \
+         check its expected_version, so nothing was written; retry the edit"
+    )]
+    EditPreconditionBusy,
+
+    /// The local writer-tip file could not be updated, so a write that would
+    /// otherwise leave the next writer on this machine chaining to a stale tip was
+    /// refused before its op was appended.
+    #[error(
+        "cannot update the writer tip file {}, so nothing was written; make sure the state \
+         directory is writable (HIPPIUS_MEM_STATE_DIR overrides it)",
+        path.display()
+    )]
+    WriterTip {
+        /// The tip file that could not be written.
+        path: std::path::PathBuf,
+        /// The I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Which integrity check a note's stored ciphertext failed
+/// ([`MemError::Integrity`]).
+///
+/// The two call for different fixes: a hash mismatch means the object was
+/// altered or replaced (run `reconcile`), and an undecryptable one usually means
+/// this machine holds the wrong team key (run `doctor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntegrityFailure {
+    /// The ciphertext's hash is not the one the note's signed op attests.
+    HashMismatch,
+    /// The ciphertext does not decrypt under this machine's key.
+    Undecryptable,
+}
+
+impl std::fmt::Display for IntegrityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::HashMismatch => "its ciphertext does not match the hash its signed op attests",
+            Self::Undecryptable => "its ciphertext does not decrypt under this machine's key",
+        })
+    }
 }
 
 /// Convenience alias for fallible core operations.
@@ -213,6 +382,23 @@ pub type Result<T> = std::result::Result<T, MemError>;
 mod tests {
     use super::*;
     use std::error::Error as StdError;
+
+    #[test]
+    fn an_integrity_failure_names_which_check_failed() {
+        let err = MemError::Integrity {
+            id: "mem_x".to_owned(),
+            reason: IntegrityFailure::Undecryptable,
+        };
+        assert!(
+            err.to_string()
+                .contains("its ciphertext does not decrypt under this machine's key"),
+            "{err}"
+        );
+        assert_eq!(
+            IntegrityFailure::HashMismatch.to_string(),
+            "its ciphertext does not match the hash its signed op attests"
+        );
+    }
 
     /// Drives the `?` operator through `From<serde_json::Error>` so the test
     /// exercises the real propagation path, not just a manual `.into()`.

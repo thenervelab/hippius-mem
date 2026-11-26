@@ -60,8 +60,9 @@ client and cannot route per repo, so `install` starts it only for a **single
 catch-all S3 profile**. A second `[[teams]]` entry, an org-routed sole
 profile, or a `storage = "local"` trial vault (whose exclusive write role a
 never-exiting service would hold for good) keeps those clients on stdio.
-`install` starts the user service and waits for `/health` before rewriting
-configs; a start failure leaves stdio entries. Uninstalling one HTTP client
+`install` starts the user service and waits for `/health`, and for the daemon
+to prove it holds this user's token (`/token-proof`), before rewriting
+configs; a start failure or a wrong proof leaves stdio entries. Uninstalling one HTTP client
 leaves the daemon running for the others. Client configs that embed the
 bearer token are written `0600`. Gemini and OpenClaw stay on stdio (one child
 per session). Hermes is a memory-provider plugin, not MCP. Bare
@@ -154,13 +155,18 @@ self-enforcing.
 On an `http-mcp` build, Claude / Grok / Codex share one `hippius-mem serve`
 process, so they no longer fork the op chain against each other. Gemini,
 OpenClaw, Hermes, a lean (no-`http-mcp`) build, and any client still on stdio
-still spawn **one process per session**. Two of those under **one identity**
-on `storage = "s3"` are unserialized: the local-vault advisory lock covers
-`storage = "local"` only. Concurrent head PUTs can fork the op chain and
-permanently drop the losing branch, which later shows up as a `reconcile`
-`head_regressions` entry against the operator's own key. Two machines remain
-unserialized either way. One identity, one writer at a time — or accept
-possible branch loss.
+still spawn **one process per session**. Processes on one machine take the
+cross-process writer lock in the state directory (`writer.lock`, any storage
+backend), so their writes are ordered and chain correctly, under one identity or
+several. A write that waits more than 30 s for another process to release the
+lock fails with a "writer lock ... stayed held" error and writes nothing: retry it. Two
+machines under one identity remain unserialized, and concurrent writes there can
+fork the op chain and permanently drop the losing branch. The losing machine's
+later writes are dropped as well, sequential ones included, until its process
+restarts; each still returns an id with no error. Readers keep the longer
+branch, so the team view can flip to the other branch wholesale. Give each
+machine its own identity (console sub-key onboarding) or accept that a
+successful write may not stay visible.
 
 ## Wiring the server into a generic MCP client
 

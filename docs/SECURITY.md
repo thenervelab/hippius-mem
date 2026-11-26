@@ -46,6 +46,27 @@ read. What that does and does not buy you, stated plainly.
   revoked at the gateway — the one step that stays manual. Until then, a removed member
   can still read and write the bucket directly and decrypt notes sealed under the
   un-rotated key.
+- **After a rotation, a process that cannot load the new key stops writing.** A process
+  loads a rotated epoch's key only with `HIPPIUS_MEM_MNEMONIC` set (the wrap is opened
+  with the mnemonic's x25519 key). The `serve` daemon the installer wires runs without it,
+  so after a `rotate` or `remove` it refuses every write (`EpochSuperseded`, naming the
+  new epoch) and does not show notes sealed under the new epoch, until it can load the
+  key. It never seals a note under the older key a removed member holds. Its writes
+  resume only on a server started with the mnemonic; deriving the encryption key from
+  the per-machine `author_seed_hex` instead is a planned format change, not in this
+  release. An epoch counts as rotated only when a wrap at it is signed by the founder or
+  the recovery key the manifest names, so an object planted under `_keys/` neither stops
+  writes nor moves the next rotation's epoch.
+- **The `serve` daemon's loopback port is shared by every user of the machine.** Clients
+  wired to the HTTP daemon send this user's bearer token and every tool call to
+  `127.0.0.1:17432`. `install`, `serve` (when the port is taken) and the `call` and
+  `path-notes` commands check that the daemon there proves it holds this user's token
+  (`/token-proof`) before they wire, yield the port, or send the token. The MCP clients
+  (Claude, Grok, Codex) do not: when this user's daemon is not running (stopped, crashed,
+  or before login), another local user who binds the port receives their token and calls.
+  On a machine with other users, wire agents over stdio: `install` from a build without
+  the `http-mcp` feature wires every client that way. A per-user Unix socket would remove
+  the shared port; it is not in this release.
 - **`reconcile`'s anchoring checks detect accidental loss, not adversarial suppression.**
   They cross-check the visible op-log against anchored Merkle roots and flag an anchored
   op that has gone missing or a record whose root disagrees with its leaves — i.e.
@@ -188,6 +209,13 @@ read. What that does and does not buy you, stated plainly.
   (`invite` → `join --bundle`, see [Add a teammate](TEAMS.md#add-a-teammate-runbook))
   removes the shared chain entirely. Each race that does happen costs the losing
   branch's ops, which are dropped from convergence for good and must be re-issued.
+  The loss is larger than the race itself. The losing process keeps chaining to its
+  own branch, so its later writes are dropped too, sequential ones included, until
+  that process restarts and syncs onto the kept branch. Every one of those writes
+  returns an id and no error or warning. Readers keep the longer branch, so once the
+  losing branch outgrows the other the team view flips to it wholesale, and notes
+  every machine could read before disappear. A successful write under one identity on
+  two machines is therefore not a promise that the note stays visible.
   A mid-chain drop ALSO populates `suppressed_tails` for the same author whenever that
   author's head survives and is current, because the post-gap run it quarantines includes
   that author's tip — but a dropped, rolled-back or merely lagging head leaves the same
@@ -299,9 +327,8 @@ read. What that does and does not buy you, stated plainly.
   (any `Relate` or `Reinforce` in the op-log tail forced it), which cleared a forgery
   as a side effect; that rebuild was removed because it stalled `recall` for minutes
   (#125), so a forged vector now persists. A full rebuild still clears it: it embeds
-  again every vector the machine took from a checkpoint. So does `hippius-mem
-  snapshot`, which writes a checkpoint built from the blobs. A machine that computed a
-  note's vector itself keeps it over a checkpoint's.
+  again every vector the machine took from a checkpoint; no command forces one. A
+  machine that computed a note's vector itself keeps it over a checkpoint's.
 
   **Redacted notes in retained checkpoints.** `redact` does not rewrite checkpoints,
   and the three most recent are retained. With full rebuilds gone, a checkpoint is
@@ -434,10 +461,17 @@ also take the writer lock and advance the Lamport clock:
    reflects the change immediately on this machine.
 
 **Anchoring — in batches, not per op.** Each op's hash is a Merkle leaf, buffered as
-the op is written. Once a batch reaches the anchor threshold (16 ops in production) —
-or on graceful shutdown — it is sealed into a Merkle root and committed, with the
+the op is written. Once a batch reaches the anchor threshold (16 ops in production),
+or when the session ends (the client closes a stdio server's stdin, or the process gets
+SIGTERM or Ctrl-C), it is sealed into a Merkle root and committed, with the
 batch record (root + leaves + receipt) persisted to the bucket so any teammate can
-build inclusion proofs. Anchoring is local by default, or on-chain with the `chain`
+build inclusion proofs. The buffer is in memory: a session killed with SIGKILL, or
+that crashes, leaves its last ops unanchored until a later session of the same author
+ends and anchors that author's ops above the newest Lamport value its own batch records
+cover. An op below that value is never anchored: when a second session of the same author
+runs at the same time and persists a batch first, its record raises the value past the
+killed session's buffered ops. Those ops stay in the op-log, so no note is lost, but
+`reconcile` has no anchor to report them missing against. Anchoring is local by default, or on-chain with the `chain`
 feature, and it is best-effort: the op is already durable in the log, so a failed
 anchor is retried on the next batch, never surfaced as a write error.
 
@@ -499,6 +533,53 @@ end-to-end, only the on-chain submission is skipped.
 `hippius-mem-core/tests/e2e_phase2.rs`.
 
 </details>
+
+## Team-key check
+
+A wrong but well-formed team key decrypts nothing and fails nothing on its own: its reads come
+back empty and its writes are sealed where no teammate can read them. So each key epoch can have
+a key-check object at `{team}/_keycheck/{epoch:020}`, holding a BLAKE3 key derivation (context
+`hippius-mem team-key check v1`) over the key, the epoch and the team name. It is a
+pseudorandom function of the key, so it reveals nothing about the key or the keys derived from
+it; it is not a plain hash of the key, which would equal any other unkeyed hash of the same
+key.
+
+- Who publishes decides what the check is worth, so no client publishes one on its own
+  judgment. `rotate` (and `remove`) publish the new epoch's check, `provision` publishes the
+  founder's epochs, and `hippius-mem admin keycheck publish` publishes it for a team that
+  predates the check. Each publish first tries its key on the epoch's 16 oldest notes (a
+  missing or altered blob counts for neither side) and publishes nothing when most of those it
+  could read fail to open (`--replace` included), because that check
+  would refuse the clients whose key those notes were sealed under; an epoch with no notes is
+  published. Each publish is a create-only write (`If-None-Match: *`, where the
+  gateway enforces it) followed by a read back, so of two publishers the second learns it lost
+  instead of overwriting the first. `--replace` and a gateway without the condition use a plain
+  PUT.
+- The server compares its key at boot, before it serves writes, and re-reads the check about
+  once a minute after that, so a check published or replaced later reaches a running server. A mismatch refuses every write with "does not match
+  the team's published key check", and `hippius-mem doctor` fails. Index checkpoints are
+  refused too, so a wrong-key client cannot publish one at the shared checkpoint key.
+- With no check published, the server tries its key on the epoch's 16 oldest notes, at most
+  16 GETs, and logs the result, loudly when most fail to open. It never refuses a write or publishes on
+  that result: which notes count as oldest depends on note ids their writers choose, so the
+  probe is a hint, not evidence of the team's key. `hippius-mem doctor` reports the same probe
+  and fails when most notes fail to open while no check is published and the team has not
+  rotated past epoch 0; beside a matching check, or after a rotation, it warns without saying
+  which side is wrong, because only a published check decides. The probe can only
+  withhold a publish: when most of an epoch's oldest notes were sealed under another key, a
+  right key's publish is refused too, and `rotate` (a new epoch, with no notes) gets past that.
+  A team without a check keeps working, with that warning, until the founder publishes one.
+  The warning names the founder because on an epoch with no notes the probe cannot tell a
+  wrong key, and a member's mistyped key published there would refuse the rest of the team.
+- A wrong check, or an object that cannot be read, is undone with `hippius-mem admin keycheck
+  publish --replace` from a machine with the right key. Nothing else overwrites it.
+- What is not guaranteed: the object is not signed. It guards against a misconfigured key,
+  not against a party with bucket write access: a wrong object makes clients refuse writes
+  until `--replace` corrects it. On a gateway
+  that ignores `If-None-Match` (doctor reports it), two publishers with different keys at the
+  same moment can overwrite each other, and the read back catches only the one that finishes
+  second.
+- Clients before 0.8.0 ignore the object.
 
 ## Phase 3 — identity, teams, and key distribution
 

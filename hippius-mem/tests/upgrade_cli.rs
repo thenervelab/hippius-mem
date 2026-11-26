@@ -17,8 +17,10 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
 )]
 
+mod support;
+
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::Context as _;
 
@@ -35,7 +37,7 @@ fn run_upgrade(
     extra: &[&str],
     secret: &str,
 ) -> anyhow::Result<std::process::Output> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let mut child = support::binary()
         .arg("upgrade")
         .args(extra)
         .env("HIPPIUS_MEM_CONFIG", config_path)
@@ -188,7 +190,7 @@ fn upgrade_reads_secret_from_stdin_not_argv() -> anyhow::Result<()> {
     // argv parsing alone is enough, so stdin is deliberately closed (Stdio::
     // null) rather than piped: a bug that tried to read from stdin here
     // would hang instead of silently passing.
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args([
             "upgrade",
             "--bucket",
@@ -250,7 +252,7 @@ fn upgrade_rejects_the_secret_equals_form_without_leaking_the_value() -> anyhow:
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args([
             "upgrade",
             "--bucket",
@@ -343,13 +345,14 @@ struct LiveDestination {
 impl LiveDestination {
     /// # Errors
     ///
-    /// Returns an error if `HIPPIUS_MEM_TEST_BUCKET` is unset — the one
-    /// coordinate with no safe default, since a wrong guess would write into
-    /// a bucket the operator did not create for this test.
+    /// Returns an error if `HIPPIUS_MEM_TEST_S3_ENDPOINT` or
+    /// `HIPPIUS_MEM_TEST_BUCKET` is unset: neither has a safe default, since a
+    /// wrong guess would write into a server or bucket the operator did not set
+    /// up for this test.
     fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned()),
+                .context("set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint")?,
             bucket: std::env::var("HIPPIUS_MEM_TEST_BUCKET").context(
                 "set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint",
             )?,
@@ -361,6 +364,25 @@ impl LiveDestination {
                 .unwrap_or_else(|_| "us-east-1".to_owned()),
         })
     }
+}
+
+/// The team the live round trip names its trial vault, and so the prefix it
+/// owns in the destination bucket.
+///
+/// Fixed, and cleared before and after the run like the other live suites'
+/// teams. quickstart's default name (`trial`) is shared with anything else
+/// that runs quickstart against the bucket, and every run's trial key is
+/// random, so notes left from earlier runs are sealed under other keys and
+/// `doctor`, which `upgrade` runs, rightly reports that this run's key does
+/// not open the team's oldest notes.
+const UPGRADE_TEAM: &str = "hippius-mem-upgrade-live";
+
+/// Remove every object under `team`'s prefix in `bucket`.
+async fn clear_team(bucket: &dyn hippius_mem_core::BlobStore, team: &str) -> anyhow::Result<()> {
+    for key in bucket.list(&format!("{team}/")).await? {
+        bucket.delete(&key).await?;
+    }
+    Ok(())
 }
 
 /// The trial identity `quickstart` wrote, parsed from the config it just
@@ -376,9 +398,10 @@ struct TrialIdentity {
 fn quickstart_trial_identity(
     config_path: &std::path::Path,
     home: &std::path::Path,
+    team: &str,
 ) -> anyhow::Result<TrialIdentity> {
-    let quickstart = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
-        .args(["quickstart", "--no-wire"])
+    let quickstart = support::binary()
+        .args(["quickstart", "--no-wire", "--team", team])
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
         .env_remove("HERMES_HOME")
@@ -469,10 +492,19 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
     use hippius_mem_core::{BlobStore, FsBlobStore, S3BlobStore};
 
     let dest = LiveDestination::from_env()?;
+    let s3_blob: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(S3BlobStore::new(
+        dest.endpoint.clone(),
+        dest.bucket.clone(),
+        dest.access_key_id.clone(),
+        dest.secret.clone(),
+        dest.region.clone(),
+    ));
+    clear_team(s3_blob.as_ref(), UPGRADE_TEAM).await?;
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
 
-    let identity = quickstart_trial_identity(&config_path, dir.path())?;
+    let identity = quickstart_trial_identity(&config_path, dir.path(), UPGRADE_TEAM)?;
+    assert_eq!(identity.team, UPGRADE_TEAM);
     // The XDG *data* base (finding #4), not *cache* — matches
     // `quickstart_trial_identity`'s isolated HOME with XDG_DATA_HOME removed.
     let vault_root = dir
@@ -512,18 +544,11 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
         "upgrade must report the copy: {stdout}"
     );
 
-    let s3_blob: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(S3BlobStore::new(
-        dest.endpoint,
-        dest.bucket,
-        dest.access_key_id,
-        dest.secret,
-        dest.region,
-    ));
     // A fresh reader identity: recall/get do not require matching the note's
     // author, only holding the team key.
     let reader_seed_hex = "11".repeat(32);
     let remote_store = build_live_store(
-        s3_blob,
+        std::sync::Arc::clone(&s3_blob),
         &identity.team,
         &identity.team_key_hex,
         &reader_seed_hex,
@@ -535,5 +560,80 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
     assert_eq!(recalled_first.summary, "live upgrade test note one");
     assert_eq!(recalled_second.summary, "live upgrade test note two");
 
+    clear_team(s3_blob.as_ref(), UPGRADE_TEAM).await
+}
+
+/// The team the live collision test names both its trial vaults.
+const COLLIDE_TEAM: &str = "hippius-mem-upgrade-collide-live";
+
+/// A second trial vault of the same team name is refused by a bucket the
+/// first one was upgraded into, and its config stays on the trial vault.
+/// Every quickstart vault is named `trial` by default, and `upgrade` copied
+/// into a prefix that already held another vault's history, under another
+/// team key, then flipped the config before its check failed.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local versitygw)"]
+async fn upgrade_refuses_a_bucket_another_vault_was_upgraded_into() -> anyhow::Result<()> {
+    use hippius_mem_core::{BlobStore, FsBlobStore, S3BlobStore};
+
+    let dest = LiveDestination::from_env()?;
+    let s3_blob = S3BlobStore::new(
+        dest.endpoint.clone(),
+        dest.bucket.clone(),
+        dest.access_key_id.clone(),
+        dest.secret.clone(),
+        dest.region.clone(),
+    );
+    clear_team(&s3_blob, COLLIDE_TEAM).await?;
+    let args = [
+        "--bucket",
+        dest.bucket.as_str(),
+        "--access-key-id",
+        dest.access_key_id.as_str(),
+        "--endpoint",
+        dest.endpoint.as_str(),
+    ];
+
+    let mut outcomes = Vec::new();
+    let mut configs = Vec::new();
+    let mut dirs = Vec::new();
+    for _ in 0..2 {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("hippius-mem.toml");
+        let identity = quickstart_trial_identity(&config_path, dir.path(), COLLIDE_TEAM)?;
+        let vault_root = dir
+            .path()
+            .join(".local/share/hippius-mem/local")
+            .join(&identity.team);
+        let fs_blob: std::sync::Arc<dyn BlobStore> =
+            std::sync::Arc::new(FsBlobStore::new(vault_root));
+        let local_store = build_live_store(
+            fs_blob,
+            &identity.team,
+            &identity.team_key_hex,
+            &identity.author_seed_hex,
+        )?;
+        seed_two_notes(&local_store).await?;
+        outcomes.push(run_upgrade(&config_path, dir.path(), &args, &dest.secret)?);
+        configs.push(config_path);
+        dirs.push(dir);
+    }
+    clear_team(&s3_blob, COLLIDE_TEAM).await?;
+
+    anyhow::ensure!(
+        outcomes[0].status.success(),
+        "the first upgrade failed: {}",
+        String::from_utf8_lossy(&outcomes[0].stderr)
+    );
+    let refused = String::from_utf8_lossy(&outcomes[1].stderr);
+    anyhow::ensure!(
+        !outcomes[1].status.success() && refused.contains("already holds objects"),
+        "the second upgrade must be refused: {refused}"
+    );
+    let second_config = std::fs::read_to_string(&configs[1])?;
+    anyhow::ensure!(
+        second_config.contains("storage = \"local\""),
+        "the refused upgrade left the trial config in place: {second_config}"
+    );
     Ok(())
 }

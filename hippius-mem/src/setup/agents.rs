@@ -5,8 +5,9 @@
 //! product directory already exists under `$HOME`. Detection is directory
 //! presence, never PATH — a missing `~/.codex` is not created. Hermes honours
 //! `HERMES_HOME` and is a memory-provider plugin, not an MCP registration.
-//! Unrelated keys in those files are preserved; a malformed file is refused
-//! (or, on uninstall, left untouched) rather than rewritten.
+//! Unrelated keys in those files are preserved, and in the TOML configs
+//! (Grok, Codex) every byte outside our table is too; a malformed file is
+//! refused (or, on uninstall, left untouched) rather than rewritten.
 
 use std::path::Path;
 
@@ -258,7 +259,7 @@ fn json_entry_has_url(path: &Path) -> bool {
 
 #[cfg(any(test, feature = "http-mcp"))]
 fn toml_entry_has_url(path: &Path) -> bool {
-    let Ok(root) = load_toml_table(path) else {
+    let Ok(root) = load_toml_document(path) else {
         return false;
     };
     root.get("mcp_servers")
@@ -268,34 +269,52 @@ fn toml_entry_has_url(path: &Path) -> bool {
 }
 
 /// Upsert `[mcp_servers.hippius-mem]` in a Grok/Codex `config.toml`.
+///
+/// Edits the document in place, so everything outside our table keeps its
+/// bytes: comments, key order, inline tables. A symlinked config is refused
+/// ([`refuse_symlink`]).
 fn upsert_toml_mcp(
     path: &Path,
     launch: &McpLaunch,
     prefer_http: bool,
     auth: TomlHttpAuth,
 ) -> anyhow::Result<()> {
+    refuse_symlink(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
     }
-    let mut root = load_toml_table(path)?;
-    let servers = toml_table_entry(&mut root, "mcp_servers")?;
-    servers.insert(SERVER_NAME.to_owned(), launch.toml_entry(prefer_http, auth));
+    let mut doc = load_toml_document(path)?;
+    let servers = doc
+        .entry("mcp_servers")
+        .or_insert_with(|| {
+            let mut table = toml_edit::Table::new();
+            // A new `[mcp_servers]` header with nothing directly under it adds
+            // a line of noise; only `[mcp_servers.hippius-mem]` is written.
+            table.set_implicit(true);
+            toml_edit::Item::Table(table)
+        })
+        .as_table_like_mut()
+        .context("`mcp_servers` is not a TOML table")?;
+    servers.insert(
+        SERVER_NAME,
+        toml_value_to_item(launch.toml_entry(prefer_http, auth))?,
+    );
     if launch.writes_token(prefer_http) {
-        return write_toml_private(path, &root);
+        return super::atomic::atomic_write_private(path, doc.to_string().as_bytes());
     }
-    write_toml(path, &root)
+    super::atomic::atomic_write(path, doc.to_string().as_bytes())
 }
 
 fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
-    let mut root = match load_toml_table(path) {
-        Ok(table) => table,
+    let mut doc = match load_toml_document(path) {
+        Ok(doc) => doc,
         Err(e) if path_missing_or_malformed(path, &e) => return Ok(()),
         Err(e) => return Err(e),
     };
-    let Some(servers) = root
+    let Some(servers) = doc
         .get_mut("mcp_servers")
-        .and_then(toml::Value::as_table_mut)
+        .and_then(toml_edit::Item::as_table_like_mut)
     else {
         return Ok(());
     };
@@ -303,44 +322,83 @@ fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     if servers.is_empty() {
-        root.remove("mcp_servers");
+        doc.remove("mcp_servers");
     }
-    write_toml(path, &root)
+    // Checked only now: a linked config without the entry needs no write, so
+    // an uninstall over every detected agent passes it by.
+    if let Some(link) = symlink_on_path(path) {
+        bail!(
+            "{} is a symlink; hippius-mem does not rewrite {} through a link, because the \
+             write would replace the link with a regular file or edit the file the link \
+             points into. Remove the \
+             `[mcp_servers.{SERVER_NAME}]` entry from the link's target by hand",
+            link.display(),
+            path.display()
+        );
+    }
+    super::atomic::atomic_write(path, doc.to_string().as_bytes())
 }
 
-fn load_toml_table(path: &Path) -> anyhow::Result<toml::Table> {
+/// The config at `path` as an editable document; empty when the file is
+/// missing.
+fn load_toml_document(path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
     match std::fs::read_to_string(path) {
-        Ok(s) if s.trim().is_empty() => Ok(toml::Table::new()),
         Ok(s) => s
             .parse()
             .with_context(|| format!("{} is not valid TOML", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
         Err(e) => Err(e).with_context(|| format!("reading {} failed", path.display())),
     }
 }
 
-fn toml_table_entry<'a>(
-    root: &'a mut toml::Table,
-    key: &str,
-) -> anyhow::Result<&'a mut toml::Table> {
-    if !root.contains_key(key) {
-        root.insert(key.to_owned(), toml::Value::Table(toml::Table::new()));
+/// `value` (a table) as an item for a [`toml_edit::DocumentMut`], with its
+/// nested tables written as dotted headers the way `toml` wrote them.
+fn toml_value_to_item(value: toml::Value) -> anyhow::Result<toml_edit::Item> {
+    let mut wrapper = toml::Table::new();
+    wrapper.insert("entry".to_owned(), value);
+    let text = toml::to_string(&wrapper).context("serializing the MCP entry failed")?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .context("re-reading the serialized MCP entry failed")?;
+    doc.remove("entry")
+        .context("the serialized MCP entry holds its own key")
+}
+
+/// Refuse to edit a config that is a symlink.
+///
+/// Writing through the link would put the entry, which can carry this user's
+/// bearer token, into the link's target, typically a dotfiles checkout that is
+/// committed and pushed. Replacing the link with a file would break the
+/// user's setup instead. Neither is this command's call to make.
+///
+/// The config's own directory (`~/.codex`, `~/.grok`) is checked too: dotfiles
+/// managers such as GNU stow link the whole directory. Directories above it
+/// (the home directory itself) are not, since a home under a linked path is a
+/// normal system layout, not a checkout.
+fn refuse_symlink(path: &Path) -> anyhow::Result<()> {
+    if let Some(link) = symlink_on_path(path) {
+        bail!(
+            "{} is a symlink; hippius-mem does not edit {} through a link, because the \
+             entry can carry a bearer token and would land in the link's target. Replace \
+             the link with a regular file or directory, or add the \
+             `[mcp_servers.{SERVER_NAME}]` entry to the target by hand (for the HTTP \
+             daemon, keep the token out of a tracked file)",
+            link.display(),
+            path.display()
+        );
     }
-    root.get_mut(key)
-        .and_then(toml::Value::as_table_mut)
-        .with_context(|| format!("`{key}` is not a TOML table"))
+    Ok(())
 }
 
-fn write_toml(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
-    let body = toml::to_string(root).context("serializing MCP TOML failed")?;
-    super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
-}
-
-/// [`write_toml`], forced owner-only because the table embeds the daemon's
-/// bearer token (see [`McpLaunch::writes_token`]).
-fn write_toml_private(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
-    let body = toml::to_string(root).context("serializing MCP TOML failed")?;
-    super::atomic::atomic_write_private(path, format!("{body}\n").as_bytes())
+/// `path` itself or its directory, whichever is a symlink, as
+/// [`refuse_symlink`] checks them.
+fn symlink_on_path(path: &Path) -> Option<&Path> {
+    [Some(path), path.parent()]
+        .into_iter()
+        .flatten()
+        .find(|link| {
+            std::fs::symlink_metadata(link).is_ok_and(|meta| meta.file_type().is_symlink())
+        })
 }
 
 fn path_missing_or_malformed(path: &Path, err: &anyhow::Error) -> bool {
@@ -648,6 +706,154 @@ mod tests {
         assert_eq!(
             AgentSelect::AllDetected.resolve(home.path(), &opts, None),
             vec![AgentId::Claude, AgentId::Hermes]
+        );
+    }
+
+    /// A user's commented, hand-ordered Codex config keeps every byte outside
+    /// our table through install, and uninstall gives the file back unchanged.
+    /// Install used to re-serialize the whole file: comments dropped, keys
+    /// re-sorted, the inline table expanded.
+    #[test]
+    fn codex_toml_install_and_uninstall_leave_the_rest_of_the_file_alone() {
+        const USER_CONFIG: &str = "# my codex settings\n\
+            model = \"o4\" # the fast one\n\
+            approval_policy = \"never\"\n\
+            tools = { web = true, shell = false }\n\
+            \n\
+            [mcp_servers.other]\n\
+            # keep this one\n\
+            command = \"x\"\n";
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        let path = home.path().join(".codex/config.toml");
+        std::fs::write(&path, USER_CONFIG).expect("seed");
+
+        AgentId::Codex
+            .register(home.path(), &launch())
+            .expect("register");
+        let installed = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            installed.starts_with(USER_CONFIG),
+            "the user's lines are unchanged and first: {installed}"
+        );
+        let table: toml::Table = installed.parse().expect("toml");
+        assert_eq!(
+            table["mcp_servers"]["hippius-mem"]["command"].as_str(),
+            Some("/opt/hippius-mem")
+        );
+
+        AgentId::Codex.unregister(home.path()).expect("unregister");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), USER_CONFIG);
+    }
+
+    /// A config that exists but cannot be read as text fails the install and
+    /// keeps its bytes. Only a missing file starts from an empty document:
+    /// taking every read error for "missing" replaced the user's whole file
+    /// with the one table hippius-mem writes.
+    #[test]
+    fn an_unreadable_codex_config_fails_the_install_and_is_left_alone() {
+        // TOML text encoded as Latin-1, so not UTF-8: `read_to_string` fails
+        // with `InvalidData`, not `NotFound`.
+        const USER_CONFIG: &[u8] = b"# caf\xe9 settings\nmodel = \"o4\"\n";
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        let path = home.path().join(".codex/config.toml");
+        std::fs::write(&path, USER_CONFIG).expect("seed");
+
+        let refused = AgentId::Codex
+            .register(home.path(), &launch())
+            .expect_err("an unreadable config must fail the install");
+        assert!(format!("{refused:#}").contains("reading"), "{refused:#}");
+        assert_eq!(std::fs::read(&path).expect("read"), USER_CONFIG);
+    }
+
+    /// A config symlinked into a dotfiles checkout is refused, so the entry
+    /// (which can carry the bearer token) never lands in the tracked target,
+    /// and the link is not replaced by a file either.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_codex_config_is_refused_and_left_alone() {
+        let home = TempDir::new().expect("tempdir");
+        let dotfiles = home.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).expect("dir");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        let real = dotfiles.join("codex.toml");
+        std::fs::write(&real, "model = \"o4\"\n").expect("seed");
+        let link = home.path().join(".codex/config.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let refused = AgentId::Codex
+            .register(home.path(), &launch())
+            .expect_err("a symlinked config is refused");
+
+        assert!(
+            format!("{refused:#}").contains(&link.display().to_string()),
+            "the error names the path: {refused:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the config is still a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read"),
+            "model = \"o4\"\n",
+            "the link's target is untouched"
+        );
+    }
+
+    /// The same for a config whose directory is the link (`~/.codex` linked
+    /// into a dotfiles checkout, as GNU stow does). Uninstall passes such a
+    /// config by when it holds no entry, so an uninstall over every detected
+    /// agent goes on to the rest, and refuses it when the entry is there.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_in_a_symlinked_directory_is_refused_and_left_alone() {
+        let home = TempDir::new().expect("tempdir");
+        let dotfiles = home.path().join("dotfiles/codex");
+        std::fs::create_dir_all(&dotfiles).expect("dir");
+        let real = dotfiles.join("config.toml");
+        std::fs::write(&real, "model = \"o4\"\n").expect("seed");
+        std::os::unix::fs::symlink(&dotfiles, home.path().join(".codex")).expect("symlink");
+
+        let refused = AgentId::Codex
+            .register(home.path(), &launch())
+            .expect_err("a config in a symlinked directory is refused");
+        assert!(
+            format!("{refused:#}").contains(".codex"),
+            "the error names the link: {refused:#}"
+        );
+        AgentId::Codex
+            .unregister(home.path())
+            .expect("a linked config without the entry is left alone");
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read"),
+            "model = \"o4\"\n",
+            "the link's target is untouched"
+        );
+
+        let with_entry = "model = \"o4\"\n\n[mcp_servers.hippius-mem]\ncommand = \"x\"\n";
+        std::fs::write(&real, with_entry).expect("seed");
+        let refused = AgentId::Codex
+            .unregister(home.path())
+            .expect_err("uninstall refuses to rewrite through the link");
+        assert!(
+            format!("{refused:#}").contains("by hand"),
+            "the error says what to do: {refused:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read"),
+            with_entry,
+            "the link's target is untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.path().join(".codex"))
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the directory is still a link"
         );
     }
 

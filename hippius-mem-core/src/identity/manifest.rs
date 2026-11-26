@@ -354,6 +354,40 @@ pub async fn publish_manifest(
     blob.put(&key, bytes).await
 }
 
+/// The first manifest version of `team` above `current` (from 0 when `None`)
+/// that no object under the manifest prefix occupies, from one LIST.
+///
+/// A garbled or unreadable object still occupies its version: publishing over
+/// it would hand a reader that never applied it a second, different manifest
+/// at the same version, and one that did apply it would refuse the new one.
+///
+/// # Errors
+///
+/// Whatever the listing reports, and [`MemError::Malformed`] when no version
+/// above `current` is free.
+pub(crate) async fn next_free_manifest_version(
+    blob: &dyn BlobStore,
+    team: &str,
+    current: Option<u64>,
+) -> Result<u64, MemError> {
+    let prefix = manifest_prefix(team);
+    let taken: BTreeSet<u64> = blob
+        .list(&prefix)
+        .await?
+        .iter()
+        .filter_map(|key| key.strip_prefix(&prefix)?.parse::<u64>().ok())
+        .collect();
+    let exhausted = || MemError::Malformed(format!("team {team} has no manifest version left"));
+    let mut version = match current {
+        None => 0,
+        Some(current) => current.checked_add(1).ok_or_else(exhausted)?,
+    };
+    while taken.contains(&version) {
+        version = version.checked_add(1).ok_or_else(exhausted)?;
+    }
+    Ok(version)
+}
+
 /// Load the current (highest valid version) manifest for `team`, or `None` if
 /// none exists.
 ///

@@ -10,15 +10,18 @@
 //! vault mid-migration); probe the destination
 //! bucket/credentials with a canary put/get/delete BEFORE touching the
 //! trial vault (bad credentials must fail loudly, not midway through
-//! copying real notes); `copy_store` every object under the team prefix
-//! (put-overwrite, so re-running after a partial copy is safe — see
-//! [`hippius_mem_core::copy_store`]); rewrite the config in place to
+//! copying real notes); refuse a destination whose team prefix holds
+//! anything but a byte-identical copy of this vault's objects
+//! ([`require_destination_holds_only_this_vault`]); `copy_store` every object
+//! under the team prefix (put-overwrite, so re-running after a partial copy is
+//! safe — see [`hippius_mem_core::copy_store`]); rewrite the config in place to
 //! `storage = "s3"` with the new bucket/credentials, preserving every other
 //! field ([`render_upgraded_config`]); then rebuild the store from the
 //! rewritten config, bootstrap any rotated epoch keys, re-run the `doctor`
-//! probe against that EXACT config, and sync the index from the bucket —
-//! proving the copied history is readable end to end before the command
-//! reports success.
+//! probe against that EXACT config, and sync the index from the bucket
+//! before the command reports success. The probe proves the key and the
+//! bucket work; the sync does not prove every copied note opens, because it
+//! skips a note it cannot decode with a warning instead of failing.
 //!
 //! Config load/rewrite deliberately mirrors `quickstart.rs`/`join_bundle.rs`,
 //! not [`Config::from_env_and_file`]: it resolves the SAME path
@@ -200,8 +203,12 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     );
 
     probe_destination(&s3_store, &cfg.team).await?;
+    require_destination_holds_only_this_vault(&fs_store, &s3_store, &cfg.team).await?;
 
-    let copied = copy_store(&fs_store, &s3_store, &cfg.team)
+    // The slash keeps team `trial` from matching `trial2/`.
+    let prefix = format!("{}/", cfg.team);
+
+    let copied = copy_store(&fs_store, &s3_store, &prefix)
         .await
         .context("copying the trial vault into the new bucket failed")?;
 
@@ -486,6 +493,61 @@ fn probe_key(team: &str) -> String {
     format!("{team}/_upgrade_probe")
 }
 
+/// Refuse a destination whose `team` prefix holds any object other than a
+/// byte-identical copy of the vault's object at that key.
+///
+/// Every trial vault's team is named `trial`, so a second vault upgraded into
+/// the same bucket would interleave two histories sealed under two team keys
+/// in one prefix, and the config is already flipped when the post-copy check
+/// fails. A byte-identical subset is allowed so a re-run after a partial copy
+/// still works. The destination probe's canary ([`probe_key`]) is not team
+/// data and is skipped: a run whose cleanup delete failed leaves it behind, and
+/// counting it would refuse every later run as "another vault". One LIST of
+/// each side, and a GET of each object on both sides of the overlap.
+async fn require_destination_holds_only_this_vault(
+    src: &dyn BlobStore,
+    dst: &dyn BlobStore,
+    team: &str,
+) -> anyhow::Result<()> {
+    // The slash keeps team `trial` from matching `trial2/`.
+    let prefix = &format!("{team}/");
+    let canary = probe_key(team);
+    let existing: Vec<String> = dst
+        .list(prefix)
+        .await
+        .context("listing the destination bucket failed")?
+        .into_iter()
+        .filter(|key| *key != canary)
+        .collect();
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let vault: std::collections::BTreeSet<String> = src
+        .list(prefix)
+        .await
+        .context("listing the trial vault failed")?
+        .into_iter()
+        .collect();
+    for key in &existing {
+        let same = vault.contains(key)
+            && src
+                .get(key)
+                .await
+                .context("reading the trial vault failed")?
+                == dst
+                    .get(key)
+                    .await
+                    .context("reading the destination failed")?;
+        ensure!(
+            same,
+            "the destination bucket already holds objects under `{prefix}` that this trial vault \
+             did not write (first: {key}); upgrading here would mix two teams' histories. Use \
+             an empty bucket, or remove that prefix first"
+        );
+    }
+    Ok(())
+}
+
 /// Prove the destination bucket/credentials work BEFORE any copy runs: put
 /// a small canary object, read it back, then delete it. Bad credentials or
 /// a missing bucket fail here, not midway through copying real notes.
@@ -630,7 +692,8 @@ fn reload_config(path: &Path) -> anyhow::Result<Config> {
 /// probe against this EXACT config — never `doctor::run(&[])`, which
 /// re-resolves its own config from the environment/cwd (see the module
 /// docs) — then a `refresh`-equivalent sync so the local index rebuilds
-/// from the bucket, proving the copied history is readable end to end.
+/// from the bucket. The sync skips a note it cannot decode with a warning,
+/// so it is not proof that every copied note opens.
 ///
 /// # Errors
 ///
@@ -683,8 +746,8 @@ mod tests {
 
     use super::{
         Options, acquire_upgrade_lock, confirm_team, describe_post_flip_failure, probe_destination,
-        render_upgraded_config, require_single_local_profile, require_vault_root_exists,
-        rewrite_config_file,
+        probe_key, render_upgraded_config, require_destination_holds_only_this_vault,
+        require_single_local_profile, require_vault_root_exists, rewrite_config_file,
     };
     use crate::config::{Config, StorageBackend, TeamProfile};
 
@@ -1162,6 +1225,73 @@ mod tests {
         async fn delete(&self, _key: &str) -> Result<(), MemError> {
             Ok(())
         }
+    }
+
+    /// Keeps everything but refuses every delete, like credentials without
+    /// `s3:DeleteObject`.
+    struct NoDeleteStore(hippius_mem_core::MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl hippius_mem_core::BlobStore for NoDeleteStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), MemError> {
+            Err(MemError::Storage("simulated delete refusal".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_canary_the_probe_could_not_delete_is_not_another_vault() -> anyhow::Result<()> {
+        let dst = NoDeleteStore(hippius_mem_core::MemoryBlobStore::default());
+        let vault = hippius_mem_core::MemoryBlobStore::default();
+        hippius_mem_core::BlobStore::put(&vault, "trial/_oplog/x", b"op".to_vec()).await?;
+
+        probe_destination(&dst, "trial").await?;
+        assert_eq!(
+            hippius_mem_core::BlobStore::list(&dst, "trial/").await?,
+            [probe_key("trial")],
+            "the canary stays behind when its delete is refused"
+        );
+        require_destination_holds_only_this_vault(&vault, &dst, "trial").await?;
+
+        hippius_mem_core::BlobStore::put(&dst, "trial/_oplog/y", b"other".to_vec()).await?;
+        let err = require_destination_holds_only_this_vault(&vault, &dst, "trial")
+            .await
+            .expect_err("an object the vault did not write is still refused");
+        assert!(err.to_string().contains("trial/_oplog/y"), "{err}");
+        Ok(())
+    }
+
+    /// A destination holding a byte-identical part of this vault (a re-run
+    /// after a partial copy) is allowed; the same key with other bytes is
+    /// another vault's object and is refused.
+    #[tokio::test]
+    async fn a_copied_object_passes_only_while_its_bytes_match_the_vault() -> anyhow::Result<()> {
+        use hippius_mem_core::BlobStore as _;
+
+        let vault = hippius_mem_core::MemoryBlobStore::default();
+        vault.put("trial/_oplog/x", b"op".to_vec()).await?;
+        vault.put("trial/_oplog/z", b"later".to_vec()).await?;
+        let dst = hippius_mem_core::MemoryBlobStore::default();
+        dst.put("trial/_oplog/x", b"op".to_vec()).await?;
+        require_destination_holds_only_this_vault(&vault, &dst, "trial").await?;
+
+        dst.put("trial/_oplog/x", b"another op".to_vec()).await?;
+        let err = require_destination_holds_only_this_vault(&vault, &dst, "trial")
+            .await
+            .expect_err("the same key with other bytes is another vault's object");
+        assert!(err.to_string().contains("trial/_oplog/x"), "{err}");
+        Ok(())
     }
 
     #[tokio::test]

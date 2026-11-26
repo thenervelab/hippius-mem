@@ -61,7 +61,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
-    crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
+    crate::admin::warn_if_epoch_superseded(&store).await;
     let _ = store.refresh_if_stale().await;
 
     let window = window_since(SystemTime::now(), since);

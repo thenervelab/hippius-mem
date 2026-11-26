@@ -14,12 +14,14 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes"
 )]
 
+mod support;
+
 use std::io::BufRead as _;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -37,12 +39,34 @@ impl Drop for ChildGuard {
     }
 }
 
+/// How long a child the test asked to stop gets to exit before the test kills
+/// it and fails. Arbitrary: a clean exit, the exit flush included (bounded at
+/// 4 s), takes well under it, and the margin absorbs a loaded CI runner.
+const EXIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Wait for `child` to exit. Past [`EXIT_DEADLINE`], kill and reap it and fail,
+/// so a child that never exits fails the test instead of hanging the suite.
+fn wait_or_kill(child: &mut Child, what: &str) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= EXIT_DEADLINE {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("{what} did not exit within {EXIT_DEADLINE:?}; killed it").into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 struct HttpDaemon {
     dir: tempfile::TempDir,
-    _child: ChildGuard,
+    child: ChildGuard,
     url: String,
     token: String,
-    _stderr: StderrDrain,
+    stderr: StderrDrain,
 }
 
 struct StderrDrain {
@@ -52,6 +76,11 @@ struct StderrDrain {
 
 impl HttpDaemon {
     fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_on_port(0)
+    }
+
+    /// [`spawn`](Self::spawn) on `port`; `0` lets the OS pick one.
+    fn spawn_on_port(port: u16) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let config_path = dir.path().join("hippius-mem.toml");
         let vault_root = dir.path().join("vault");
@@ -60,21 +89,14 @@ impl HttpDaemon {
         seed_trial_config(&config_path, &vault_root)?;
         std::fs::write(&token_path, format!("{TOKEN}\n"))?;
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
-        for (name, _) in std::env::vars_os() {
-            if name
-                .to_str()
-                .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
-            {
-                command.env_remove(name);
-            }
-        }
+        let mut command = support::binary();
         command
-            .args(["serve", "--port", "0", "--token-file"])
+            .args(["serve", "--port", &port.to_string(), "--token-file"])
             .arg(&token_path)
             .current_dir(dir.path())
             .env("HOME", dir.path())
             .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("HIPPIUS_MEM_STATE_DIR", dir.path().join("state"))
             .env("HIPPIUS_MEM_CONFIG", &config_path)
             .env_remove("XDG_CACHE_HOME")
             .env_remove("RUST_LOG")
@@ -88,10 +110,10 @@ impl HttpDaemon {
         let url = wait_for_listen_url(&drain)?;
         Ok(Self {
             dir,
-            _child: child,
+            child,
             url,
             token: TOKEN.to_owned(),
-            _stderr: drain,
+            stderr: drain,
         })
     }
 
@@ -150,15 +172,7 @@ fn run_serve_to_exit(
     std::fs::write(&config_path, config)?;
     std::fs::write(&token_path, format!("{TOKEN}\n"))?;
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
-    for (name, _) in std::env::vars_os() {
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
-        {
-            command.env_remove(name);
-        }
-    }
+    let mut command = support::binary();
     let output = command
         .args(["serve", "--port", "0", "--token-file"])
         .arg(&token_path)
@@ -295,6 +309,7 @@ fn the_binary_remembers_recalls_and_gets_over_http() -> Result<(), Box<dyn std::
                 "name": "remember",
                 "arguments": {
                     "note_type": "gotcha",
+                    "repo": "global",
                     "summary": "quokka-http eviction storm",
                     "body": "pin the group instance id"
                 }
@@ -336,6 +351,35 @@ fn the_binary_remembers_recalls_and_gets_over_http() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// The shared daemon refuses a `remember` that omits `repo`, as the CLI does.
+/// It used to write the note team-global, into the pool every repository's
+/// recall and brief read, while the docs said an omitted `repo` means the
+/// repository the server was launched in.
+#[test]
+fn the_daemon_refuses_a_remember_without_repo() -> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let session = handshake(&daemon)?;
+    let (_, reply) = daemon.rpc(
+        Some(&session),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remember",
+                "arguments": {
+                    "note_type": "gotcha",
+                    "summary": "lynx-http unscoped note",
+                    "body": "body"
+                }
+            }
+        }),
+    )?;
+    assert_eq!(reply["result"]["isError"].as_bool(), Some(true), "{reply}");
+    assert!(call_text(&reply).contains("invalid repo"), "{reply}");
+    Ok(())
+}
+
 #[test]
 fn two_http_sessions_share_one_process_and_see_each_others_writes()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -354,6 +398,7 @@ fn two_http_sessions_share_one_process_and_see_each_others_writes()
                 "name": "remember",
                 "arguments": {
                     "note_type": "decision",
+                    "repo": "global",
                     "summary": "shared-daemon session B can recall A's note",
                     "body": "one ONNX load"
                 }
@@ -494,7 +539,7 @@ fn path_notes_stdout(
         .strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["path-notes", "--port", port, "--repo-root"])
         .arg(checkout)
         .arg("--file")
@@ -579,7 +624,7 @@ fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::erro
         .port();
 
     let run = |file: &std::path::Path| {
-        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        support::binary()
             .args(["path-notes", "--port", &port.to_string(), "--repo-root"])
             .arg(&checkout)
             .arg("--file")
@@ -600,11 +645,14 @@ fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// A daemon that refuses the token is "could not ask", not "no notes": the
-/// command exits non-zero so the hook asks again. Catches the status check
-/// being dropped, which would report a 401 body as an empty list.
+/// A daemon that does not hold this config's token (another user's, or one
+/// started from another config) is "could not ask", not "no notes": the
+/// command exits non-zero so the hook asks again, and the token is not sent.
+/// Catches the challenge being skipped, which sent the token to whichever
+/// daemon answered `/health`.
 #[test]
-fn path_notes_reports_a_refused_token() -> Result<(), Box<dyn std::error::Error>> {
+fn path_notes_refuses_a_daemon_that_does_not_hold_the_token()
+-> Result<(), Box<dyn std::error::Error>> {
     let daemon = HttpDaemon::spawn()?;
     let elsewhere = tempfile::tempdir()?;
     std::fs::write(
@@ -618,7 +666,7 @@ fn path_notes_reports_a_refused_token() -> Result<(), Box<dyn std::error::Error>
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["path-notes", "--port", port, "--repo-root"])
         .arg(&checkout)
         .arg("--file")
@@ -631,7 +679,11 @@ fn path_notes_reports_a_refused_token() -> Result<(), Box<dyn std::error::Error>
         .output()?;
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not prove it holds this user's daemon token"),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -664,7 +716,7 @@ fn path_notes_does_not_send_the_token_to_a_foreign_listener()
         }
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["path-notes", "--port", &port.to_string(), "--repo-root"])
         .arg(&checkout)
         .arg("--file")
@@ -676,12 +728,119 @@ fn path_notes_does_not_send_the_token_to_a_foreign_listener()
     assert!(output.stdout.is_empty());
     let seen = seen.lock().map_err(|_| "recorder poisoned")?.clone();
     assert!(
-        seen.contains("GET /health"),
-        "the listener was never asked: {seen}"
+        seen.contains("GET /token-proof?nonce="),
+        "the listener was never challenged: {seen}"
     );
     assert!(
         !seen.contains(TOKEN),
         "the token reached a foreign listener"
+    );
+    Ok(())
+}
+
+/// A second `serve` whose port is taken exits 0 only when the daemon there
+/// proves it holds the same token, and fails otherwise. It used to exit 0 for
+/// any daemon that answered `/health`, so on a shared host this user's service
+/// stopped while its clients sent their token to another user's daemon.
+#[test]
+fn serve_on_a_taken_port_exits_0_only_for_a_daemon_with_its_token()
+-> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let port = daemon
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("daemon url has no port")?
+        .to_owned();
+    let config_path = daemon.dir.path().join("hippius-mem.toml");
+    let other_token = daemon.dir.path().join("other-token");
+    std::fs::write(&other_token, "ffffffffffffffffffffffffffffffff\n")?;
+
+    let second_serve = |token_path: &std::path::Path| {
+        support::binary()
+            .args(["serve", "--port", &port, "--token-file"])
+            .arg(token_path)
+            .current_dir(daemon.dir.path())
+            .env("HOME", daemon.dir.path())
+            .env("XDG_DATA_HOME", daemon.dir.path().join("data"))
+            .env("HIPPIUS_MEM_CONFIG", &config_path)
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .output()
+    };
+
+    let same = second_serve(&daemon.dir.path().join("mcp-token"))?;
+    assert!(
+        same.status.success(),
+        "{}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+    let other = second_serve(&other_token)?;
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert!(!other.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("does not prove it holds this user's token"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A `serve` started while the previous daemon is still releasing the port
+/// waits for it and takes the port. Catches a serve that probes the occupant
+/// at once: the dying occupant proves no token, so that serve fails, and the
+/// user service it runs under starts no daemon on a restart.
+#[test]
+fn serve_takes_a_port_its_previous_occupant_releases() -> Result<(), Box<dyn std::error::Error>> {
+    let occupant = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = occupant.local_addr()?.port();
+    // Held past `serve`'s first bind and released inside its retry window
+    // (eight binds 150 ms apart, about 1 s). A binary slower than 600 ms to
+    // its first bind finds the port free and passes without retrying.
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(600));
+        drop(occupant);
+    });
+
+    let daemon = HttpDaemon::spawn_on_port(port)?;
+    releaser
+        .join()
+        .map_err(|_| "the releasing thread panicked")?;
+    assert_eq!(daemon.url, format!("http://127.0.0.1:{port}/mcp"));
+    Ok(())
+}
+
+/// A port `serve` may not bind at all fails at once with the bind error, not
+/// after the retries meant for a port another process is releasing, and not
+/// as "held by a process that does not prove it holds this user's token".
+/// Skipped where this user may bind port 1 (root, or a lowered
+/// `ip_unprivileged_port_start`).
+#[test]
+fn serve_reports_a_port_it_may_not_bind() -> Result<(), Box<dyn std::error::Error>> {
+    match std::net::TcpListener::bind("127.0.0.1:1") {
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
+        _ => return Ok(()),
+    }
+    let dir = tempfile::tempdir()?;
+    let token_path = dir.path().join("mcp-token");
+    std::fs::write(&token_path, format!("{TOKEN}\n"))?;
+
+    let output = support::binary()
+        .args(["serve", "--port", "1", "--token-file"])
+        .arg(&token_path)
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("HIPPIUS_MEM_CONFIG", dir.path().join("hippius-mem.toml"))
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("failed to bind loopback MCP port 1") && !stderr.contains("does not prove"),
+        "{stderr}"
     );
     Ok(())
 }
@@ -698,6 +857,146 @@ fn path_notes_route_rejects_a_missing_bearer_token() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// `serve` anchors the ops it buffered below the batch threshold when it gets
+/// SIGTERM, the signal a supervisor stops it with, and then exits. Its buffer
+/// lived only in memory, so the daemon's last writes were never anchored.
+#[cfg(unix)]
+#[test]
+fn serve_anchors_its_last_writes_on_sigterm() -> Result<(), Box<dyn std::error::Error>> {
+    let mut daemon = HttpDaemon::spawn()?;
+    let session = handshake(&daemon)?;
+    let (_, remembered) = daemon.rpc(
+        Some(&session),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remember",
+                "arguments": {
+                    "note_type": "gotcha",
+                    "repo": "global",
+                    "summary": "heron-http anchors at stop",
+                    "body": "body"
+                }
+            }
+        }),
+    )?;
+    assert_ne!(
+        remembered["result"]["isError"].as_bool(),
+        Some(true),
+        "{remembered}"
+    );
+
+    let pid = daemon.child.0.id().to_string();
+    let killed = Command::new("kill").args(["-TERM", &pid]).status()?;
+    assert!(killed.success(), "kill -TERM failed");
+    let status = wait_or_kill(&mut daemon.child.0, "serve after SIGTERM")?;
+    assert!(status.success(), "serve exits cleanly on SIGTERM: {status}");
+
+    let anchors = daemon
+        .dir
+        .path()
+        .join("vault")
+        .join("trial")
+        .join("_anchors");
+    let mut records = 0;
+    for entry in std::fs::read_dir(&anchors).into_iter().flatten().flatten() {
+        records += std::fs::read_dir(entry.path()).map_or(0, Iterator::count);
+    }
+    assert_eq!(records, 1, "one batch record under {}", anchors.display());
+    Ok(())
+}
+
+/// A signal during `serve`'s exit flush ends the flush. Here the flush cannot
+/// finish: the test holds the daemon's cross-process writer lock, which the
+/// anchor record's write waits for. `serve` used to await the flush with no
+/// signal arm, so a stop waited the flush out, which has no bound when the
+/// store anchors on chain.
+#[cfg(unix)]
+#[test]
+fn a_signal_during_serves_exit_flush_ends_it() -> Result<(), Box<dyn std::error::Error>> {
+    let mut daemon = HttpDaemon::spawn()?;
+    let session = handshake(&daemon)?;
+    let (_, remembered) = daemon.rpc(
+        Some(&session),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remember",
+                "arguments": {
+                    "note_type": "gotcha",
+                    "repo": "global",
+                    "summary": "heron-http flush meets a held lock",
+                    "body": "body"
+                }
+            }
+        }),
+    )?;
+    assert_ne!(
+        remembered["result"]["isError"].as_bool(),
+        Some(true),
+        "{remembered}"
+    );
+    let lock = std::fs::OpenOptions::new().read(true).write(true).open(
+        daemon
+            .dir
+            .path()
+            .join("state/hippius-mem/state/trial/writer.lock"),
+    )?;
+    lock.try_lock()?;
+
+    // The first signal ends the session. Which later one lands inside the
+    // flush is not observable from here, so one is sent every 100 ms until
+    // the process exits; the flush's own bound is 4 s.
+    let pid = daemon.child.0.id().to_string();
+    let status = loop {
+        let killed = Command::new("kill").args(["-TERM", &pid]).status()?;
+        assert!(killed.success(), "kill -TERM failed");
+        thread::sleep(Duration::from_millis(100));
+        if let Some(status) = daemon.child.0.try_wait()? {
+            break status;
+        }
+    };
+    drop(lock);
+
+    assert!(status.success(), "serve exits cleanly: {status}");
+    let stderr = daemon
+        .stderr
+        .buf
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(
+        stderr.contains("stopped anchoring the session's last ops at exit on a signal"),
+        "the signal ended the flush: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not finish before exit"),
+        "the flush did not run to its time bound: {stderr}"
+    );
+    Ok(())
+}
+
+/// The real daemon answers the token challenge `install` sends with the proof
+/// for its own token, unauthenticated, so a client can check whose daemon holds
+/// the shared port without sending its token.
+#[test]
+fn the_daemon_answers_the_token_challenge_with_its_own_proof()
+-> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let url = daemon.url.replace("/mcp", "/token-proof?nonce=n0nce");
+    let body = reqwest::blocking::Client::new().get(url).send()?.text()?;
+    assert_eq!(body, hippius_mem_core::token_proof(&daemon.token, "n0nce"));
+    assert_ne!(
+        body,
+        hippius_mem_core::token_proof("another-token", "n0nce")
+    );
+    Ok(())
+}
+
 /// Run `hippius-mem <args>` against `daemon`, from a directory with no git
 /// remote, so `--repo` is exactly what the test passes.
 fn cli(
@@ -709,7 +1008,7 @@ fn cli(
         .strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
-    Ok(Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    Ok(support::binary()
         .args(args)
         .args(["--port", port])
         .current_dir(daemon.dir.path())
@@ -844,7 +1143,7 @@ fn a_saved_history_verifies_offline_until_it_is_tampered_with()
     std::fs::write(&saved, &history.stdout)?;
 
     let verify = |path: &std::path::Path| {
-        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        support::binary()
             .arg("verify-history")
             .arg(path)
             // No config and an empty home: the check reads only its input.
@@ -889,7 +1188,7 @@ fn cli_with_stdin(
         .strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.split('/').next())
         .ok_or("daemon url has no port")?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let mut child = support::binary()
         .args(args)
         .args(["--port", port])
         .current_dir(cwd)
@@ -986,7 +1285,7 @@ fn the_cli_says_so_when_there_is_no_daemon() -> Result<(), Box<dyn std::error::E
     let port = std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
         .port();
-    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+    let output = support::binary()
         .args(["recall", "anything", "--port", &port.to_string()])
         .current_dir(dir.path())
         .env("HIPPIUS_MEM_CONFIG", dir.path().join("hippius-mem.toml"))
