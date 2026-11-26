@@ -689,6 +689,44 @@ fn a_session_anchors_its_writes_when_the_client_closes_stdin()
     Ok(())
 }
 
+/// SIGTERM or SIGINT ends a stdio session whose client keeps stdin open: the
+/// server anchors the session's writes and exits. It used to anchor and then
+/// keep running until stdin closed, ignoring every further signal.
+#[cfg(unix)]
+#[test]
+fn a_signal_ends_a_session_whose_stdin_stays_open() -> Result<(), Box<dyn std::error::Error>> {
+    for signal in ["-TERM", "-INT"] {
+        let mut session = StdioSession::spawn()?;
+        session.call_tool(
+            3,
+            "remember",
+            &json!({ "note_type": "gotcha", "summary": "heron lock order", "body": "body", "repo": "global" }),
+        )?;
+        let killed = Command::new("kill")
+            .args([signal, &session.child.0.id().to_string()])
+            .status()?;
+        assert!(killed.success(), "kill {signal}");
+        let status = wait_or_kill(&mut session.child.0, &format!("the server after {signal}"))?;
+        assert!(
+            status.success(),
+            "{signal}: the server exits cleanly: {status}"
+        );
+
+        let anchors = session
+            .dir
+            .path()
+            .join("vault")
+            .join("trial")
+            .join("_anchors");
+        assert_eq!(
+            walk_files(&anchors).len(),
+            1,
+            "{signal}: the exit flush anchored the write"
+        );
+    }
+    Ok(())
+}
+
 /// Every regular file under `dir`, recursively; empty when it does not exist.
 fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {

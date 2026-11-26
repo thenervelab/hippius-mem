@@ -296,14 +296,36 @@ async fn main() -> anyhow::Result<()> {
     // session. Either way, anchor the ops still buffered below the batch
     // threshold: they live only in this process, and nothing else anchors them
     // until a later session's own exit picks them up. A SIGKILL skips this.
-    tokio::select! {
+    let signalled = tokio::select! {
         waited = service.waiting() => {
             waited?;
+            false
         }
-        () = terminated() => {}
-    }
+        () = terminated() => true,
+    };
     flush_until_signal(&runtime.server).await;
+    if signalled {
+        exit_after_signal();
+    }
     Ok(())
+}
+
+/// End the process after a signal ended the stdio session and its exit flush
+/// ran.
+///
+/// Returning from `main` would not end it: dropping the Tokio runtime waits for
+/// every blocking task, and the stdio transport reads stdin on one that returns
+/// only when the client closes stdin. The handlers [`terminated`] installed
+/// replace the signal's default action, so a second signal does nothing
+/// either. Nothing is left to run: the session's last ops are anchored, the
+/// transport stopped serving when the signal arrived, and the writer lock is
+/// a file lock the kernel releases on exit.
+#[expect(
+    clippy::exit,
+    reason = "the runtime cannot shut down while stdin is open; see the doc comment"
+)]
+fn exit_after_signal() -> ! {
+    std::process::exit(0)
 }
 
 /// Run [`MemoryServer::flush_on_exit`] until it ends or the process receives
