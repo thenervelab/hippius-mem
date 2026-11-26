@@ -467,7 +467,11 @@ SIGTERM or Ctrl-C), it is sealed into a Merkle root and committed, with the
 batch record (root + leaves + receipt) persisted to the bucket so any teammate can
 build inclusion proofs. The buffer is in memory: a session killed with SIGKILL, or
 that crashes, leaves its last ops unanchored until a later session of the same author
-ends and anchors every op of that author no own batch record covers. Anchoring is local by default, or on-chain with the `chain`
+ends and anchors that author's ops above the newest Lamport value its own batch records
+cover. An op below that value is never anchored: when a second session of the same author
+runs at the same time and persists a batch first, its record raises the value past the
+killed session's buffered ops. Those ops stay in the op-log, so no note is lost, but
+`reconcile` has no anchor to report them missing against. Anchoring is local by default, or on-chain with the `chain`
 feature, and it is best-effort: the op is already durable in the log, so a failed
 anchor is retried on the next batch, never surfaced as a write error.
 
