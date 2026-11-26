@@ -2195,7 +2195,9 @@ mod tests {
         .await?;
 
         let store = epoch0_store(&bucket)?;
-        bootstrap_epochs(&store, MNEMONIC, 1).await;
+        // `max_epoch` 0: the fallback range stops at epoch 0, so epoch 1 comes
+        // only from the listing of this member's wraps.
+        bootstrap_epochs(&store, MNEMONIC, 0).await;
         assert_eq!(
             store.current_epoch(),
             1,
