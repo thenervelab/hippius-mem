@@ -1135,13 +1135,16 @@ pub struct MemoryStore {
     // `append_under_serialization` itself, may ever run inside a
     // `select!`/`timeout` that can drop its future — a cancelled call would
     // skip the reclaim arm and silently reintroduce the fork this
-    // guard-ordering exists to prevent. No caller does that today: the
-    // `tokio::time::timeout` wrappers that exist (the binary's exit flush and
-    // a test in `store/mod.rs`, both over `flush_anchors`, and a test in
-    // `server.rs` over `logic_forget`) never reach
-    // `mint_and_append`/`commit_edit`: `flush_anchors` is the anchor-commit
-    // path, not the op-log write path, and `logic_forget` blocks at
-    // `await_warm` before the store. Keep it that way.
+    // guard-ordering exists to prevent. One production caller can: the
+    // binary's exit flush waits, under its time bound or until a signal, for
+    // the `reinforce_use` appends the MCP server started in the background,
+    // and drops one still running when the wait ends (see
+    // `append_under_serialization`'s docs for the accepted cost). The other
+    // `tokio::time::timeout` wrappers that exist (a test in `store/mod.rs`
+    // over `flush_anchors`, and a test in `server.rs` over `logic_forget`)
+    // never reach `mint_and_append`/`commit_edit`: `flush_anchors` is the
+    // anchor-commit path, not the op-log write path, and `logic_forget`
+    // blocks at `await_warm` before the store. Add no other caller.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -3083,10 +3086,17 @@ impl MemoryStore {
     /// landing durably and the reclaim below completing skips the reclaim and
     /// reintroduces the self-fork it exists to prevent. (With the lock, a
     /// dropped future is the same as a killed process: the pending record lets
-    /// the next writer complete the op.) No production caller does this today;
-    /// see the `writer` field's own doc comment for the two harmless test-only
-    /// `tokio::time::timeout` wrappers elsewhere in this crate, neither of which
-    /// reaches this function.
+    /// the next writer complete the op.) One production caller can drop it:
+    /// the MCP server's exit flush waits for the [`reinforce_use`]
+    /// appends it started in the background, under its exit time bound or
+    /// until a signal, and drops one still running when that wait ends (a
+    /// runtime shutdown drops such a task the same way). That costs at most
+    /// the self-fork above for a session with no cross-process lock, in a
+    /// flush that already ran out of time. See the `writer` field's doc
+    /// comment for the test-only `tokio::time::timeout` wrappers, neither of
+    /// which reaches this function.
+    ///
+    /// [`reinforce_use`]: Self::reinforce_use
     ///
     /// # Errors
     ///

@@ -9,8 +9,8 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use hippius_mem_core::{
@@ -28,6 +28,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 /// Why [`MemoryServer::call_plain`] returned no result.
 #[derive(Debug, thiserror::Error)]
@@ -734,6 +735,15 @@ pub struct MemoryServer {
     /// per connection, and the syncs being deduplicated all target the one
     /// shared [`MemoryStore`].
     refresh_in_flight: Arc<AtomicBool>,
+    /// The `Reinforce` appends [`reinforce_in_background`] started, which
+    /// [`flush_on_exit`] waits for before the runtime shuts down and drops
+    /// them mid-append. Shared (`Arc`) across per-connection clones, like
+    /// `refresh_in_flight`. Finished tasks are reaped at each spawn, so the set
+    /// holds only the ones still running.
+    ///
+    /// [`reinforce_in_background`]: Self::reinforce_in_background
+    /// [`flush_on_exit`]: Self::flush_on_exit
+    reinforcing: Arc<std::sync::Mutex<JoinSet<()>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -761,6 +771,7 @@ impl MemoryServer {
             provisioning_nudge: None,
             shared_http: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            reinforcing: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -785,6 +796,7 @@ impl MemoryServer {
             provisioning_nudge: None,
             shared_http: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            reinforcing: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -1041,26 +1053,47 @@ impl MemoryServer {
             return;
         }
         let store = Arc::clone(&self.store);
-        // Detached: reinforcement is a best-effort ranking signal that logs its
-        // own failure; nothing waits for it, and a session that exits first
-        // loses one `Reinforce` op, which the next qualifying read re-emits.
-        drop(tokio::spawn(async move { store.reinforce_use(id).await }));
+        let mut reinforcing = self
+            .reinforcing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while reinforcing.try_join_next().is_some() {}
+        reinforcing.spawn(async move { store.reinforce_use(id).await });
+    }
+
+    /// Wait for the reinforcements still running. A task that panicked is
+    /// passed over: `reinforce_use` logs its own failures, and a lost
+    /// `Reinforce` op is re-emitted by the next qualifying read.
+    async fn finish_reinforcing(&self) {
+        let mut running = std::mem::take(
+            &mut *self
+                .reinforcing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        while running.join_next().await.is_some() {}
     }
 
     /// Anchor what this session buffered below the batch threshold, and this
     /// author's ops an earlier session left unanchored, when the session ends.
     ///
     /// Skipped for a read-only session, which writes nothing to the bucket.
-    /// Best-effort and bounded by [`EXIT_FLUSH_TIMEOUT`] unless the store
-    /// anchors on chain (see [`MemoryStore::anchors_on_chain`]), where the
-    /// caller decides when to stop waiting: a failure or a flush that runs
-    /// out of time is logged, since every op stays in the op-log either way
-    /// and the next session's flush queues what this one left.
+    /// Waits first for the `Reinforce` appends reads started in the
+    /// background, so their ops are anchored too and the runtime's shutdown
+    /// does not drop them mid-append. Best-effort and bounded by
+    /// [`EXIT_FLUSH_TIMEOUT`] (both steps together) unless the store anchors
+    /// on chain (see [`MemoryStore::anchors_on_chain`]), where the caller
+    /// decides when to stop waiting: a failure or a flush that runs out of
+    /// time is logged, since every op stays in the op-log either way and the
+    /// next session's flush queues what this one left.
     pub async fn flush_on_exit(&self) {
         if !self.holds_write_role() {
             return;
         }
-        let flush = self.store.flush_anchors();
+        let flush = async {
+            self.finish_reinforcing().await;
+            self.store.flush_anchors().await
+        };
         let bounded = if self.store.anchors_on_chain() {
             Ok(flush.await)
         } else {
@@ -2112,6 +2145,46 @@ mod tests {
             started.elapsed() >= super::EXIT_FLUSH_TIMEOUT,
             "the flush never reached the stalled anchor"
         );
+    }
+
+    /// The exit flush waits for the `Reinforce` append a `get` started in the
+    /// background, so that op is in the batch the flush anchors. The append
+    /// used to run detached: the flush could anchor without it, and the
+    /// runtime's shutdown after the flush dropped it mid-append.
+    #[tokio::test]
+    async fn the_exit_flush_waits_for_a_reads_reinforcement() {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let anchor = Arc::new(RecordingAnchor::new());
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            index,
+            OpLogStore::new(blob),
+            Arc::clone(&anchor) as Arc<dyn AuditAnchor>,
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        );
+        let server = MemoryServer::new(Arc::new(store));
+        let id = server.logic_remember(sample_remember()).await.unwrap().id;
+        server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets table".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+        server.logic_get(super::GetParams { id }).await.unwrap();
+
+        server.flush_on_exit().await;
+
+        let batches = anchor.anchored();
+        assert_eq!(batches.len(), 1, "{batches:?}");
+        assert_eq!(batches[0].1.op_count, 2, "the remember and the reinforce");
     }
 
     fn sample_remember() -> RememberParams {
