@@ -8187,44 +8187,20 @@ impl MemoryStore {
         // The founder generated this key, so it is the one place a new epoch's
         // check can be published without trusting anyone's judgment. Best
         // effort: the rotation is already durable, and `admin keycheck publish`
-        // covers a failure here.
-        let key_check = match self
+        // covers a failure here. The outcome is returned, not warned here, so
+        // the caller tells the operator once.
+        let key_check = self
             .publish_team_key_check(new_epoch, PublishKeyCheck::IfAbsent)
             .await
-        {
-            Ok(found @ KeyCheckPublished::Refused) => {
-                tracing::warn!(
-                    team = %self.team,
-                    new_epoch,
-                    "a key check for the new epoch already exists and is not this key's; run \
-                     `hippius-mem admin keycheck publish --replace` from this machine"
-                );
-                Some(found)
-            }
-            Ok(found @ KeyCheckPublished::KeyFailsOnNotes) => {
-                tracing::warn!(
-                    team = %self.team,
-                    new_epoch,
-                    "no team-key check was published for the new epoch: this machine's new \
-                     key opens fewer than half of that epoch's oldest notes it tried (a \
-                     prior mint at this epoch, whose ring this machine did not hold); run \
-                     `hippius-mem doctor`, or `hippius-mem admin keycheck publish` from a \
-                     machine whose key opens those notes"
-                );
-                Some(found)
-            }
-            Ok(found) => Some(found),
-            Err(err) => {
-                tracing::warn!(
+            .inspect_err(|err| {
+                tracing::debug!(
                     team = %self.team,
                     new_epoch,
                     error = %err,
-                    "could not publish the new epoch's team-key check; run `hippius-mem admin \
-                     keycheck publish` from this machine"
+                    "could not publish the new epoch's team-key check"
                 );
-                None
-            }
-        };
+            })
+            .ok();
 
         Ok(RotationOutcome {
             new_epoch,
