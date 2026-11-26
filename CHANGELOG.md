@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-27
+
+A patch release of fixes to key rotation, provisioning and team administration.
+It adds one bucket object, `{team}/_keyshares/{epoch:020}/{member}`, which only
+the new `admin share-epoch-keys` writes; clients before 0.8.1 never read it.
+Nothing else in the storage format changes.
+
+### Upgrade notes
+
+- **Upgrade every machine, the founder's first.** A 0.8.0 `provision` run by a
+  member still replaces the founder's wraps. Until every machine runs 0.8.1, do
+  not run `provision` anywhere but on the founder's machine.
+- **`rotate` and `remove` require `HIPPIUS_MEM_MNEMONIC`** and refuse before
+  writing anything without it. When the founder has not run `join`, they
+  publish the founder's member key first and say so on stdout, so every new
+  epoch is wrapped to the founder.
+- **Run `provision` once on the founder's machine after upgrading**, with
+  `HIPPIUS_MEM_MNEMONIC` set. It now wraps every epoch the founder holds, so a
+  member who joined after a rotation receives the epochs in between, and it
+  replaces any wrap no reader accepts (for example one a member's 0.8.0
+  `provision` wrote) for the epochs the founder holds.
+- **A founder locked out of an epoch by 0.8.0** (it ran `rotate` or `remove`
+  before `join`) is named by `doctor` on the founder's machine. To repair it:
+  `join` on the founder's machine, `admin share-epoch-keys` on a member's
+  machine that holds the epoch, then `provision` on the founder's machine. An
+  epoch whose every founder-signed wrap a member's 0.8.0 `provision` replaced
+  cannot be repaired: no wrap the founder signed holds its key any more. See
+  docs/TEAMS.md, "Repair an epoch the founder cannot read".
+- **`provision` never replaces a wrap a reader accepts.** A member who
+  re-joined with another mnemonic keeps the wrap to the old key until the next
+  `rotate`.
+- **Team commands follow the git remote.** On a config with `[[teams]]`
+  profiles, run `join`, `provision`, `publish-membership`, `members`, `rotate`,
+  `remove`, `recover` and the `admin` commands from a checkout of the team's
+  repository, as `doctor` already asked. `invite` still uses the primary
+  profile.
+- Each `remember` and `edit` lists `{team}/_keys/` once before it seals the
+  note, where 0.8.0 kept the answer for a minute; a failed listing fails the
+  write.
+- `get` of a note sealed under an epoch this process holds no key for fails
+  with "no team key for epoch N" instead of "not found", and `recall` and
+  `refresh` carry a `keyless_notes` warning.
+- A summary containing U+2028 or U+2029 is refused. Stored notes are not
+  changed.
+
+### Added
+
+- `hippius-mem admin share-epoch-keys`: a member gives the founder what it
+  needs to load an epoch key it holds no wrap of. The founder's next
+  `provision` opens its own founder-signed wrap with it, so no member is
+  trusted for the key itself.
+- `recall`, `get`, `remember`, `call` and `path-notes` take `--token-file
+  <path>`, like `serve`.
+- `doctor` warns once per epoch whose notes this machine holds no key for, with
+  the fix, and, while the team is still at epoch 0, for every member an earlier
+  manifest listed and the live one does not.
+- The `keyless_notes` warning code on `recall` and `refresh`.
+
+### Fixed
+
+- A member's `provision` replaced the founder's wraps with ones no reader
+  accepts, which stranded every note sealed under a rotated epoch, left
+  `doctor` passing, and sent new writes back to the founding epoch. Only the
+  founder or the recovery key may provision now, and no provisioning write
+  replaces a wrap a reader accepts, on a gateway that ignores create-only
+  writes too.
+- `rotate` and `remove` by a founder that never ran `join` minted an epoch the
+  founder could never read, said so only on stderr, and `doctor` prescribed a
+  fix that could not work. A rotation now refuses before writing when no wrap
+  would reach the founder, and `doctor` names the repair above.
+- `provision` wrapped only the current epoch.
+- A session that wrote within the last minute sealed its next notes under the
+  epoch a just-removed member holds, even after `refresh`.
+- The stdio server stayed alive after SIGTERM or SIGINT until its client closed
+  stdin. It now exits after anchoring the session's last ops.
+- `remove` ended with a banner about "the rotation above" when it had not
+  rotated, and `doctor` passed a team whose roster shrank while it stayed at
+  epoch 0.
+- `join --bundle` refused a rotated team's bundle when the config's top-level
+  `max_epoch` was lower; that value is only a fallback now.
+- The recall gate hook failed open for a session wired to the HTTP daemon by
+  `url` when the binary was not on its PATH.
+- `upgrade` published no team-key check.
+- The comment above summary validation claimed more than the check did.
+
 ## [0.8.0] - 2026-11-24
 
 A minor release: it adds a bucket object (`{team}/_keycheck/{epoch}`), a local

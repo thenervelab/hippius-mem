@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "hippius-mem"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3513,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "hippius-mem-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "alloy-signer",
  "alloy-signer-local",
