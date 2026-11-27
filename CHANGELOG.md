@@ -93,6 +93,10 @@ Nothing else in the storage format changes.
   `max_epoch` was lower; that value is only a fallback now.
 - The recall gate hook failed open for a session wired to the HTTP daemon by
   `url` when the binary was not on its PATH.
+- A note edited under an epoch the process holds no key for, or whose newest
+  version fails its integrity check, was still served in its older version by
+  `recall` and `get`. It is now left out and reported, like any note this
+  process cannot read.
 - `upgrade` published no team-key check.
 - The comment above summary validation claimed more than the check did.
 

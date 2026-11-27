@@ -1293,15 +1293,16 @@ pub struct MemoryStore {
     // Notes the last decode of each left out of the index because their
     // ciphertext failed its integrity check or did not decrypt, with the reason.
     // Kept so `get` reports an integrity failure for them instead of "not found";
-    // an entry is removed when the note later decodes.
+    // an entry is removed when the note is indexed or is no longer live
+    // (`settle_unreadable`).
     undecodable: Mutex<BTreeMap<NoteId, IntegrityFailure>>,
     // Notes a decode left out of the index because this process holds no key
     // for their epoch (a rotation it did not load, or an epoch from before it
     // joined). While any is here the index is incomplete, so no checkpoint is
-    // written from it. An entry is removed when the note later decodes; one
-    // whose note is forgotten first stays until the process exits, which only
-    // costs this process its checkpoint writes. Each note maps to the epoch it
-    // is sealed under, so `get` and the tool warnings can name it.
+    // written from it. An entry is removed when the note is indexed or is no
+    // longer live (`settle_unreadable`), never on a failed read. Each note
+    // maps to the epoch it is sealed under, so `get` and the tool warnings can
+    // name it.
     keyless: Mutex<BTreeMap<NoteId, u64>>,
 }
 
@@ -6985,6 +6986,8 @@ impl MemoryStore {
         // through: an entry stays true after its note dies, so when this runs
         // does not matter, only that every path prunes.
         self.decoded.retain(live_ids);
+        let unreadable = self.settle_unreadable(live_ids, &records);
+        let readable: BTreeSet<NoteId> = live_ids.difference(&unreadable).copied().collect();
         let filled = self.attach_embeddings(&mut records, from_checkpoint)?;
         let indexed = records.len();
         let clock = self.writer.lock().await;
@@ -7000,7 +7003,7 @@ impl MemoryStore {
         }
         match apply {
             IndexApply::Authoritative(_) => {
-                self.index.retain(live_ids, baseline_lamport)?;
+                self.index.retain(&readable, baseline_lamport)?;
                 self.index.replace_batch(records)?;
                 // `replace_batch` has no rollback gate, so every filled vector
                 // is now the indexed one. The gated installs below may keep an
@@ -7009,16 +7012,48 @@ impl MemoryStore {
                 ledger.restored.retain(|note_id| !filled.contains(note_id));
             }
             IndexApply::Monotonic => {
-                self.index.retain(live_ids, baseline_lamport)?;
+                self.index.retain(&readable, baseline_lamport)?;
                 self.index.upsert_batch(records)?;
             }
             IndexApply::Lagging { my_view_tip } => {
-                let keep = self.with_own_unseen(live_ids, my_view_tip)?;
+                let keep = self.with_own_unseen(&readable, my_view_tip)?;
                 self.index.retain(&keep, baseline_lamport)?;
                 self.index.upsert_batch(records)?;
             }
         }
         Ok(Some(indexed))
+    }
+
+    /// Bring `keyless` and `undecodable` in line with a sync's outcome, and
+    /// return the live notes this process cannot index: those whose current
+    /// version failed to decode for a missing key or an integrity failure.
+    ///
+    /// An entry for a note that is no longer live (forgotten, redacted, its
+    /// author removed) is dropped, and so is one for a note `records` indexes
+    /// now (decoded, or restored from a checkpoint). The returned notes are
+    /// pruned from the index too: an older version of a note edited under an
+    /// epoch this process lacks would otherwise stay indexed, since the note is
+    /// still live, and be served in place of the edit.
+    fn settle_unreadable(
+        &self,
+        live_ids: &BTreeSet<NoteId>,
+        records: &[IndexRecord],
+    ) -> BTreeSet<NoteId> {
+        let indexed: BTreeSet<NoteId> = records.iter().map(|record| record.note_id).collect();
+        let current = |note_id: &NoteId| live_ids.contains(note_id) && !indexed.contains(note_id);
+
+        let mut keyless = self.keyless.lock().unwrap_or_else(PoisonError::into_inner);
+        keyless.retain(|note_id, _| current(note_id));
+        let mut unreadable: BTreeSet<NoteId> = keyless.keys().copied().collect();
+        drop(keyless);
+
+        let mut undecodable = self
+            .undecodable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        undecodable.retain(|note_id, _| current(note_id));
+        unreadable.extend(undecodable.keys().copied());
+        unreadable
     }
 
     /// `live_ids` plus every note this author has indexed above `my_view_tip`:
@@ -7610,10 +7645,16 @@ impl MemoryStore {
     fn record_decode_outcome(&self, note_id: NoteId, decoded: &Result<IndexRecord, MemError>) {
         {
             let mut keyless = self.keyless.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Err(MemError::KeyUnavailable { epoch }) = decoded {
-                keyless.insert(note_id, *epoch);
-            } else {
-                keyless.remove(&note_id);
+            match decoded {
+                Err(MemError::KeyUnavailable { epoch }) => {
+                    keyless.insert(note_id, *epoch);
+                }
+                // A failed read says nothing about the key, and the note is
+                // still not indexed, so a keyless note stays keyless.
+                Err(MemError::Storage(_) | MemError::BlobTooLarge { .. }) => {}
+                Ok(_) | Err(_) => {
+                    keyless.remove(&note_id);
+                }
             }
         }
         let mut undecodable = self
@@ -11302,6 +11343,114 @@ mod tests {
         assert!(
             matches!(unknown, Err(MemError::NotFound { .. })),
             "{unknown:?}"
+        );
+        Ok(())
+    }
+
+    /// A note edited under an epoch this process lacks is no longer served in
+    /// its older version, and a keyless note that is then forgotten reads as
+    /// not found and leaves the warning. The older version used to stay in the
+    /// index (it was still live), so `get` and `recall` served superseded text
+    /// while `keyless_notes` counted the same note; and a forgotten note stayed
+    /// keyless for the life of the process, which also stopped its checkpoints.
+    #[tokio::test]
+    async fn keyless_notes_follow_the_live_set() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .join_as_member(&crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+        let note = founder.remember(numbered_input(1)).await?;
+        let lagging = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        lagging.sync().await?;
+        assert_eq!(lagging.get(note).await?.summary, "numbered note 1");
+
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        founder.edit(note, numbered_input(2)).await?;
+        lagging.sync().await?;
+        let refused = lagging.get(note).await;
+        assert!(
+            matches!(refused, Err(MemError::KeyUnavailable { epoch: 1 })),
+            "the superseded version is not served: {refused:?}"
+        );
+        assert!(lagging.list_records()?.is_empty());
+        assert_eq!(lagging.keyless_notes(), BTreeMap::from([(1, 1)]));
+
+        founder.forget(note).await?;
+        lagging.sync().await?;
+        let gone = lagging.get(note).await;
+        assert!(matches!(gone, Err(MemError::NotFound { .. })), "{gone:?}");
+        assert!(lagging.keyless_notes().is_empty());
+        Ok(())
+    }
+
+    /// A bucket whose note blobs (keys with no `/_`-prefixed segment) fail to
+    /// read while `failing` is set.
+    struct FlakyNoteBlob {
+        inner: MemoryBlobStore,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FlakyNoteBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.inner.put_if_absent(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if !key.contains("/_") && self.failing.load(Ordering::SeqCst) {
+                return Err(MemError::Storage("the gateway is down".to_owned()));
+            }
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A note blob that fails to read leaves a keyless note keyless, even once
+    /// the key has arrived: the note is still not indexed. It used to be
+    /// dropped from the map, so `get` said "not found", which invites an agent
+    /// to write the note again, until a later sync read the blob.
+    #[tokio::test]
+    async fn a_failed_read_keeps_a_note_keyless() -> TestResult {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let flaky = Arc::new(FlakyNoteBlob {
+            inner: MemoryBlobStore::default(),
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&flaky) as Arc<dyn BlobStore>;
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .join_as_member(&crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        let note = founder.remember(numbered_input(1)).await?;
+        let lagging = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        lagging.sync().await?;
+        assert_eq!(lagging.keyless_notes(), BTreeMap::from([(1, 1)]));
+
+        // The key arrives, and the edit puts the note in the next sync's tail,
+        // so that sync reads its blob again, and the read fails.
+        lagging.add_epoch_key(1, founder.key_for_epoch(1)?);
+        founder.edit(note, numbered_input(2)).await?;
+        flaky.failing.store(true, Ordering::SeqCst);
+        lagging.sync().await?;
+        assert_eq!(lagging.keyless_notes(), BTreeMap::from([(1, 1)]));
+        let refused = lagging.get(note).await;
+        assert!(
+            matches!(refused, Err(MemError::KeyUnavailable { epoch: 1 })),
+            "{refused:?}"
         );
         Ok(())
     }
