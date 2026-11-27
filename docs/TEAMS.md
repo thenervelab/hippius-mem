@@ -300,7 +300,12 @@ the shrunk membership already landed; the error says so and names `hippius-mem r
   key was never rotated" for every member an earlier manifest listed: the founding key
   reaches invite-bundle members as `team_key_hex`, not as a wrap, so the first check
   cannot see them. A rotated epoch's key travels only in wraps, so the first check covers
-  every later epoch. Run `hippius-mem rotate` to clear either warning.
+  every later epoch. Run `hippius-mem rotate` to clear either warning. Both checks read
+  the bucket: the wraps, and the manifests the live founder key signed (not those of a
+  founder key replaced by `recover`). A removed member whose sub-token is not yet revoked
+  can delete those objects and silence them, so rotate after every removal rather than
+  wait for `doctor`. When the manifest history cannot be read, `doctor` says the second
+  check did not run.
 - The closing banner says whether this run rotated. A run that did not (the target was
   already off the roster) says so and names `hippius-mem rotate`.
 

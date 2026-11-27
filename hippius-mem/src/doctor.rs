@@ -836,7 +836,9 @@ async fn removed_member_still_holds_key_lines(
 /// member ever listed may hold the key every note is sealed under (if they ever
 /// received it), and a removal that never rotated
 /// (a `remove` before 0.8.1 with nobody joined, or a rotation that failed after
-/// the roster shrank) leaves that open. Silent when any lookup fails.
+/// the roster shrank) leaves that open. Silent when the live manifest cannot
+/// be loaded (the storage probe reports that); one line saying the check did
+/// not run when the manifest history cannot be read.
 async fn unrotated_removal_lines(
     blob: &dyn BlobStore,
     team: &str,
@@ -849,8 +851,15 @@ async fn unrotated_removal_lines(
     let Ok(Some(manifest)) = load_manifest(blob, team, founder).await else {
         return Vec::new();
     };
-    let Ok(ever) = members_ever_listed(blob, team, &manifest).await else {
-        return Vec::new();
+    let ever = match members_ever_listed(blob, team, &manifest).await {
+        Ok(ever) => ever,
+        Err(err) => {
+            return vec![format!(
+                "WARN: could not read the team's manifest history ({err}), so this run cannot \
+                 tell whether a member was removed without a rotation; run `hippius-mem doctor` \
+                 again"
+            )];
+        }
     };
     ever.difference(&manifest.members)
         .map(|ss58| {
@@ -3082,6 +3091,68 @@ mod tests {
                 .await
                 .is_empty(),
             "a rotated epoch's key travels only in wraps, which the other check covers"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] whose `get` of one key fails with a storage error.
+    struct FailingGetBlobStore {
+        inner: MemoryBlobStore,
+        failing: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FailingGetBlobStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key == self.failing {
+                return Err(MemError::Storage("the gateway is down".to_owned()));
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// When an older manifest cannot be read, the unrotated-removal check says
+    /// it did not run instead of reporting nothing. One failed read used to
+    /// hide every removal warning, which reads as "no removal went unrotated".
+    #[tokio::test]
+    async fn unrotated_removal_lines_report_a_history_they_could_not_read() -> Result<(), MemError>
+    {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let removed = derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?.ss58;
+        let inner = MemoryBlobStore::default();
+        for (version, members) in [(0, BTreeSet::from([removed])), (1, BTreeSet::new())] {
+            let manifest =
+                TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), members, version);
+            publish_manifest(&inner, &manifest).await?;
+        }
+        let mut manifests = inner.list(&format!("{TEAM}/_manifest/")).await?;
+        manifests.sort();
+        let blob = FailingGetBlobStore {
+            inner,
+            failing: manifests[0].clone(),
+        };
+
+        let lines = unrotated_removal_lines(&blob, TEAM, None, 0).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("could not read the team's manifest history"),
+            "{}",
+            lines[0]
         );
         Ok(())
     }
