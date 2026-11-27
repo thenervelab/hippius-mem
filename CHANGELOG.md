@@ -94,7 +94,8 @@ Nothing else in the storage format changes.
 - `join --bundle` refused a rotated team's bundle when the config's top-level
   `max_epoch` was lower; that value is only a fallback now.
 - The recall gate hook failed open for a session wired to the HTTP daemon by
-  `url` when the binary was not on its PATH.
+  `url` when the binary was not on its PATH, and for a Grok session registered
+  in `~/.grok/config.toml`.
 - A note edited under an epoch the process holds no key for, or whose newest
   version fails its integrity check, was still served in its older version by
   `recall` and `get`. It is now left out and reported, like any note this

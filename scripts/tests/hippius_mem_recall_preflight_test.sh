@@ -16,6 +16,8 @@
 #      on the first edit of the file, and not again on the second
 #   6. no binary on PATH, server registered by `url` (the HTTP daemon) in
 #      ~/.claude.json                               -> BLOCK (url wiring counts)
+#   7. no binary on PATH, server registered in ~/.grok/config.toml
+#                                                   -> BLOCK (Grok wiring counts)
 #
 # The hook is copied into a sandbox fake-repo so repo_root resolves to a throwaway
 # tree (the hook derives it from its own location), HOME points at an empty dir
@@ -348,4 +350,21 @@ if [ "$status" -ne 0 ] || ! grep -q '"decision"[[:space:]]*:[[:space:]]*"block"'
 fi
 echo "PASS: a url-wired server counts as registered"
 
-echo "PASS: recall-preflight gate fails open when absent, blocks when present, honors bypass, sees MAIN-root registration from a worktree, delivers path notes once, and counts url wiring"
+# --- Case 7: Grok's TOML registration, no binary on PATH -> BLOCK ---------------
+# `install --agent grok` wires Grok by `url` in ~/.grok/config.toml, which the
+# gate did not read, so a Grok session with the binary off PATH failed open.
+GROK_HOME="$WORK/grok-home"
+mkdir -p "$GROK_HOME/.grok"
+printf '[mcp_servers.hippius-mem]\nurl = "http://127.0.0.1:17432/mcp"\n' \
+  > "$GROK_HOME/.grok/config.toml"
+_json=$(make_json "sess-grok")
+if printf '%s' "$_json" | env -i HOME="$GROK_HOME" PATH="$BASE_BIN" \
+    "$BASH_BIN" "$FAKE_HOOK" >"$WORK/out-grok" 2>&1
+then status=0; else status=$?; fi
+if [ "$status" -ne 0 ] || ! grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' "$WORK/out-grok"; then
+  echo "FAIL: a Grok-registered server with no binary on PATH did not BLOCK"
+  cat "$WORK/out-grok"; exit 1
+fi
+echo "PASS: a Grok TOML registration counts as registered"
+
+echo "PASS: recall-preflight gate fails open when absent, blocks when present, honors bypass, sees MAIN-root registration from a worktree, delivers path notes once, and counts url and Grok wiring"

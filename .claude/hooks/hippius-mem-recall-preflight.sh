@@ -192,6 +192,13 @@ hippius_mem_reachable() {
   if [[ -f "$repo_root/.mcp.json" ]]; then
     [[ -n "$(jq -r '.mcpServers["hippius-mem"] | (.command // .url // empty)' "$repo_root/.mcp.json" 2>/dev/null || true)" ]] && return 0
   fi
+  # Grok runs this hook too, and `install --agent grok` registers the server as
+  # a `[mcp_servers.hippius-mem]` table (a `url` to the daemon) in its own TOML
+  # config, which jq cannot read; the table header alone means registered.
+  grok_toml="${HOME:-}/.grok/config.toml"
+  if [[ -n "${HOME:-}" && -f "$grok_toml" ]]; then
+    grep -Eq '^[[:space:]]*\[mcp_servers\.("hippius-mem"|hippius-mem)\][[:space:]]*$' "$grok_toml" && return 0
+  fi
   return 1
 }
 hippius_mem_reachable || degraded_pass "hippius-mem"
