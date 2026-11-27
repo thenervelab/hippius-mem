@@ -1175,6 +1175,31 @@ mod tests {
         Ok(())
     }
 
+    /// A leftover at the staging path that cannot be removed (here a
+    /// directory) stops the append with that cause, and the config is left
+    /// as it was. Taking every removal failure for "nothing there" would
+    /// report a confusing create failure instead.
+    #[test]
+    fn append_names_a_staging_leftover_it_cannot_remove() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = existing_primary(dir.path())?;
+        let before = std::fs::read(&path)?;
+        let staged = path.with_extension("toml.joining");
+        std::fs::create_dir(&staged)?;
+        std::fs::write(staged.join("inside"), "x")?;
+
+        let err = write_config(
+            &path,
+            &sample_bundle("acme"),
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )
+        .expect_err("the leftover cannot be removed");
+        assert!(format!("{err:#}").contains("removing the stale"), "{err:#}");
+        assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+
     #[test]
     fn duplicate_org_pattern_is_refused_by_candidate_validation() -> anyhow::Result<()> {
         // The candidate document is validated before any byte is appended, so
