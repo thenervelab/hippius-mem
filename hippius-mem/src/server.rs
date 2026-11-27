@@ -2295,6 +2295,58 @@ mod tests {
         assert_eq!(wire["warnings"][0]["code"], "unserialized_write", "{wire}");
     }
 
+    /// A store over `blob` signing with `seed`, holding only the epoch-0 key
+    /// [`test_store`] uses.
+    fn store_over(blob: &Arc<dyn BlobStore>, seed: u8) -> Arc<MemoryStore> {
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed_with_prefix(&[seed; 32], NetworkPrefix::HIPPIUS)
+                .expect("valid test seed"),
+        );
+        Arc::new(MemoryStore::new(
+            Arc::clone(blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        ))
+    }
+
+    /// `refresh` and `recall` on a server without the key of a rotated epoch
+    /// carry the `keyless_notes` warning naming that epoch, and a server that
+    /// reads every note carries none. Both used to read as if the notes did
+    /// not exist, which invites an agent to write them again.
+    #[tokio::test]
+    async fn notes_this_process_cannot_read_are_named_in_a_warning() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(&blob, 5);
+        let identity = hippius_mem_core::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)
+            .expect("valid test phrase");
+        founder.join_as_member(&identity).await.unwrap();
+        assert_eq!(founder.rotate_key(0).await.unwrap().new_epoch, 1);
+        let writer = MemoryServer::new(Arc::clone(&founder));
+        writer.logic_remember(sample_remember()).await.unwrap();
+
+        let reads_all = writer.logic_refresh().await.unwrap();
+        assert!(reads_all.warnings.is_empty(), "{:?}", reads_all.warnings);
+
+        let lagging = MemoryServer::new(store_over(&blob, 6));
+        let refreshed = lagging.logic_refresh().await.unwrap();
+        assert_eq!(refreshed.warnings.len(), 1, "{:?}", refreshed.warnings);
+        assert_eq!(refreshed.warnings[0].code, "keyless_notes");
+        assert!(
+            refreshed.warnings[0].message.starts_with("1 note(s)")
+                && refreshed.warnings[0].message.contains("(epoch 1)"),
+            "{}",
+            refreshed.warnings[0].message
+        );
+    }
+
     /// A blob store that holds the first armed note-blob PUT until released,
     /// and fails head PUTs while `fail_heads` is set.
     struct PausedWriteAndHeadFault {
