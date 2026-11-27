@@ -133,7 +133,8 @@ Usage:
                                        result; offline, needs no config
   hippius-mem path-notes --repo-root <dir> --file <path>
                                        print the notes tagged `path:` for a file,
-                                       for the edit hook (--features http-mcp)
+                                       for the edit hook; takes [--port <n>]
+                                       [--token-file <path>] (--features http-mcp)
   hippius-mem join [--bundle [<path|->] [--orgs <host/org,...>]]
                                        join a team: consume a founder's invite bundle
                                        (writes the local config, then publishes this

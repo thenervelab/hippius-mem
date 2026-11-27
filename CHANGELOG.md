@@ -63,7 +63,9 @@ Nothing else in the storage format changes.
   `provision` opens its own founder-signed wrap with it, so no member is
   trusted for the key itself.
 - `recall`, `get`, `remember`, `call` and `path-notes` take `--token-file
-  <path>`, like `serve`.
+  <path>`, like `serve`. Without the flag, `serve` and these clients read the
+  token from the file `HIPPIUS_MEM_TOKEN_FILE` names, when it is set, so the
+  edit hook's `path-notes` reaches a daemon whose token is elsewhere.
 - `doctor` warns once per epoch whose notes this machine holds no key for, with
   the fix, and, while the team is still at epoch 0, for every member an earlier
   manifest listed and the live one does not.

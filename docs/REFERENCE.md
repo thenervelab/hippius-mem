@@ -507,10 +507,13 @@ stated plainly.
   0 when the question was answered (with notes or none) and non-zero when the daemon
   could not be asked (not running, still syncing, no or wrong token), so the hook asks
   again on the next edit. It looks for the daemon on the default port and for its token
-  beside the config `HIPPIUS_MEM_CONFIG` names (or the default config); for a daemon
+  in the file `HIPPIUS_MEM_TOKEN_FILE` names, else beside the config `HIPPIUS_MEM_CONFIG`
+  names (or the default config); `serve` picks its token file the same way. For a daemon
   started with another `--port` or `--token-file`, pass the same `--port` and
-  `--token-file`. `recall`, `get`, `remember` and `call` take both flags too. Builds
-  without `http-mcp` accept the command and print nothing.
+  `--token-file`; the edit hook passes neither flag, so for it export
+  `HIPPIUS_MEM_TOKEN_FILE` where both the daemon and the agent run. `recall`, `get`,
+  `remember` and `call` take both flags too. Builds without `http-mcp` accept the command
+  and print nothing.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
   the same predecessor; the losing branch lost convergence and is removable) versus

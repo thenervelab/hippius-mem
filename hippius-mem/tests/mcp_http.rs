@@ -1083,9 +1083,10 @@ fn the_cli_remembers_recalls_and_gets_through_the_daemon() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// The daemon clients read the token file `--token-file` names, as `serve`
-/// takes one, instead of only the file beside the config: a daemon started
-/// with `serve --token-file <elsewhere>` was unreachable from them.
+/// The daemon clients read the token file `--token-file` or
+/// `HIPPIUS_MEM_TOKEN_FILE` names, as `serve` does, instead of only the file
+/// beside the config: a daemon started with `serve --token-file <elsewhere>`
+/// was unreachable from them, and from the edit hook, which passes no flag.
 #[test]
 fn the_cli_and_path_notes_read_the_token_file_they_are_given()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1157,6 +1158,26 @@ fn the_cli_and_path_notes_read_the_token_file_they_are_given()
     assert!(
         !output.status.success(),
         "without the flag path-notes asks the daemon with no token"
+    );
+
+    // The edit hook runs `path-notes` with neither flag; the variable is how it
+    // reaches a daemon started with another token file.
+    let output = support::binary()
+        .args(["path-notes", "--port", port, "--repo-root"])
+        .arg(&checkout)
+        .arg("--file")
+        .arg(checkout.join("src/lib.rs"))
+        .env(
+            "HIPPIUS_MEM_CONFIG",
+            daemon.dir.path().join("hippius-mem.toml"),
+        )
+        .env("HIPPIUS_MEM_TOKEN_FILE", &elsewhere)
+        .env("HOME", daemon.dir.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "path-notes reads the token file HIPPIUS_MEM_TOKEN_FILE names: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
 }
