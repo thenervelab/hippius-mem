@@ -1165,6 +1165,55 @@ async fn a_removal_that_never_rotated_is_flagged_until_a_rotation() -> anyhow::R
 /// The primary profile's namespace in the routing test.
 const ROUTING_PRIMARY: &str = "rw-routing-primary-live";
 
+/// Run `members`, `admin quarantine`, `provision` and `recover` from
+/// `checkout`, as the routing test's founder, and check each answered for the
+/// routed team.
+fn other_team_commands_act_on(founder: &Machine, checkout: &std::path::Path) -> anyhow::Result<()> {
+    let routed = |args: &[&str]| {
+        founder
+            .command(Mnemonic::Set)
+            .current_dir(checkout)
+            .args(args)
+            .output()
+    };
+    let members = routed(&["members"])?;
+    assert!(
+        String::from_utf8_lossy(&members.stdout).contains(&founder.address()?),
+        "members lists the routed roster: {}",
+        String::from_utf8_lossy(&members.stderr)
+    );
+    let quarantine = routed(&["admin", "quarantine"])?;
+    assert!(
+        quarantine.status.success()
+            && String::from_utf8_lossy(&quarantine.stderr).contains("no quarantine"),
+        "admin quarantine inspects the routed op-log: {}",
+        String::from_utf8_lossy(&quarantine.stderr)
+    );
+    let provision = routed(&["provision"])?;
+    let seed = printed_recovery_seed(&String::from_utf8_lossy(&provision.stdout))?;
+    let mut recover = founder
+        .command(Mnemonic::Set)
+        .current_dir(checkout)
+        .arg("recover")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    writeln!(
+        recover.stdin.take().context("stdin is piped")?,
+        "{}",
+        hippius_mem_core::hex::encode(seed)
+    )?;
+    let recovered = recover.wait_with_output()?;
+    assert!(
+        recovered.status.success()
+            && String::from_utf8_lossy(&recovered.stdout).contains("New founder"),
+        "recover acts on the routed team: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    Ok(())
+}
+
 /// The `[[teams]]` profile's namespace in the routing test.
 const ROUTING_TEAM: &str = "rw-routing-team-live";
 
@@ -1241,49 +1290,7 @@ async fn a_team_command_acts_on_the_profile_the_remote_routes_to() -> anyhow::Re
         1,
         "the routed profile's roster is published"
     );
-    // The other team commands read and write the routed profile too.
-    let routed = |args: &[&str]| {
-        founder
-            .command(Mnemonic::Set)
-            .current_dir(&checkout)
-            .args(args)
-            .output()
-    };
-    let members = routed(&["members"])?;
-    assert!(
-        String::from_utf8_lossy(&members.stdout).contains(&founder.address()?),
-        "members lists the routed roster: {}",
-        String::from_utf8_lossy(&members.stderr)
-    );
-    let quarantine = routed(&["admin", "quarantine"])?;
-    assert!(
-        quarantine.status.success()
-            && String::from_utf8_lossy(&quarantine.stderr).contains("no quarantine"),
-        "admin quarantine inspects the routed op-log: {}",
-        String::from_utf8_lossy(&quarantine.stderr)
-    );
-    let provision = routed(&["provision"])?;
-    let seed = printed_recovery_seed(&String::from_utf8_lossy(&provision.stdout))?;
-    let mut recover = founder
-        .command(Mnemonic::Set)
-        .current_dir(&checkout)
-        .arg("recover")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    writeln!(
-        recover.stdin.take().context("stdin is piped")?,
-        "{}",
-        hippius_mem_core::hex::encode(seed)
-    )?;
-    let recovered = recover.wait_with_output()?;
-    assert!(
-        recovered.status.success()
-            && String::from_utf8_lossy(&recovered.stdout).contains("New founder"),
-        "recover acts on the routed team: {}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
+    other_team_commands_act_on(&founder, &checkout)?;
     assert_eq!(
         bucket
             .list(&format!("{ROUTING_TEAM}/_manifest/"))
