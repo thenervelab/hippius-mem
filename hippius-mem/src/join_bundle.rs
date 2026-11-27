@@ -655,14 +655,28 @@ fn with_max_epoch(text: &str, max_epoch: u64, path: &Path) -> anyhow::Result<Zer
 /// Replace the config at `path` with `text`: written to a 0600 sibling first,
 /// then renamed over it, so a failed write leaves the old file whole.
 ///
-/// The file holds a live secret, so it ends at exactly 0600 whatever mode it
-/// had before: keeping a looser one would keep a leak.
+/// A config reached through a symlink (a dotfiles manager's) keeps the link:
+/// the sibling is staged beside the file the link resolves to, and the rename
+/// replaces that file. A leftover at the staging path (an earlier run that
+/// stopped, or a planted symlink) is removed, and the staged file is created
+/// new at 0600, so the secret is never written through a link or into a file
+/// with a looser mode. The file ends at exactly 0600 whatever mode it had
+/// before: keeping a looser one would keep a leak.
 fn replace_config(path: &Path, text: &str) -> anyhow::Result<()> {
-    let staged = path.with_extension("toml.joining");
+    let target = std::fs::canonicalize(path)
+        .with_context(|| format!("resolving the config path {} failed", path.display()))?;
+    let staged = target.with_extension("toml.joining");
+    match std::fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("removing the stale {} failed", staged.display()));
+        }
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&staged)
         .with_context(|| format!("creating {} failed", staged.display()))?;
@@ -671,7 +685,8 @@ fn replace_config(path: &Path, text: &str) -> anyhow::Result<()> {
         .with_context(|| format!("writing {} failed", staged.display()))?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting 0600 on {} failed", staged.display()))?;
-    std::fs::rename(&staged, path).with_context(|| format!("replacing {} failed", path.display()))
+    std::fs::rename(&staged, &target)
+        .with_context(|| format!("replacing {} failed", target.display()))
 }
 
 /// Best-effort `--orgs` suggestion from the current repo's `origin` remote,
@@ -1125,6 +1140,38 @@ mod tests {
         let text = std::fs::read_to_string(&path)?;
         assert_eq!(Config::from_toml_str(&text)?.max_epoch, 3);
         assert_eq!(text.matches("max_epoch").count(), 1, "{text}");
+        Ok(())
+    }
+
+    /// A config that is a symlink (a dotfiles manager's) stays one: the
+    /// append lands in the file it points to. A file planted at the staging
+    /// path, here a symlink to another file, is replaced, never written
+    /// through. The append used to rename its staged file over the symlink,
+    /// and opened the staging path following a symlink there.
+    #[test]
+    fn append_writes_through_a_symlinked_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let managed = dir.path().join("dotfiles");
+        std::fs::create_dir(&managed)?;
+        let target = existing_primary(&managed)?;
+        let path = dir.path().join("hippius-mem.toml");
+        std::os::unix::fs::symlink(&target, &path)?;
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "untouched")?;
+        std::os::unix::fs::symlink(&elsewhere, target.with_extension("toml.joining"))?;
+
+        write_config(
+            &path,
+            &sample_bundle("acme"),
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )?;
+        assert!(std::fs::symlink_metadata(&path)?.file_type().is_symlink());
+        let cfg = Config::from_toml_str(&std::fs::read_to_string(&target)?)?;
+        assert_eq!(cfg.teams[0].name, "acme");
+        assert_eq!(std::fs::read_to_string(&elsewhere)?, "untouched");
+        let mode = std::fs::metadata(&target)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         Ok(())
     }
 
