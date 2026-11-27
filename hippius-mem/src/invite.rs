@@ -8,9 +8,9 @@
 //! and neither the secret nor the team key ever reaches `tracing` — only the
 //! public `access_key_id` is logged.
 //!
-//! Scope: like `join`/`provision`/`rotate`, this reads the PRIMARY (flat,
-//! top-level) profile only — invite for a secondary team from a config whose
-//! primary IS that team.
+//! Scope: unlike the other team commands, which act on the profile the git
+//! remote routes to, this reads the PRIMARY (flat, top-level) profile only —
+//! invite for a secondary team from a config whose primary IS that team.
 
 use std::io::Write;
 use std::num::NonZeroU64;

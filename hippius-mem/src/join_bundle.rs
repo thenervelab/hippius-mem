@@ -707,8 +707,8 @@ async fn publish_member_key(cfg: &Config, team: &str) -> anyhow::Result<bool> {
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
     // `all_profiles` covers both outcomes: the fresh primary and the appended
-    // `[[teams]]` profile — the bare `join` is primary-only, but here the
-    // joined team may be either.
+    // `[[teams]]` profile. The joined team is picked by name, not by the git
+    // remote the bare `join` routes by, since the cwd need not route to it.
     let profile = cfg
         .all_profiles()
         .into_iter()
@@ -765,7 +765,9 @@ fn print_next_steps(bundle: &InviteBundle, published: bool) {
         "\nNext steps:\n\
          1. Reconnect Claude Code with /mcp (or start a new session) so the\n\
             server picks up the new profile.\n\
-         2. Verify the setup: hippius-mem doctor   (--offline to skip the gateway probe)"
+         2. Verify the setup: hippius-mem doctor   (--offline to skip the gateway probe)\n\
+            Run it, and `hippius-mem join`, from a checkout of one of the team's\n\
+            repositories: team commands act on the profile the git remote routes to."
     );
     if bundle.max_epoch.is_some() {
         if published {

@@ -174,13 +174,11 @@ pub enum MemError {
         /// token-set Jaccard on a lexical build.
         similarity: f32,
     },
-    /// A key rotation found no published member key the current manifest
-    /// authorizes, so the new epoch's key would be wrapped to no one.
-    //
     /// The team's founder has no published member key, so a new epoch would
-    /// be wrapped to every member but the founder, or the founder cannot be
-    /// sent a key share. On an open team (no manifest, no pin) the rotating
-    /// author is the founder this names: a rotation there claims the team.
+    /// be wrapped to every member but the founder (or to no one), or the
+    /// founder cannot be sent a key share. On an open team (no manifest, no
+    /// pin) it names the rotating author, which is the only signer a wrap of
+    /// that rotation must reach.
     //
     // A rotation refuses this BEFORE it writes a wrap: the founder reads a
     // rotated epoch only from a wrap addressed to its own member key, so an

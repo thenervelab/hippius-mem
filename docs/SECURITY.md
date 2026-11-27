@@ -51,9 +51,10 @@ read. What that does and does not buy you, stated plainly.
   with the mnemonic's x25519 key). The `serve` daemon the installer wires runs without it,
   so after a `rotate` or `remove` it refuses every note write (`remember`, `edit`:
   `EpochSuperseded`, naming the new epoch; `forget`, `link` and `redact` seal no body and
-  still run) and does not show notes sealed under the new epoch (`get` says "no team key
-  for epoch N", `recall` and `refresh` carry a `keyless_notes` warning), until it can load
-  the key. Every process, daemon or not, lists the team's wraps before it seals each note
+  still run on the notes it can read) and does not show notes sealed under the new epoch
+  (`get` says "no team key for epoch N", `recall` and `refresh` carry a `keyless_notes`
+  warning, `brief` leaves them out without one, and `forget`, `link` and `redact` cannot
+  find them), until it can load the key. Every process, daemon or not, lists the team's wraps before it seals each note
   body, so it does not seal a note under the older key a removed member holds once the new
   epoch's wraps are in the bucket; the one exception is a write whose listing ran just
   before those wraps landed. Its writes
