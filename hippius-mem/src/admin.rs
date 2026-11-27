@@ -2534,6 +2534,38 @@ mod tests {
         Ok(())
     }
 
+    /// A plain rotation that fails published no membership, so its error does
+    /// not claim a half-applied state; it would send the operator after a
+    /// roster change that never happened.
+    #[tokio::test]
+    async fn a_plain_rotation_failing_claims_no_membership_publish() -> anyhow::Result<()> {
+        let blob: Arc<dyn BlobStore> = Arc::new(RefusesWraps(MemoryBlobStore::default()));
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            Arc::new(signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([1u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            16,
+        );
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        store
+            .publish_membership(BTreeSet::from([founder.ss58.clone()]))
+            .await?;
+
+        let err = publish_and_rotate(&rotation_test_config(), &store, &founder, None, true)
+            .await
+            .expect_err("the wrap writes are refused");
+        assert!(
+            !format!("{err:#}").contains("membership WAS already published"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn publish_and_rotate_skips_rotation_when_should_rotate_is_false() -> anyhow::Result<()> {
         // I2 fix: a completed-removal re-run (or a bogus never-a-member

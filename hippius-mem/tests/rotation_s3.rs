@@ -1168,8 +1168,9 @@ const ROUTING_PRIMARY: &str = "rw-routing-primary-live";
 /// The `[[teams]]` profile's namespace in the routing test.
 const ROUTING_TEAM: &str = "rw-routing-team-live";
 
-/// A team command run from a checkout whose remote routes to a `[[teams]]`
-/// profile acts on that profile, as `doctor` and the server do. Team commands
+/// Team commands (`publish-membership`, `members`, `admin quarantine`,
+/// `provision`, `recover`) run from a checkout whose remote routes to a
+/// `[[teams]]` profile act on that profile, as `doctor` and the server do. Team commands
 /// used to act on the primary profile wherever they ran, so a founder of an
 /// org-routed team published its roster into the personal namespace.
 #[tokio::test]
@@ -1239,6 +1240,57 @@ async fn a_team_command_acts_on_the_profile_the_remote_routes_to() -> anyhow::Re
             .len(),
         1,
         "the routed profile's roster is published"
+    );
+    // The other team commands read and write the routed profile too.
+    let routed = |args: &[&str]| {
+        founder
+            .command(Mnemonic::Set)
+            .current_dir(&checkout)
+            .args(args)
+            .output()
+    };
+    let members = routed(&["members"])?;
+    assert!(
+        String::from_utf8_lossy(&members.stdout).contains(&founder.address()?),
+        "members lists the routed roster: {}",
+        String::from_utf8_lossy(&members.stderr)
+    );
+    let quarantine = routed(&["admin", "quarantine"])?;
+    assert!(
+        quarantine.status.success()
+            && String::from_utf8_lossy(&quarantine.stderr).contains("no quarantine"),
+        "admin quarantine inspects the routed op-log: {}",
+        String::from_utf8_lossy(&quarantine.stderr)
+    );
+    let provision = routed(&["provision"])?;
+    let seed = printed_recovery_seed(&String::from_utf8_lossy(&provision.stdout))?;
+    let mut recover = founder
+        .command(Mnemonic::Set)
+        .current_dir(&checkout)
+        .arg("recover")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    writeln!(
+        recover.stdin.take().context("stdin is piped")?,
+        "{}",
+        hippius_mem_core::hex::encode(seed)
+    )?;
+    let recovered = recover.wait_with_output()?;
+    assert!(
+        recovered.status.success()
+            && String::from_utf8_lossy(&recovered.stdout).contains("New founder"),
+        "recover acts on the routed team: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        bucket
+            .list(&format!("{ROUTING_TEAM}/_manifest/"))
+            .await?
+            .len(),
+        3,
+        "the roster, the recovery key and the recovery, all on the routed profile"
     );
     assert!(
         bucket
