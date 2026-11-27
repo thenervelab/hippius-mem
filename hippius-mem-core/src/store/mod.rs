@@ -12214,6 +12214,14 @@ mod tests {
             crate::Joined::Already
         );
         assert_eq!(member.share_epoch_keys(&member_identity).await?.shared, [1]);
+        // The share's bucket path is part of the format 0.8.1 documents.
+        assert_eq!(
+            blob.list(&format!("{TEAM}/_keyshares/")).await?,
+            [format!(
+                "{TEAM}/_keyshares/00000000000000000001/{}",
+                member.author.as_str()
+            )]
+        );
 
         assert_eq!(
             founder.adopt_shared_epoch_keys(&founder_identity).await?,
@@ -12345,6 +12353,83 @@ mod tests {
         assert_eq!(
             member.share_epoch_keys(&member_identity).await?.skipped,
             [1]
+        );
+        Ok(())
+    }
+
+    /// A wrap that names the founder as its provisioner but whose signature
+    /// does not verify is not one the founder signed, so a share of it is
+    /// refused. Only the signature check stands between that wrap and the
+    /// founder's ring: the provisioner field alone passes the authorization
+    /// check, so a member could otherwise plant a key of its choosing.
+    #[tokio::test]
+    async fn a_share_of_a_wrap_claiming_the_founder_without_its_signature_is_refused() -> TestResult
+    {
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (founder, member, member_identity, _note) =
+            epoch_one_stranded_for_the_founder(&blob).await?;
+        let founder_identity = crate::derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        founder.join_as_member(&founder_identity).await?;
+
+        let chosen = crate::wrap_team_key(
+            TEAM,
+            &SecretKey::from_bytes([79_u8; 32]),
+            &member_identity.x25519_public(),
+            1,
+            member.signer.as_ref(),
+        )?;
+        // The share is sealed from the member's own valid wrap; the planted
+        // wrap is the same ciphertext with the founder named as provisioner.
+        let share = crate::identity::seal_key_share(
+            TEAM,
+            1,
+            &chosen,
+            &member_identity.x25519_secret(),
+            &founder_identity.x25519_public(),
+            member.signer.as_ref(),
+        )?;
+        let mut forged = chosen;
+        forged.provisioner = founder.signer.verifying_key();
+        blob.put(
+            &crate::wrapped_key_key(TEAM, 1, member.author.as_str()),
+            serde_json::to_vec(&forged)?,
+        )
+        .await?;
+        blob.put(
+            &crate::identity::key_share_key(TEAM, 1, member.author.as_str()),
+            serde_json::to_vec(&share)?,
+        )
+        .await?;
+
+        assert!(
+            founder
+                .adopt_shared_epoch_keys(&founder_identity)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(founder.held_epochs(), [0]);
+        Ok(())
+    }
+
+    /// Under a founder pin with no manifest yet, only the pinned founder may
+    /// provision (it wraps nobody, since the gate is fail-closed); anyone else
+    /// is refused. A reader would refuse every wrap a non-founder signs there.
+    #[tokio::test]
+    async fn under_a_pin_without_a_manifest_only_the_founder_provisions() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let pin = Some(founder.author.clone());
+        let founder = founder.with_pinned_founder(pin.clone());
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?.with_pinned_founder(pin);
+
+        let provisioned = founder.provision_members().await?;
+        assert!(provisioned.written.is_empty(), "{provisioned:?}");
+        let refused = member.provision_members().await;
+        assert!(
+            matches!(refused, Err(MemError::Unauthorized(_))),
+            "{refused:?}"
         );
         Ok(())
     }

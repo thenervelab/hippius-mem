@@ -2483,4 +2483,32 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Every member a manifest the live founder key signed for this team ever
+    /// listed is counted, and nothing else: a manifest another key signed
+    /// lists nobody, however well-formed. The epoch-0 removal warning in
+    /// `doctor` reads this set, so a missed member hides an unrotated removal
+    /// and an extra one names a removal that never happened.
+    #[tokio::test]
+    async fn members_ever_listed_counts_only_the_founder_keys_manifests() -> TestResult {
+        const TEAM: &str = "clientx";
+        let founder = Sr25519Signer::from_seed_with_prefix(&[31_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let rogue = Sr25519Signer::from_seed_with_prefix(&[32_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let removed = Sr25519Signer::from_seed_with_prefix(&[33_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let planted = Sr25519Signer::from_seed_with_prefix(&[34_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let blob = MemoryBlobStore::default();
+
+        let before = BTreeSet::from([removed.author_ss58()]);
+        let v0 = TeamManifest::create_signed(&founder, TEAM.to_owned(), before, 0);
+        let live = TeamManifest::create_signed(&founder, TEAM.to_owned(), BTreeSet::new(), 1);
+        let not_the_founders = BTreeSet::from([planted.author_ss58()]);
+        let forged = TeamManifest::create_signed(&rogue, TEAM.to_owned(), not_the_founders, 2);
+        for manifest in [&v0, &live, &forged] {
+            publish_manifest(&blob, manifest).await?;
+        }
+
+        let ever = super::members_ever_listed(&blob, TEAM, &live).await?;
+        assert_eq!(ever, live.members.union(&v0.members).cloned().collect());
+        Ok(())
+    }
 }
