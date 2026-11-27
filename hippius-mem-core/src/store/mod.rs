@@ -12416,8 +12416,10 @@ mod tests {
     /// Under a founder pin with no manifest yet, only the pinned founder may
     /// provision (it wraps nobody, since the gate is fail-closed); anyone else
     /// is refused. A reader would refuse every wrap a non-founder signs there.
+    /// Neither may rotate, and each is told the reason that applies to it.
     #[tokio::test]
-    async fn under_a_pin_without_a_manifest_only_the_founder_provisions() -> TestResult {
+    async fn under_a_pin_without_a_manifest_only_the_founder_provisions_and_nobody_rotates()
+    -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
         let pin = Some(founder.author.clone());
@@ -12430,6 +12432,19 @@ mod tests {
         assert!(
             matches!(refused, Err(MemError::Unauthorized(_))),
             "{refused:?}"
+        );
+
+        // A rotation there is refused for both, and the error says why: the
+        // founder has no manifest to rotate against, a member is not the founder.
+        let founder_rotation = founder.rotate_key(0).await;
+        assert!(
+            matches!(founder_rotation, Err(MemError::ManifestUnavailable { .. })),
+            "{founder_rotation:?}"
+        );
+        let member_rotation = member.rotate_key(0).await;
+        assert!(
+            matches!(member_rotation, Err(MemError::Unauthorized(_))),
+            "{member_rotation:?}"
         );
         Ok(())
     }
