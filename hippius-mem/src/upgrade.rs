@@ -688,13 +688,13 @@ fn reload_config(path: &Path) -> anyhow::Result<Config> {
 }
 
 /// Rebuild the store from the just-rewritten config, bootstrap any rotated
-/// epoch keys (mirrors `brief.rs`/`quickstart.rs`), re-run the `doctor`
+/// epoch keys (mirrors `brief.rs`/`quickstart.rs`), run a
+/// `refresh`-equivalent sync so the local index rebuilds from the bucket,
+/// publish the team-key check where none exists, then re-run the `doctor`
 /// probe against this EXACT config — never `doctor::run(&[])`, which
 /// re-resolves its own config from the environment/cwd (see the module
-/// docs) — then a `refresh`-equivalent sync so the local index rebuilds
-/// from the bucket, then publish the team-key check where none exists. The
-/// sync skips a note it cannot decode with a warning, so it is not proof that
-/// every copied note opens.
+/// docs). The sync skips a note it cannot decode with a warning, so it is not
+/// proof that every copied note opens.
 ///
 /// # Errors
 ///
@@ -708,7 +708,6 @@ async fn finish_upgrade(cfg: &Config) -> anyhow::Result<()> {
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
-    crate::doctor::run_for_config(cfg, false).await?;
     store
         .sync()
         .await
@@ -716,8 +715,10 @@ async fn finish_upgrade(cfg: &Config) -> anyhow::Result<()> {
     // The trial vault had one user, whose key sealed every copied note, so the
     // upgrader is the team's founder and may publish the check, as the
     // founder's `provision` does. Without it no later client can tell its key
-    // is the team's before it writes.
+    // is the team's before it writes. Published before the doctor run, which
+    // would otherwise warn that the team has no check.
     crate::admin::publish_founder_key_checks(&store).await;
+    crate::doctor::run_for_config(cfg, false).await?;
     Ok(())
 }
 

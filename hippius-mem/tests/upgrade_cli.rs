@@ -543,6 +543,13 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
         stdout.contains("Copied") && stdout.contains(&dest.bucket),
         "upgrade must report the copy: {stdout}"
     );
+    // The doctor run that ends the upgrade sees the check the upgrade just
+    // published; it used to run first and warn that there was none.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("no usable team-key check"),
+        "upgrade's doctor run sees the published check: {stderr}"
+    );
 
     // A fresh reader identity: recall/get do not require matching the note's
     // author, only holding the team key.
