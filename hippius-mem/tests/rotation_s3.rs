@@ -547,6 +547,85 @@ async fn a_members_provision_changes_no_wrap_and_the_founder_keeps_reading() -> 
     Ok(())
 }
 
+/// The team namespace the recovery-key retirement test owns.
+const RECOVERY_TEAM: &str = "rw-recovery-wraps-live";
+
+/// The recovery seed a `provision` printed: the line after its banner.
+fn printed_recovery_seed(stdout: &str) -> anyhow::Result<[u8; 32]> {
+    let line = stdout
+        .lines()
+        .skip_while(|line| !line.contains("RECOVERY SEED"))
+        .nth(1)
+        .with_context(|| format!("provision printed no recovery seed: {stdout}"))?;
+    let bytes = hippius_mem_core::hex::decode(line.trim())?;
+    <[u8; 32]>::try_from(bytes.as_slice()).context("a recovery seed is 32 bytes")
+}
+
+/// A founder's default `provision`, which names a new recovery key, leaves
+/// every member able to read an epoch whose wraps the previous recovery key
+/// signed: the wraps are signed again by the founder in the same run. The
+/// wrap pass used to keep them (the recovery key was still trusted at that
+/// moment) and then retire their signer, so no reader accepted them again.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn retiring_the_recovery_key_keeps_the_epochs_it_wrapped_readable() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, RECOVERY_TEAM).await;
+
+    let founder = Machine::new(
+        45,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        46,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, RECOVERY_TEAM, &founder_address)?;
+        machine.run(&["join"])?;
+    }
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    let seed = printed_recovery_seed(&founder.run(&["provision"])?)?;
+
+    // Epoch 1, wrapped to both machines by the recovery key's holder.
+    let recovery = Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?;
+    let wrapped = rotate_team_key(
+        &bucket,
+        RECOVERY_TEAM,
+        &SecretKey::from_bytes([92_u8; 32]),
+        1,
+        &load_member_keys(&bucket, RECOVERY_TEAM).await?,
+        Some(&Ss58::new(&founder_address)?),
+        &recovery,
+    )
+    .await?;
+    assert_eq!(
+        wrapped.len(),
+        2,
+        "epoch 1 reaches the founder and the member"
+    );
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under the epoch the recovery key wrapped")?;
+    drop(session);
+
+    let provision = founder.run(&["provision"])?;
+    assert!(
+        provision.contains("REPLACES the previous recovery seed"),
+        "{provision}"
+    );
+
+    for machine in [&member, &founder] {
+        let mut session = Server::spawn(machine, Mnemonic::Set)?;
+        let (failed, text) = session.call("get", &json!({ "id": id }))?;
+        assert!(!failed, "the epoch-1 note is still readable: {text}");
+    }
+
+    clear_team(&bucket, RECOVERY_TEAM).await;
+    Ok(())
+}
+
 /// The team namespace the late-member test owns.
 const LATE_TEAM: &str = "rw-late-member-live";
 

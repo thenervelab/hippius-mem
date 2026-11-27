@@ -55,10 +55,10 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `provision [--no-recovery]`: as the founder, wrap every epoch key this
-/// machine holds to every published member key the founder-signed manifest
-/// authorizes, then — by default — name a fresh recovery key on the team
-/// manifest.
+/// Run `provision [--no-recovery]`: as the founder, by default name a fresh
+/// recovery key on the team manifest, then wrap every epoch key this machine
+/// holds to every published member key the founder-signed manifest
+/// authorizes.
 ///
 /// The team-key wrap is the read-side complement of `publish-membership`:
 /// membership gates who may WRITE (converge ops); provisioning gates who may
@@ -104,6 +104,19 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
         adopt_shared_epoch_keys(&store, &mnemonic).await?;
     }
 
+    // The new recovery key is named BEFORE the wrap pass. The pass keeps every
+    // wrap a reader accepts, and readers accept a wrap the CURRENT recovery key
+    // signed; naming a new one retires that key, so a wrap it signed and the pass
+    // kept would be refused by every reader afterwards, the founder included, and
+    // its epoch lost. Named first, those wraps are no longer accepted during the
+    // pass, which replaces them with founder-signed ones. The epoch bootstrap
+    // above already opened this founder's own such wraps while they were still
+    // accepted. A wrap the retired key signed at an epoch this founder does not
+    // hold cannot be replaced, and stays refused.
+    if generate_recovery {
+        generate_and_print_recovery_key(&store, store.team()).await?;
+    }
+
     let provisioned = store.provision_members().await?;
     tracing::info!(
         written = provisioned.written.len(),
@@ -115,13 +128,8 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
 
     // The founder holds the team's keys by construction, so this is a place a
     // team-key check can be published without trusting anyone's judgment. Best
-    // effort, like `rotate`'s: the members are provisioned already, and the
-    // recovery key below must still be generated.
+    // effort, like `rotate`'s: the members are provisioned already.
     publish_founder_key_checks(&store).await;
-
-    if generate_recovery {
-        generate_and_print_recovery_key(&store, store.team()).await?;
-    }
 
     Ok(())
 }
@@ -176,8 +184,8 @@ fn parse_provision_args(args: &[String]) -> anyhow::Result<bool> {
 ///
 /// A team with no membership manifest published yet cannot have a recovery
 /// key named on it (there is nothing to attach it to), so THAT case is a
-/// warning, not a hard failure — the team-key wrap `provision` already
-/// performed stays a success. Any OTHER failure (storage, an unauthorized
+/// warning, not a hard failure — the team-key wrap `provision` performs next
+/// still runs. Any OTHER failure (storage, an unauthorized
 /// signer) IS surfaced: naming a recovery key is a security-relevant act, and
 /// a silently swallowed failure here would leave the operator believing the
 /// escape hatch exists when it does not.
@@ -223,6 +231,10 @@ async fn generate_and_print_recovery_key(store: &MemoryStore, team: &str) -> any
             );
             Ok(())
         }
+        Err(err @ MemError::Unauthorized(_)) => Err(anyhow::Error::new(err).context(
+            "only the founder names a recovery key; the recovery key's holder runs \
+             `hippius-mem provision --no-recovery`",
+        )),
         Err(err) => Err(err.into()),
     }
 }
