@@ -1327,6 +1327,18 @@ pub enum Joined {
     Now,
 }
 
+/// What [`MemoryStore::share_epoch_keys`] did for the epochs the founder holds
+/// no accepted wrap of, each list ascending.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyShares {
+    /// Epochs whose key share this call wrote.
+    pub shared: Vec<u64>,
+    /// Epochs this member could not share: its wrap of each is not one the
+    /// founder or the recovery key signed, or does not open with the given
+    /// identity. A warning names the reason for each.
+    pub skipped: Vec<u64>,
+}
+
 /// What a [`MemoryStore::rotate_key`] accomplished: the epoch the team now
 /// writes under and exactly who received a wrap of its key.
 ///
@@ -8410,7 +8422,8 @@ impl MemoryStore {
 
     /// Member action: send the founder what it needs to load each epoch key it
     /// holds no wrap of, for every epoch this member holds a wrap the founder
-    /// or the recovery key signed. Returns the epochs shared, ascending.
+    /// or the recovery key signed. Returns the epochs shared and the epochs
+    /// it could not share.
     ///
     /// The repair for an epoch a founder minted before it had a member key: the
     /// founder-signed wraps of that epoch reached the members only, and only
@@ -8433,8 +8446,9 @@ impl MemoryStore {
     /// [`MemError::ManifestUnavailable`] when the team has no manifest (no
     /// founder to share with), [`MemError::FounderHasNoMemberKey`] when the
     /// founder has not joined, or whatever a read or write reports. A wrap this
-    /// member cannot open, or one no reader accepts, is skipped with a warning.
-    pub async fn share_epoch_keys(&self, identity: &Identity) -> Result<Vec<u64>, MemError> {
+    /// member cannot open, or one no reader accepts, is skipped with a warning
+    /// and listed in [`KeyShares::skipped`].
+    pub async fn share_epoch_keys(&self, identity: &Identity) -> Result<KeyShares, MemError> {
         let manifest =
             self.current_manifest()
                 .await?
@@ -8450,7 +8464,7 @@ impl MemoryStore {
                 founder: manifest.founder.as_str().to_owned(),
             })?;
 
-        let mut shared = Vec::new();
+        let mut outcome = KeyShares::default();
         let own = wrap_epochs_addressed_to(self.blob.as_ref(), &self.team, &self.author).await?;
         for epoch in own {
             if self
@@ -8469,6 +8483,7 @@ impl MemoryStore {
                     "this member's wrap of the epoch is not one the founder or the recovery key \
                      signed; not sharing it"
                 );
+                outcome.skipped.push(epoch);
                 continue;
             };
             let share = match seal_key_share(
@@ -8487,6 +8502,7 @@ impl MemoryStore {
                         "this member's wrap of the epoch does not open with HIPPIUS_MEM_MNEMONIC; \
                          not sharing it"
                     );
+                    outcome.skipped.push(epoch);
                     continue;
                 }
             };
@@ -8494,9 +8510,9 @@ impl MemoryStore {
             self.blob
                 .put(&share_key, serde_json::to_vec(&share)?)
                 .await?;
-            shared.push(epoch);
+            outcome.shared.push(epoch);
         }
-        Ok(shared)
+        Ok(outcome)
     }
 
     /// The wrap of `epoch` addressed to `recipient`, when the slot holds one a
@@ -12195,7 +12211,7 @@ mod tests {
                 .await?,
             crate::Joined::Already
         );
-        assert_eq!(member.share_epoch_keys(&member_identity).await?, [1]);
+        assert_eq!(member.share_epoch_keys(&member_identity).await?.shared, [1]);
 
         assert_eq!(
             founder.adopt_shared_epoch_keys(&founder_identity).await?,
@@ -12211,7 +12227,7 @@ mod tests {
         restarted.sync().await?;
         assert_eq!(restarted.get(note).await?.summary, "numbered note 1");
         assert!(
-            member.share_epoch_keys(&member_identity).await?.is_empty(),
+            member.share_epoch_keys(&member_identity).await? == crate::KeyShares::default(),
             "nothing is left to share once the founder holds the epoch"
         );
         Ok(())
@@ -12322,6 +12338,12 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(founder.held_epochs(), [0]);
+        // Sharing it again is refused, and reported as such rather than as
+        // nothing to share.
+        assert_eq!(
+            member.share_epoch_keys(&member_identity).await?.skipped,
+            [1]
+        );
         Ok(())
     }
 

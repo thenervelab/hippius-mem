@@ -553,6 +553,8 @@ stated plainly.
   mnemonic) opens its own founder-signed wrap with each share, loads the key, and wraps it
   to the founder and every member. The repair for an epoch minted before the founder had a
   member key; see [Repair an epoch the founder cannot read](TEAMS.md#repair-an-epoch-the-founder-cannot-read).
+  It fails, naming the epochs, when the founder lacks an epoch whose wrap on this machine
+  is not founder-signed or does not open with the mnemonic.
 - **`admin keycheck publish [--replace]`**: publishes the team-key check
   (`{team}/_keycheck/{epoch}`, see [Security](SECURITY.md#team-key-check)) for every epoch
   this machine holds a key for: the configured key, plus the rotated epochs

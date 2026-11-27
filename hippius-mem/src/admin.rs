@@ -11,7 +11,7 @@ use std::io::IsTerminal as _;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    CreateOnly, DropClass, Identity, Joined, KeyCheckPublished, MemError, MemoryStore,
+    CreateOnly, DropClass, Identity, Joined, KeyCheckPublished, KeyShares, MemError, MemoryStore,
     NetworkPrefix, PublishKeyCheck, QuarantinedAuthorDetail, Signer, Sr25519Signer, Ss58,
     TeamManifest, derive_identity,
 };
@@ -422,8 +422,9 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the argument is missing/malformed, `HIPPIUS_MEM_MNEMONIC`
-/// is unset, the configuration cannot be loaded or routes to a local trial vault, the removal is refused (open
-/// team, or target is the founder — see [`RemoveRefusal`]), or the
+/// is unset, the configuration cannot be loaded or routes to a local trial
+/// vault, the removal is refused (open team, or target is the founder — see
+/// [`RemoveRefusal`]), or the
 /// publish/rotate path fails (e.g. this signer is not the founder, or a
 /// storage failure).
 pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
@@ -1207,7 +1208,8 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
 ///
 /// Stray arguments, `HIPPIUS_MEM_MNEMONIC` unset or invalid, a store that
 /// cannot be built, a team without a manifest, a founder without a member key,
-/// or a failed read or write.
+/// an epoch the founder lacks whose wrap here could not be shared, or a failed
+/// read or write.
 async fn share_epoch_keys(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -1221,23 +1223,37 @@ async fn share_epoch_keys(args: &[String]) -> anyhow::Result<()> {
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     let (_profile, store) = routed_store(&cfg).await?;
 
-    let shared = store.share_epoch_keys(&identity).await?;
-    let mut out = std::io::stdout();
-    if shared.is_empty() {
-        let _ = writeln!(
-            out,
-            "the founder already holds a wrap of every epoch this machine holds; nothing to share"
-        );
-    } else {
-        let epochs = shared
+    let KeyShares { shared, skipped } = store.share_epoch_keys(&identity).await?;
+    let list = |epochs: &[u64]| {
+        epochs
             .iter()
             .map(u64::to_string)
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    };
+    if !shared.is_empty() {
         let _ = writeln!(
-            out,
-            "shared the key of epoch {epochs} with the founder; the founder now runs \
-             `hippius-mem provision` with HIPPIUS_MEM_MNEMONIC set, which loads and wraps it"
+            std::io::stdout(),
+            "shared the key of epoch {} with the founder; the founder now runs \
+             `hippius-mem provision` with HIPPIUS_MEM_MNEMONIC set, which loads and wraps it",
+            list(&shared)
+        );
+    }
+    if !skipped.is_empty() {
+        bail!(
+            "could not share epoch {}: this machine's wrap of it is not one the founder or the \
+             recovery key signed, or does not open with HIPPIUS_MEM_MNEMONIC (the warnings \
+             above say which). When every member's wrap of an epoch was replaced by one no \
+             reader accepts (a member's `provision` before 0.8.1 did that), no member can \
+             share it and the epoch cannot be recovered; see docs/TEAMS.md, \"Repair an epoch \
+             the founder cannot read\"",
+            list(&skipped)
+        );
+    }
+    if shared.is_empty() {
+        let _ = writeln!(
+            std::io::stdout(),
+            "the founder already holds a wrap of every epoch this machine holds; nothing to share"
         );
     }
     Ok(())

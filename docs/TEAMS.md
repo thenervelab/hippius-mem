@@ -324,7 +324,9 @@ through a member who holds it:
    founder and to every member. Restart the founder's server.
 
 An epoch whose every founder-signed wrap was overwritten (by a member's `provision` before
-0.8.1) cannot be repaired this way: no wrap the founder signed holds its key any more.
+0.8.1) cannot be repaired this way: no wrap the founder signed holds its key any more. On
+such an epoch `admin share-epoch-keys` fails and names it, and `doctor` on the founder's
+machine says the epoch cannot be recovered when no member can share it.
 
 > [!NOTE]
 > **Where this is headed.** The paste-ready-bundle onboarding exists today as the CLI

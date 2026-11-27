@@ -504,7 +504,9 @@ async fn keyless_epoch_lines(
 /// lacks. A member asks the founder to provision. The founder cannot provision
 /// a key it does not hold: an epoch minted before the founder had a member key
 /// reached the members only, so a member sends the founder a key share, which
-/// the founder's next `provision` loads and wraps.
+/// the founder's next `provision` loads and wraps. No share can be made from a
+/// member wrap no reader accepts, so an epoch whose every member wrap a 0.8.0
+/// member `provision` replaced is lost, and the remedy says so.
 async fn missing_epoch_remedy(store: &MemoryStore, author: &str, epoch: u64) -> String {
     let founder = store
         .membership_manifest()
@@ -518,7 +520,9 @@ async fn missing_epoch_remedy(store: &MemoryStore, author: &str, epoch: u64) -> 
              member key was published, so only members received it); run `hippius-mem join` \
              here if this machine has not, have a member who holds epoch {epoch} run \
              `hippius-mem admin share-epoch-keys`, then run `hippius-mem provision` here with \
-             HIPPIUS_MEM_MNEMONIC set"
+             HIPPIUS_MEM_MNEMONIC set; if every member's attempt says it cannot share epoch \
+             {epoch}, a member's `provision` before 0.8.1 replaced their wraps and the epoch \
+             cannot be recovered"
         )
     } else {
         "run `hippius-mem join` here if this machine has not, then ask the founder to run \

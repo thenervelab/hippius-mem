@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use hippius_mem_core::{
     BlobStore, NetworkPrefix, OpLogStore, S3BlobStore, SecretKey, Signer as _, Sr25519Signer, Ss58,
-    load_member_keys, rotate_team_key,
+    load_member_keys, rotate_team_key, wrap_team_key, wrapped_key_key,
 };
 use serde_json::{Value, json};
 
@@ -941,6 +941,98 @@ async fn a_founder_stranded_by_an_older_rotation_recovers_the_epoch() -> anyhow:
     );
 
     clear_team(&bucket, STRANDED_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the unrecoverable-epoch test owns.
+const LOST_TEAM: &str = "rw-lost-epoch-live";
+
+/// When the founder lacks an epoch and the member's own wrap of it is one no
+/// reader accepts (what a member's 0.8.0 `provision` left), `admin
+/// share-epoch-keys` fails and names the epoch, and `doctor` on the founder's
+/// machine says such an epoch cannot be recovered. The command used to exit 0
+/// saying the founder already held every epoch.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn an_epoch_no_member_can_share_is_named_as_lost() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, LOST_TEAM).await;
+
+    let founder = Machine::new(
+        73,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        74,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, LOST_TEAM, &founder_address)?;
+    }
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    // Epoch 1 reached only the member, and the member's wrap of it was then
+    // replaced by one the member signed.
+    let epoch_key = SecretKey::from_bytes([93_u8; 32]);
+    let founder_signer =
+        Sr25519Signer::from_seed_with_prefix(&founder.seed, NetworkPrefix::HIPPIUS)?;
+    let member_keys = load_member_keys(&bucket, LOST_TEAM).await?;
+    let founder_pin = Ss58::new(&founder_address)?;
+    rotate_team_key(
+        &bucket,
+        LOST_TEAM,
+        &epoch_key,
+        1,
+        &member_keys,
+        Some(&founder_pin),
+        &founder_signer,
+    )
+    .await?;
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    session.remember_id("sealed under the epoch that is lost")?;
+    drop(session);
+    let member_signer = Sr25519Signer::from_seed_with_prefix(&member.seed, NetworkPrefix::HIPPIUS)?;
+    let member_address = member.address()?;
+    let member_key = member_keys
+        .iter()
+        .find(|key| key.ss58.as_str() == member_address)
+        .context("the member joined")?;
+    let replaced = wrap_team_key(
+        LOST_TEAM,
+        &epoch_key,
+        &member_key.x25519_public,
+        1,
+        &member_signer,
+    )?;
+    bucket
+        .put(
+            &wrapped_key_key(LOST_TEAM, 1, &member_address),
+            serde_json::to_vec(&replaced)?,
+        )
+        .await?;
+
+    founder.run(&["join"])?;
+    let shared = member
+        .command(Mnemonic::Set)
+        .args(["admin", "share-epoch-keys"])
+        .output()?;
+    let shared_err = String::from_utf8_lossy(&shared.stderr);
+    assert!(
+        !shared.status.success() && shared_err.contains("could not share epoch 1"),
+        "share-epoch-keys names the epoch it cannot share: {shared_err}"
+    );
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_err.contains("the epoch cannot be recovered"),
+        "doctor says when the epoch is lost: {doctor_err}"
+    );
+
+    clear_team(&bucket, LOST_TEAM).await;
     Ok(())
 }
 
