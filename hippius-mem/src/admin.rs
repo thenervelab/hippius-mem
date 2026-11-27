@@ -375,7 +375,7 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
 /// under a pin, or nothing to rotate — see the typed `MemError` variants).
 pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
     let members = parse_rotate_args(args)?;
-    let (cfg, store, founder) = load_rotation_store().await?;
+    let (cfg, store, founder) = load_rotation_store("rotate").await?;
     // `rotate`'s whole point is rotating: always attempt it. The
     // should-we-bother guard `remove` uses (see `removal_requires_rotation`)
     // is meaningless here — there is no single removal target to check
@@ -422,7 +422,7 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the argument is missing/malformed, `HIPPIUS_MEM_MNEMONIC`
-/// is unset, the configuration cannot be loaded, the removal is refused (open
+/// is unset, the configuration cannot be loaded or routes to a local trial vault, the removal is refused (open
 /// team, or target is the founder — see [`RemoveRefusal`]), or the
 /// publish/rotate path fails (e.g. this signer is not the founder, or a
 /// storage failure).
@@ -430,7 +430,7 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
     let target = parse_remove_args(args)?;
-    let (cfg, store, founder) = load_rotation_store().await?;
+    let (cfg, store, founder) = load_rotation_store("remove").await?;
     let manifest = store.membership_manifest().await?;
     let step = plan_removal(manifest, &target)?;
 
@@ -668,7 +668,8 @@ async fn routed_store(cfg: &Config) -> anyhow::Result<(TeamProfile, MemoryStore)
 }
 
 /// Shared preamble of the rotation-driving commands (`rotate`, `remove`): load
-/// the config, build the routed profile's store, derive the founder identity from `HIPPIUS_MEM_MNEMONIC`, and run the epoch
+/// the config, build the routed profile's store, refuse a local trial vault
+/// (`command` names the refused command), derive the founder identity from `HIPPIUS_MEM_MNEMONIC`, and run the epoch
 /// bootstrap. Writes nothing.
 ///
 /// `HIPPIUS_MEM_MNEMONIC` is required: the founder loads a rotated epoch's key
@@ -682,9 +683,10 @@ async fn routed_store(cfg: &Config) -> anyhow::Result<(TeamProfile, MemoryStore)
 /// skipping it would silently pin them to the founding epoch (the recorded
 /// `bootstrap_epochs` gotcha). The founder's member key is published later, by
 /// [`publish_and_rotate`], only once the command is going to rotate.
-async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore, Identity)> {
+async fn load_rotation_store(command: &str) -> anyhow::Result<(Config, MemoryStore, Identity)> {
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let (_profile, store) = routed_store(&cfg).await?;
+    let (profile, store) = routed_store(&cfg).await?;
+    crate::config::require_s3(&profile, command)?;
 
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").context(
         "`rotate` and `remove` require HIPPIUS_MEM_MNEMONIC (the founder's mnemonic): the \
