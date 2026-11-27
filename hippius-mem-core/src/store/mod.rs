@@ -8492,7 +8492,6 @@ impl MemoryStore {
                 &own_wrap,
                 &identity.x25519_secret(),
                 &founder_key.x25519_public,
-                self.signer.as_ref(),
             ) {
                 Ok(share) => share,
                 Err(err) => {
@@ -12328,7 +12327,6 @@ mod tests {
             &chosen,
             &member_identity.x25519_secret(),
             &founder_identity.x25519_public(),
-            member.signer.as_ref(),
         )?;
         blob.put(
             &crate::wrapped_key_key(TEAM, 1, member.author.as_str()),
@@ -12388,7 +12386,6 @@ mod tests {
             &chosen,
             &member_identity.x25519_secret(),
             &founder_identity.x25519_public(),
-            member.signer.as_ref(),
         )?;
         let mut forged = chosen;
         forged.provisioner = founder.signer.verifying_key();
@@ -12481,7 +12478,6 @@ mod tests {
             &planted,
             &writer_identity.x25519_secret(),
             &founder_identity.x25519_public(),
-            writer.signer.as_ref(),
         )?;
         blob.put(
             &crate::wrapped_key_key(TEAM, 1, writer.author.as_str()),
