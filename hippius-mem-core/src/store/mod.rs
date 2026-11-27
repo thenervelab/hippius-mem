@@ -8530,13 +8530,26 @@ impl MemoryStore {
     /// open, or one whose key does not open the holder's wrap, is skipped
     /// with a warning.
     ///
-    /// One LIST of `_keyshares/`; when it names an epoch the ring lacks, the
-    /// manifest and member keys, then two GETs per such share.
+    /// Adopts nothing on a team with no manifest: every signer's wrap is
+    /// accepted there, so a share cannot show the founder chose its key.
+    ///
+    /// The manifest, one LIST of `_keyshares/`; when it names an epoch the ring
+    /// lacks, the member keys, then two GETs per such share.
     ///
     /// # Errors
     ///
-    /// Whatever the LIST, the manifest or member-key reads report.
+    /// [`MemError::Unauthorized`] when this signer is neither the founder nor
+    /// the recovery key (checked before any share is read), or whatever the
+    /// LIST, the manifest or member-key reads report.
     pub async fn adopt_shared_epoch_keys(&self, identity: &Identity) -> Result<Vec<u64>, MemError> {
+        // With no manifest every signer's wrap is accepted, so a share would not
+        // show that the founder chose the key it opens, and there is no founder
+        // to repair epochs for (the same reason `share_epoch_keys` refuses).
+        let Some(manifest) = self.current_manifest().await? else {
+            return Ok(Vec::new());
+        };
+        self.require_provisioner(Some(&manifest))?;
+
         let held = self.held_epochs();
         let shares: Vec<(u64, String, String)> = self
             .blob
@@ -8552,7 +8565,6 @@ impl MemoryStore {
         if shares.is_empty() {
             return Ok(Vec::new());
         }
-        let manifest = self.current_manifest().await?;
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
 
         let mut adopted = Vec::new();
@@ -8565,7 +8577,7 @@ impl MemoryStore {
                 continue;
             };
             match self
-                .open_share(identity, *epoch, share_key, holder_key, manifest.as_ref())
+                .open_share(identity, *epoch, share_key, holder_key, &manifest)
                 .await
             {
                 Ok(key) => {
@@ -8591,12 +8603,12 @@ impl MemoryStore {
         epoch: u64,
         share_key: &str,
         holder_key: &MemberKey,
-        manifest: Option<&TeamManifest>,
+        manifest: &TeamManifest,
     ) -> Result<SecretKey, MemError> {
         let share: WrappedKey = serde_json::from_slice(&self.blob.get(share_key).await?)?;
         let holder = holder_key.ss58.as_str();
         let holder_wrap = read_wrapped_key(self.blob.as_ref(), &self.team, epoch, holder).await?;
-        if !provisioner_authorized(&holder_wrap, manifest, self.founder.as_ref()) {
+        if !provisioner_authorized(&holder_wrap, Some(manifest), self.founder.as_ref()) {
             return Err(unauthorized_wrap(&self.team, epoch, &holder_key.ss58));
         }
         open_key_share(
@@ -12310,6 +12322,70 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(founder.held_epochs(), [0]);
+        Ok(())
+    }
+
+    /// On a team with no manifest every signer's wrap is accepted, so a share
+    /// there proves nothing about who chose the key, and none is adopted. The
+    /// founder used to load the planted key and sign wraps of it, which stayed
+    /// accepted after the team published its manifest. A signer that may not
+    /// provision is refused before any share is read.
+    #[tokio::test]
+    async fn shares_are_adopted_only_on_a_team_with_a_manifest() -> TestResult {
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const WRITER_PHRASE: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let writer = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        let founder_identity = crate::derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let writer_identity = crate::derive_identity(WRITER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        founder.join_as_member(&founder_identity).await?;
+        writer.join_as_member(&writer_identity).await?;
+
+        let planted = crate::wrap_team_key(
+            TEAM,
+            &SecretKey::from_bytes([78_u8; 32]),
+            &writer_identity.x25519_public(),
+            1,
+            writer.signer.as_ref(),
+        )?;
+        let share = crate::identity::seal_key_share(
+            TEAM,
+            1,
+            &planted,
+            &writer_identity.x25519_secret(),
+            &founder_identity.x25519_public(),
+            writer.signer.as_ref(),
+        )?;
+        blob.put(
+            &crate::wrapped_key_key(TEAM, 1, writer.author.as_str()),
+            serde_json::to_vec(&planted)?,
+        )
+        .await?;
+        blob.put(
+            &crate::identity::key_share_key(TEAM, 1, writer.author.as_str()),
+            serde_json::to_vec(&share)?,
+        )
+        .await?;
+
+        assert!(
+            founder
+                .adopt_shared_epoch_keys(&founder_identity)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(founder.held_epochs(), [0]);
+
+        founder
+            .publish_membership(BTreeSet::from([writer.author.clone()]))
+            .await?;
+        let refused = writer.adopt_shared_epoch_keys(&writer_identity).await;
+        assert!(
+            matches!(refused, Err(MemError::Unauthorized(_))),
+            "{refused:?}"
+        );
         Ok(())
     }
 
