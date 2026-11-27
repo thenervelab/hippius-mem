@@ -92,7 +92,9 @@ Nothing else in the storage format changes.
   rotated, and `doctor` passed a team whose roster shrank while it stayed at
   epoch 0.
 - `join --bundle` refused a rotated team's bundle when the config's top-level
-  `max_epoch` was lower; that value is only a fallback now.
+  `max_epoch` was lower. It now appends the profile and raises the top-level
+  `max_epoch` to the bundle's, the range startup tries when listing the wraps
+  fails.
 - The recall gate hook failed open for a session wired to the HTTP daemon by
   `url` when the binary was not on its PATH, and for a Grok session registered
   in `~/.grok/config.toml`.

@@ -536,7 +536,9 @@ fn render_fresh_config(
 ///
 /// A bundle `max_epoch` above the existing top-level one is not a conflict:
 /// startup lists the epochs wrapped to this member, and `max_epoch` is only the
-/// range it tries when that listing fails, so the existing value is kept.
+/// range it tries when that listing fails. It is raised to the bundle's, so
+/// that range covers the joined team too; a higher value only costs another
+/// profile GETs of epochs it never minted.
 ///
 /// The full candidate document is validated before the block is appended, so
 /// a refused append leaves the existing file byte-identical. A successful
@@ -607,8 +609,16 @@ fn append_profile(
     };
     let block =
         Zeroizing::new(toml::to_string(&doc).context("serializing the [[teams]] profile as TOML")?);
+    let raised = bundle
+        .max_epoch
+        .map(std::num::NonZeroU64::get)
+        .filter(|&bundle_max| bundle_max > existing.max_epoch);
+    let head = match raised {
+        None => Zeroizing::new(existing_text.as_str().to_owned()),
+        Some(bundle_max) => with_max_epoch(&existing_text, bundle_max, path)?,
+    };
     // Validate the exact document the file will hold; only then touch disk.
-    let candidate = Zeroizing::new(format!("{}\n{}", existing_text.as_str(), block.as_str()));
+    let candidate = Zeroizing::new(format!("{}\n{}", head.as_str(), block.as_str()));
     Config::from_toml_str(&candidate).with_context(|| {
         format!(
             "appending team `{}` would make {} invalid; nothing was written",
@@ -616,18 +626,52 @@ fn append_profile(
             path.display()
         )
     })?;
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {} for append failed", path.display()))?;
-    file.write_all(format!("\n{}", block.as_str()).as_bytes())
-        .with_context(|| format!("appending the profile to {} failed", path.display()))?;
-    // The file now PROVABLY holds a live secret (we just appended one), so pin
-    // it to 0600 regardless of the mode it had before — preserving a looser
-    // pre-existing mode would be preserving a leak, not a feature.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("setting 0600 on {} failed", path.display()))?;
+    replace_config(path, &candidate)?;
+    if let Some(bundle_max) = raised {
+        let _ = writeln!(
+            std::io::stdout(),
+            "raised the top-level max_epoch in {} from {} to {bundle_max}, the joined team's",
+            path.display(),
+            existing.max_epoch
+        );
+    }
     Ok(WriteOutcome::AppendedProfile)
+}
+
+/// `text` with its top-level `max_epoch` set to `max_epoch`, every other line
+/// kept as written.
+fn with_max_epoch(text: &str, max_epoch: u64, path: &Path) -> anyhow::Result<Zeroizing<String>> {
+    let mut document: toml_edit::DocumentMut = text.parse().with_context(|| {
+        format!(
+            "the existing config at {} is not valid TOML",
+            path.display()
+        )
+    })?;
+    let value = i64::try_from(max_epoch).context("max_epoch does not fit a TOML integer")?;
+    document["max_epoch"] = toml_edit::value(value);
+    Ok(Zeroizing::new(document.to_string()))
+}
+
+/// Replace the config at `path` with `text`: written to a 0600 sibling first,
+/// then renamed over it, so a failed write leaves the old file whole.
+///
+/// The file holds a live secret, so it ends at exactly 0600 whatever mode it
+/// had before: keeping a looser one would keep a leak.
+fn replace_config(path: &Path, text: &str) -> anyhow::Result<()> {
+    let staged = path.with_extension("toml.joining");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&staged)
+        .with_context(|| format!("creating {} failed", staged.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {} failed", staged.display()))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting 0600 on {} failed", staged.display()))?;
+    std::fs::rename(&staged, path).with_context(|| format!("replacing {} failed", path.display()))
 }
 
 /// Best-effort `--orgs` suggestion from the current repo's `origin` remote,
@@ -1034,9 +1078,9 @@ mod tests {
     }
 
     /// A bundle from a team that rotated appends to a config whose top-level
-    /// `max_epoch` is lower, keeping that value: startup lists the rotated
-    /// epochs, and `max_epoch` is only the range it tries when the listing
-    /// fails. The append used to be refused until the operator raised it.
+    /// `max_epoch` is lower, and raises it to the bundle's, so the range
+    /// startup tries when listing the wraps fails covers the joined team. The
+    /// append used to be refused, and then kept the lower value.
     #[test]
     fn append_with_a_lower_max_epoch_is_accepted() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1049,9 +1093,36 @@ mod tests {
             &hex64("cd"),
             &["github.com/acme".to_owned()],
         )?;
-        let cfg = Config::from_toml_str(&std::fs::read_to_string(&path)?)?;
-        assert_eq!(cfg.max_epoch, 0);
+        let text = std::fs::read_to_string(&path)?;
+        let cfg = Config::from_toml_str(&text)?;
+        assert_eq!(cfg.max_epoch, 2);
         assert_eq!(cfg.teams[0].name, "acme");
+        assert!(
+            text.contains("team = \"primary\"\nbucket = \"b1\""),
+            "the existing lines are kept as written: {text}"
+        );
+        Ok(())
+    }
+
+    /// A config that already sets a lower top-level `max_epoch` has that line
+    /// replaced, not a second one added (a duplicate key would not load).
+    #[test]
+    fn append_replaces_a_lower_max_epoch_line() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = existing_primary(dir.path())?;
+        let text = format!("max_epoch = 1\n{}", std::fs::read_to_string(&path)?);
+        std::fs::write(&path, text)?;
+        let mut bundle = sample_bundle("acme");
+        bundle.max_epoch = NonZeroU64::new(3);
+        write_config(
+            &path,
+            &bundle,
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )?;
+        let text = std::fs::read_to_string(&path)?;
+        assert_eq!(Config::from_toml_str(&text)?.max_epoch, 3);
+        assert_eq!(text.matches("max_epoch").count(), 1, "{text}");
         Ok(())
     }
 
