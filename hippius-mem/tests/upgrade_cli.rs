@@ -543,6 +543,13 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
         stdout.contains("Copied") && stdout.contains(&dest.bucket),
         "upgrade must report the copy: {stdout}"
     );
+    // The doctor run that ends the upgrade sees the check the upgrade just
+    // published; it used to run first and warn that there was none.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("no usable team-key check"),
+        "upgrade's doctor run sees the published check: {stderr}"
+    );
 
     // A fresh reader identity: recall/get do not require matching the note's
     // author, only holding the team key.
@@ -559,6 +566,23 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
     let recalled_second = remote_store.get(second).await?;
     assert_eq!(recalled_first.summary, "live upgrade test note one");
     assert_eq!(recalled_second.summary, "live upgrade test note two");
+    // The upgrader is the founder, so the team-key check is published; it was
+    // not, and a teammate's wrong key then went unnoticed.
+    assert_eq!(
+        hippius_mem_core::matches_published_key_check(
+            s3_blob.as_ref(),
+            &identity.team,
+            0,
+            &hippius_mem_core::SecretKey::from_bytes(
+                hippius_mem_core::hex::decode(&identity.team_key_hex)?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("the team key is 32 bytes"))?,
+            ),
+        )
+        .await?,
+        hippius_mem_core::KeyCheckMatch::Matches,
+        "upgrade publishes the epoch-0 key check"
+    );
 
     clear_team(s3_blob.as_ref(), UPGRADE_TEAM).await
 }

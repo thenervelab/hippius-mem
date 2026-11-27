@@ -158,9 +158,18 @@ pub(crate) async fn serve(
 /// Arbitrary, well under systemd's default 90 s stop timeout.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
 
-/// The bearer-token file `serve` uses when `--token-file` is not given: the
-/// sibling of the config it loads. `path-notes` reads the same file.
+/// The bearer-token file `serve` and its clients use when `--token-file` is
+/// not given: the file `HIPPIUS_MEM_TOKEN_FILE` names when it is set and not
+/// empty, else the sibling of the config `serve` loads.
+///
+/// The variable exists for the clients nobody passes a flag to: the edit hook
+/// runs `path-notes` with neither `--token-file` nor a way to learn the path
+/// `serve` was started with, so a daemon with its token elsewhere was
+/// unreachable from it.
 pub(crate) fn default_token_path_from_env() -> PathBuf {
+    if let Some(path) = std::env::var_os("HIPPIUS_MEM_TOKEN_FILE").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
     let config = std::env::var_os("HIPPIUS_MEM_CONFIG")
         .map(PathBuf::from)
         .or_else(crate::setup::mcp::resolved_global_config_path)

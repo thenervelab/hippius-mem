@@ -702,9 +702,10 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
         !recall_surfaces(&bob, "post-rotation rotated epoch", &repo, post_rotation)?,
         "the post-rotation note never surfaces for the removed member"
     );
+    let hydrated = bob.get(post_rotation).await;
     assert!(
-        matches!(bob.get(post_rotation).await, Err(MemError::NotFound { .. })),
-        "the removed member cannot hydrate a note written after rotation"
+        matches!(hydrated, Err(MemError::KeyUnavailable { epoch: 1 })),
+        "the removed member cannot hydrate a note written after rotation: {hydrated:?}"
     );
 
     // Alice, still a member, bootstraps the rotated epoch from the bucket with
@@ -828,8 +829,11 @@ async fn remove_seam_shrinks_the_manifest_and_excludes_the_removed_member() -> R
         "the removed member's sync skips the post-removal note"
     );
     assert!(
-        matches!(bob.get(post_removal).await, Err(MemError::NotFound { .. })),
-        "the removed member cannot read a note written after removal"
+        matches!(
+            bob.get(post_removal).await,
+            Err(MemError::KeyUnavailable { epoch: 1 })
+        ),
+        "the removed member cannot read a note written after removal, and is told why"
     );
     let alice = store(
         &bucket,
@@ -848,23 +852,17 @@ async fn remove_seam_shrinks_the_manifest_and_excludes_the_removed_member() -> R
     Ok(())
 }
 
-/// The resumability `hippius-mem remove` now relies on, at the library seam:
-/// publishing the shrunk membership BEFORE any remaining member has
-/// `join`ed leaves `rotate_key` with nobody to wrap the new epoch to, so it
-/// refuses with `NothingToRotate` — the recorded `rotate --members`
-/// non-atomicity gotcha. The manifest shrink already landed and the write
-/// epoch has NOT advanced (a refused rotation must never seal future writes
-/// under a key wrapped to no one). Once the remaining member `join`s, a
-/// second `rotate_key` call — exactly what a resumed `hippius-mem
-/// remove`/`rotate` performs — completes the rotation the first attempt
-/// could not, with no other side effect from the failed attempt to undo.
+/// A rotation never mints an epoch its founder cannot read: with Alice joined
+/// but the founder not, it is refused before any wrap is written and the write
+/// epoch stays. A rotation used to wrap the new epoch to Alice only and warn on
+/// stderr; once the rotating process exited, the founder could never load that
+/// epoch, and nobody else may wrap it to the founder. Once the founder joins,
+/// the same call succeeds.
 #[tokio::test]
-async fn rotate_key_recovers_from_nothing_to_rotate_once_remaining_members_join()
--> Result<(), BoxError> {
+async fn rotate_key_refuses_until_the_founder_has_joined() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
     let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
-    let (bob_id, _) = member(BOB_MNEMONIC)?;
 
     let founder = store(
         &bucket,
@@ -876,27 +874,20 @@ async fn rotate_key_recovers_from_nothing_to_rotate_once_remaining_members_join(
         .publish_membership(BTreeSet::from([
             founder_id.ss58.clone(),
             alice_id.ss58.clone(),
-            bob_id.ss58.clone(),
         ]))
         .await?;
+    publish_member(&bucket, ALICE_MNEMONIC).await?;
 
-    // Remove Bob (the `remove`/`rotate --members` publish half) BEFORE
-    // anyone has joined — the ordering a fresh team is likeliest to hit.
-    founder
-        .publish_membership(BTreeSet::from([
-            founder_id.ss58.clone(),
-            alice_id.ss58.clone(),
-        ]))
-        .await?;
-
-    // First attempt: nobody remaining has published a MemberKey yet, so
-    // there is nobody authorized to wrap the new epoch to.
     assert!(
         matches!(
             founder.rotate_key(0).await,
-            Err(MemError::NothingToRotate { .. })
+            Err(MemError::FounderHasNoMemberKey { .. })
         ),
-        "rotating with no remaining member joined must refuse, not silently succeed"
+        "rotating without the founder's member key must refuse"
+    );
+    assert!(
+        bucket.list(&format!("{TEAM}/_keys/")).await?.is_empty(),
+        "no wrap is written"
     );
     assert_eq!(
         founder.current_epoch(),
@@ -904,9 +895,7 @@ async fn rotate_key_recovers_from_nothing_to_rotate_once_remaining_members_join(
         "a refused rotation must not advance the write epoch"
     );
 
-    // Alice joins; the resumed rotation now has someone to wrap the new
-    // epoch to, and succeeds exactly as if the first attempt never happened.
-    publish_member(&bucket, ALICE_MNEMONIC).await?;
+    publish_member(&bucket, FOUNDER_MNEMONIC).await?;
     let outcome = founder.rotate_key(0).await?;
     assert_eq!(
         outcome.new_epoch, EPOCH_1,
@@ -914,8 +903,8 @@ async fn rotate_key_recovers_from_nothing_to_rotate_once_remaining_members_join(
     );
     assert_eq!(
         outcome.wrapped,
-        BTreeSet::from([alice_id.ss58.clone()]),
-        "the resumed rotation wraps exactly the member who joined in the meantime"
+        BTreeSet::from([founder_id.ss58.clone(), alice_id.ss58.clone()]),
+        "the resumed rotation wraps the founder and the member"
     );
     assert_eq!(
         founder.current_epoch(),
@@ -1020,7 +1009,7 @@ async fn rotate_key_fails_closed_when_pinned_without_a_trusted_manifest() -> Res
 }
 
 #[tokio::test]
-async fn rotate_key_with_no_member_keys_is_nothing_to_rotate() -> Result<(), BoxError> {
+async fn rotate_key_with_no_member_keys_is_refused() -> Result<(), BoxError> {
     // Nobody has `join`ed: rotating would advance the write epoch onto a key
     // that exists only in this process — every subsequent write would be
     // unreadable to the whole team after the process exits.
@@ -1039,9 +1028,9 @@ async fn rotate_key_with_no_member_keys_is_nothing_to_rotate() -> Result<(), Box
     assert!(
         matches!(
             founder.rotate_key(0).await,
-            Err(MemError::NothingToRotate { .. })
+            Err(MemError::FounderHasNoMemberKey { .. })
         ),
-        "zero wrap targets must be refused as NothingToRotate"
+        "zero wrap targets must be refused: the founder is not among them"
     );
     assert_eq!(
         founder.current_epoch(),

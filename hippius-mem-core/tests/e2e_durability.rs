@@ -1107,13 +1107,14 @@ async fn bootstrap_skips_epochs_member_cannot_unwrap() -> Result<(), BoxError> {
     );
     assert_eq!(alice.get(n0).await?.body, "epoch-0 body");
     // `sync` SKIPS a note whose epoch key is absent rather than indexing a
-    // broken entry (`decode_records`'s skip-with-warn path, mirrored in
-    // `sync_skips_notes_with_unavailable_epoch`): the note is never in Alice's
-    // index at all, so `get` reports `NotFound`, not `KeyUnavailable` (the
-    // variant `get`'s own doc reserves for an INDEXED note whose epoch key is
-    // missing at read time — a different case than "never indexed").
+    // broken entry (`decode_records`'s skip-with-warn path), but remembers why:
+    // `get` reports the missing epoch, not `NotFound`, so a caller does not
+    // take the note for one that does not exist and write it again.
     assert!(
-        matches!(alice.get(n1).await, Err(MemError::NotFound { .. })),
+        matches!(
+            alice.get(n1).await,
+            Err(MemError::KeyUnavailable { epoch: EPOCH_1 })
+        ),
         "the epoch-1 note is unreadable to a member who never received that wrap"
     );
     Ok(())

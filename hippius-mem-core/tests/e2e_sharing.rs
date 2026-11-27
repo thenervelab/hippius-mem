@@ -21,7 +21,7 @@ use hippius_mem_core::{
     BlobStore, HashEmbedder, Identity, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
     NetworkPrefix, NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope,
     SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest, derive_identity, load_manifest,
-    provision_team_key, publish_manifest, publish_member_key, signer_from_mnemonic,
+    publish_manifest, publish_member_key, signer_from_mnemonic, wrap_team_key, wrapped_key_key,
 };
 
 /// Production anchor threshold; this test writes fewer ops than this, so its
@@ -375,23 +375,23 @@ async fn bootstrap_refuses_a_wrap_from_an_unauthorized_provisioner() -> Result<(
 
     // ATTACKER: a self-consistent signer that is neither the manifest's
     // founder nor its recovery key. It overwrites the teammate's epoch-0 wrap
-    // using only PUBLIC inputs — the teammate's own published x25519 key,
-    // readable by anyone with bucket read access — via the same
-    // `provision_team_key` entry point a bucket writer with write access
-    // could call directly. `provision_team_key` signs unconditionally and
-    // does not itself check the provisioner's identity (see its docs); that
-    // check is `fetch_team_key`'s job, on the read side.
+    // with a raw PUT, as anyone with bucket write can, using only PUBLIC
+    // inputs: the teammate's own published x25519 key. (`provision_team_key`
+    // keeps a wrap a reader accepts, so it is not the attacker's tool here.)
     let attacker = Sr25519Signer::from_seed_with_prefix(&[199_u8; 32], NetworkPrefix::HIPPIUS)?;
-    provision_team_key(
-        bucket.as_ref(),
+    let forged = wrap_team_key(
         TEAM,
         &SecretKey::from_bytes([13_u8; 32]),
+        &teammate_member_key.x25519_public,
         0,
-        std::slice::from_ref(&teammate_member_key),
-        None,
         &attacker,
-    )
-    .await?;
+    )?;
+    bucket
+        .put(
+            &wrapped_key_key(TEAM, 0, teammate_member_key.ss58.as_str()),
+            serde_json::to_vec(&forged)?,
+        )
+        .await?;
 
     // A FRESH teammate store — an empty ring — attempts to bootstrap the SAME
     // epoch. The attacker's wrap verifies (it is genuinely self-signed) but is

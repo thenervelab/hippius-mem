@@ -180,9 +180,8 @@ the config **0600**:
 - **Fresh machine** (no config yet): the bundle becomes the primary profile at
   `$HIPPIUS_MEM_CONFIG` (or `${XDG_CONFIG_HOME:-~/.config}/hippius-mem/hippius-mem.toml`).
 - **Existing config**: the bundle is appended as an org-routed `[[teams]]` profile —
-  pass `--orgs github.com/acme` so repos route to it. A conflicting profile name, a
-  different `s3_endpoint`, or a too-low top-level `max_epoch` is **refused with
-  guidance**, never silently overwritten.
+  pass `--orgs github.com/acme` so repos route to it. A conflicting profile name or a
+  different `s3_endpoint` is **refused with guidance**, never silently overwritten.
 
 When `HIPPIUS_MEM_MNEMONIC` is set it also publishes the member key (the same thing
 the bare `hippius-mem join` does) so the founder can `provision` wrapped epoch keys.
@@ -266,39 +265,75 @@ sub-token revocation, is the manual step above):
    member restarts their MCP server with `HIPPIUS_MEM_MNEMONIC` set, which loads the
    new epoch's key. No config edit is needed: startup loads keys up to the newest epoch
    the founder provisioned. A server that cannot load the new key, such as the `serve`
-   daemon (it runs without the mnemonic), refuses every write with an error naming the
+   daemon (it runs without the mnemonic), refuses every note write with an error naming the
    new epoch instead of sealing notes under the old key the removed member holds.
 
-**Resumable.** Steps 2 and 3 are not atomic (they are `rotate --members`'s
-semantics): the rotation can refuse — typically `NothingToRotate` because no
-remaining member has `join`ed yet — after the shrunk membership already landed.
-`remove` is safe to re-run with the exact same address either way:
+`remove` and `rotate` require `HIPPIUS_MEM_MNEMONIC` and refuse before writing anything
+without it: the founder reads a rotated epoch only with its mnemonic. When the founder has
+not run `join`, they publish the founder's member key first and say so, so the new epoch is
+always wrapped to the founder, and the rotation never waits for another member to `join`.
+They never replace a member key the founder already published: when `HIPPIUS_MEM_MNEMONIC` is
+not the mnemonic the founder joined with, they refuse before writing anything, because the
+epochs already wrapped to the published key would stay wrapped to it.
+
+**Resumable.** Steps 2 and 3 are not atomic (they are `rotate --members`'s semantics):
+the rotation can fail (a storage fault, or another rotation taking the same epoch) after
+the shrunk membership already landed; the error says so and names `hippius-mem rotate`.
+`remove` is safe to re-run with the exact same address:
 
 - If the target is already absent from the roster (a prior partial run already
-  published the shrink, or nothing to do), it prints `membership already excludes
-  <ss58> (resuming)` instead of refusing.
-- **A re-run only rotates when the CURRENT epoch's key is still wrapped to the
-  target.** Before rotating, `remove` checks whether the target still holds a wrap
-  of the current epoch (independent of the roster). If they do not — a prior
-  rotation already excluded them, or they never held a wrap at all — it skips the
-  rotation entirely and says so; nothing else needs fixing. If they still do —
-  either a fresh removal, or a half-done resume where rotation never completed —
-  it rotates exactly as before. This matters because **every real rotation forces
-  a team-wide restart**: without this check, re-running `remove` (or simply
-  re-running it against an address that was never a member) after the removal had
-  already fully completed would mint a needless new epoch and force every remaining
-  member to restart for no security benefit.
-- A rotation that could not run yet (`NothingToRotate`) is reported to stdout, not
-  treated as a command failure — `remove`'s own job (shrinking membership) is done
-  regardless. Have the remaining members `join`, then re-run `hippius-mem remove
-  <ss58>` (or plain `hippius-mem rotate`) to finish the rotation.
+  published the shrink, or the address was never a member), it prints `membership
+  already excludes <ss58> (resuming)` instead of refusing, and it does **not** rotate:
+  this invocation changed no membership, and every rotation forces a team-wide
+  restart. A half-done run is therefore finished with plain `hippius-mem rotate`, not
+  by re-running `remove`.
+- A fresh removal always rotates, whether or not the target ever held a wrap (a member
+  who joined by invite bundle holds `team_key_hex` directly and appears in no wrap).
 - The manual sub-token-revoke reminder prints on every run, success or not, resumed
   or not, rotated or not — the membership shrink alone is reason enough to revoke
   it.
 - `hippius-mem doctor` independently flags a rotation that never finished: "removed
   member `<ss58>` still holds the current epoch key" warns whenever the live roster
   and the current epoch's wrapped-key recipients disagree, so a half-done removal
-  is caught even on a machine that never saw the original run's output.
+  is caught even on a machine that never saw the original run's output. While the team
+  is still at epoch 0 it also warns "`<ss58>` was removed from the roster, but the team
+  key was never rotated" for every member an earlier manifest listed: the founding key
+  reaches invite-bundle members as `team_key_hex`, not as a wrap, so the first check
+  cannot see them. A rotated epoch's key travels only in wraps, so the first check covers
+  every later epoch. Run `hippius-mem rotate` to clear either warning. Both checks read
+  the bucket: the wraps, and the manifests the live founder key signed (not those of a
+  founder key replaced by `recover`). A removed member whose sub-token is not yet revoked
+  can delete those objects and silence them, so rotate after every removal rather than
+  wait for `doctor`. When the manifest history cannot be read, `doctor` says the second
+  check did not run.
+- The closing banner says whether this run rotated. A run that did not (the target was
+  already off the roster) says so and names `hippius-mem rotate`.
+
+## Repair an epoch the founder cannot read
+
+Before 0.8.1, a founder that had never run `join` could `rotate` or `remove` and receive no
+wrap of the new epoch: once that command exited, the founder could not read the notes the
+team sealed under it, and its writes were refused. `doctor` on the founder's machine names
+such an epoch. Only the founder (or the recovery key) may wrap an epoch, so the repair goes
+through a member who holds it:
+
+1. On the founder's machine: `HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem join`.
+2. On a member's machine that holds the epoch:
+   `HIPPIUS_MEM_MNEMONIC="<member mnemonic>" hippius-mem admin share-epoch-keys`. For every
+   epoch the founder holds no wrap of, it writes a key share to
+   `{team}/_keyshares/{epoch}/{member}`: the AEAD key of the member's own founder-signed
+   wrap, sealed to the founder's member key.
+3. On the founder's machine: `HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem
+   provision`. It opens the founder-signed wrap with each share, so the key it loads is
+   the one the founder sealed (a share cannot substitute another key), and wraps it to the
+   founder and to every member. Restart the founder's server. The shares under
+   `{team}/_keyshares/` can then be deleted: each opens only a wrap whose key the founder
+   now holds, and every later `provision` lists them until they are gone.
+
+An epoch whose every founder-signed wrap was overwritten (by a member's `provision` before
+0.8.1) cannot be repaired this way: no wrap the founder signed holds its key any more. On
+such an epoch `admin share-epoch-keys` fails and names it, and `doctor` on the founder's
+machine says the epoch cannot be recovered when no member can share it.
 
 > [!NOTE]
 > **Where this is headed.** The paste-ready-bundle onboarding exists today as the CLI

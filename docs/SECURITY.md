@@ -49,9 +49,15 @@ read. What that does and does not buy you, stated plainly.
 - **After a rotation, a process that cannot load the new key stops writing.** A process
   loads a rotated epoch's key only with `HIPPIUS_MEM_MNEMONIC` set (the wrap is opened
   with the mnemonic's x25519 key). The `serve` daemon the installer wires runs without it,
-  so after a `rotate` or `remove` it refuses every write (`EpochSuperseded`, naming the
-  new epoch) and does not show notes sealed under the new epoch, until it can load the
-  key. It never seals a note under the older key a removed member holds. Its writes
+  so after a `rotate` or `remove` it refuses every note write (`remember`, `edit`:
+  `EpochSuperseded`, naming the new epoch; `forget`, `link` and `redact` seal no body and
+  still run on the notes it can read) and does not show notes sealed under the new epoch
+  (`get` says "no team key for epoch N", `recall` and `refresh` carry a `keyless_notes`
+  warning, `brief` leaves them out without one, and `forget`, `link` and `redact` cannot
+  find them), until it can load the key. Every process, daemon or not, lists the team's wraps before it seals each note
+  body, so it does not seal a note under the older key a removed member holds once the new
+  epoch's wraps are in the bucket; the one exception is a write whose listing ran just
+  before those wraps landed. Its writes
   resume only on a server started with the mnemonic; deriving the encryption key from
   the per-machine `author_seed_hex` instead is a planned format change, not in this
   release. An epoch counts as rotated only when a wrap at it is signed by the founder or
@@ -546,8 +552,9 @@ key.
 
 - Who publishes decides what the check is worth, so no client publishes one on its own
   judgment. `rotate` (and `remove`) publish the new epoch's check, `provision` publishes the
-  founder's epochs, and `hippius-mem admin keycheck publish` publishes it for a team that
-  predates the check. Each publish first tries its key on the epoch's 16 oldest notes (a
+  founder's epochs, `upgrade` publishes the trial vault's (its one user sealed every note it
+  copies), and `hippius-mem admin keycheck publish` publishes it for a team that predates the
+  check. Each publish first tries its key on the epoch's 16 oldest notes (a
   missing or altered blob counts for neither side) and publishes nothing when most of those it
   could read fail to open (`--replace` included), because that check
   would refuse the clients whose key those notes were sealed under; an epoch with no notes is
@@ -620,7 +627,14 @@ an attacker could vary (epoch, ephemeral public key, ciphertext, provisioner key
 is the same author-signature discipline every other bucket-stored type carries, and
 `unwrap_team_key` checks it before spending any ECDH work — a bucket writer who only
 knows a recipient's *public* x25519 key cannot forge a wrap installing an
-attacker-chosen team key. The signed transcript is `hippius-memory-teamkey-wrap-sign/v2`
+attacker-chosen team key. Readers accept a wrap only when its provisioner is the live
+manifest's founder or trusted recovery key, and `provision` refuses any other signer before it
+writes. Every wrap write reads the slot first and keeps a wrap a reader accepts, so neither a
+member's `provision` nor a re-run by the founder can replace a wrap that holds an epoch key
+(the read comes first because a gateway that ignores `If-None-Match` would overwrite a
+create-only write). That check runs in the 0.8.1 client: a member still on 0.8.0, or anyone
+with bucket write, can still overwrite a wrap object. Readers then refuse the replacement,
+and the founder's next `provision` re-creates the wrap for every epoch the founder holds. The signed transcript is `hippius-memory-teamkey-wrap-sign/v2`
 (every field length-framed, including `epoch`). `/v1` used a raw-LE `epoch` and is not
 read: this is a pre-release clean break, so upgrade means re-`provision` / `rotate`
 rather than a dual-read window. A joining member who was never handed the key **bootstraps**
@@ -630,6 +644,23 @@ a removed member gets no wrap of the new epoch and cannot read writes sealed und
 while older epochs stay wrapped so previously shared notes remain readable. The full
 lifecycle (join, removal, rotation, forged-author rejection) is exercised in
 `hippius-mem-core/tests/e2e_phase3.rs`.
+
+**A rotation never strands its founder.** The founder reads a rotated epoch only from a wrap
+addressed to its own member key, and nobody else may wrap one to it. So `rotate_key` refuses
+(`FounderHasNoMemberKey`) before writing any wrap when none would be addressed to the
+founder, and the CLI's `rotate` / `remove` require `HIPPIUS_MEM_MNEMONIC` and publish the
+founder's member key first when it is missing. An epoch an older release minted without the
+founder is repaired by a key share (`admin share-epoch-keys`): a member seals to the founder
+the AEAD key of its own founder-signed wrap of that epoch, and the founder's `provision`
+opens that founder-signed ciphertext with it. The founder trusts no member for the key
+itself: a share carrying any other AEAD key fails the Poly1305 tag of the founder's
+ciphertext, and a share is only ever used with a wrap the founder or the recovery key
+signed. A share is its own object, not a wrap: it carries no provisioner and no signature
+(the founder trusts it for nothing, so a sender's signature would prove nothing a reader
+checks), neither object parses as the other, and its additional data names its own domain
+(`hippius-memory-keyshare-v1`), so a share's sealed box never opens as a wrap of a team key. A share
+reveals nothing the bucket does not already guard: it opens only that one wrap, whose key
+the member already holds, and only the founder's x25519 secret opens the share.
 
 **Sub-token minting (`console` feature).** Minting a per-developer S3 sub-token from the
 same mnemonic is wired behind the opt-in `console` Cargo feature: it derives an ETH key

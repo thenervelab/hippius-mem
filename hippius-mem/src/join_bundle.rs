@@ -531,11 +531,14 @@ fn render_fresh_config(
 /// - a profile (primary or `[[teams]]`) already named `bundle.team`;
 /// - an `s3_endpoint` differing from the existing top level (a shared
 ///   TOP-LEVEL key — one file cannot speak to two gateways);
-/// - a bundle `max_epoch` above the existing top level (also TOP-LEVEL; a
-///   silent drop would hide every post-rotation note — the documented rotate
-///   gotcha);
 /// - no `--orgs` (an org-less `[[teams]]` profile is a second catch-all,
 ///   which `Config::validate` rejects at the next launch).
+///
+/// A bundle `max_epoch` above the existing top-level one is not a conflict:
+/// startup lists the epochs wrapped to this member, and `max_epoch` is only the
+/// range it tries when that listing fails. It is raised to the bundle's, so
+/// that range covers the joined team too; a higher value only costs another
+/// profile GETs of epochs it never minted.
 ///
 /// The full candidate document is validated before the block is appended, so
 /// a refused append leaves the existing file byte-identical. A successful
@@ -581,18 +584,6 @@ fn append_profile(
             path = path.display()
         );
     }
-    if let Some(epoch) = bundle.max_epoch
-        && existing.max_epoch < epoch.get()
-    {
-        bail!(
-            "this team has rotated to epoch {epoch}, but {path} sets max_epoch = {existing_epoch}; \
-             max_epoch is a shared TOP-LEVEL key — raise `max_epoch = {epoch}` at the top of the \
-             file (before any [[teams]] table), then re-run; a stale max_epoch silently hides \
-             every note sealed after the rotation",
-            existing_epoch = existing.max_epoch,
-            path = path.display()
-        );
-    }
     if orgs.is_empty() {
         let suggestion = derived_org_suggestion().map_or_else(String::new, |org| {
             format!(", e.g. --orgs {org} (this repo's origin)")
@@ -618,8 +609,16 @@ fn append_profile(
     };
     let block =
         Zeroizing::new(toml::to_string(&doc).context("serializing the [[teams]] profile as TOML")?);
+    let raised = bundle
+        .max_epoch
+        .map(std::num::NonZeroU64::get)
+        .filter(|&bundle_max| bundle_max > existing.max_epoch);
+    let head = match raised {
+        None => Zeroizing::new(existing_text.as_str().to_owned()),
+        Some(bundle_max) => with_max_epoch(&existing_text, bundle_max, path)?,
+    };
     // Validate the exact document the file will hold; only then touch disk.
-    let candidate = Zeroizing::new(format!("{}\n{}", existing_text.as_str(), block.as_str()));
+    let candidate = Zeroizing::new(format!("{}\n{}", head.as_str(), block.as_str()));
     Config::from_toml_str(&candidate).with_context(|| {
         format!(
             "appending team `{}` would make {} invalid; nothing was written",
@@ -627,18 +626,67 @@ fn append_profile(
             path.display()
         )
     })?;
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {} for append failed", path.display()))?;
-    file.write_all(format!("\n{}", block.as_str()).as_bytes())
-        .with_context(|| format!("appending the profile to {} failed", path.display()))?;
-    // The file now PROVABLY holds a live secret (we just appended one), so pin
-    // it to 0600 regardless of the mode it had before — preserving a looser
-    // pre-existing mode would be preserving a leak, not a feature.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("setting 0600 on {} failed", path.display()))?;
+    replace_config(path, &candidate)?;
+    if let Some(bundle_max) = raised {
+        let _ = writeln!(
+            std::io::stdout(),
+            "raised the top-level max_epoch in {} from {} to {bundle_max}, the joined team's",
+            path.display(),
+            existing.max_epoch
+        );
+    }
     Ok(WriteOutcome::AppendedProfile)
+}
+
+/// `text` with its top-level `max_epoch` set to `max_epoch`, every other line
+/// kept as written.
+fn with_max_epoch(text: &str, max_epoch: u64, path: &Path) -> anyhow::Result<Zeroizing<String>> {
+    let mut document: toml_edit::DocumentMut = text.parse().with_context(|| {
+        format!(
+            "the existing config at {} is not valid TOML",
+            path.display()
+        )
+    })?;
+    let value = i64::try_from(max_epoch).context("max_epoch does not fit a TOML integer")?;
+    document["max_epoch"] = toml_edit::value(value);
+    Ok(Zeroizing::new(document.to_string()))
+}
+
+/// Replace the config at `path` with `text`: written to a 0600 sibling first,
+/// then renamed over it, so a failed write leaves the old file whole.
+///
+/// A config reached through a symlink (a dotfiles manager's) keeps the link:
+/// the sibling is staged beside the file the link resolves to, and the rename
+/// replaces that file. A leftover at the staging path (an earlier run that
+/// stopped, or a planted symlink) is removed, and the staged file is created
+/// new at 0600, so the secret is never written through a link or into a file
+/// with a looser mode. The file ends at exactly 0600 whatever mode it had
+/// before: keeping a looser one would keep a leak.
+fn replace_config(path: &Path, text: &str) -> anyhow::Result<()> {
+    let target = std::fs::canonicalize(path)
+        .with_context(|| format!("resolving the config path {} failed", path.display()))?;
+    let staged = target.with_extension("toml.joining");
+    match std::fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("removing the stale {} failed", staged.display()));
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged)
+        .with_context(|| format!("creating {} failed", staged.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {} failed", staged.display()))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting 0600 on {} failed", staged.display()))?;
+    std::fs::rename(&staged, &target)
+        .with_context(|| format!("replacing {} failed", target.display()))
 }
 
 /// Best-effort `--orgs` suggestion from the current repo's `origin` remote,
@@ -674,8 +722,8 @@ async fn publish_member_key(cfg: &Config, team: &str) -> anyhow::Result<bool> {
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
     // `all_profiles` covers both outcomes: the fresh primary and the appended
-    // `[[teams]]` profile — the bare `join` is primary-only, but here the
-    // joined team may be either.
+    // `[[teams]]` profile. The joined team is picked by name, not by the git
+    // remote the bare `join` routes by, since the cwd need not route to it.
     let profile = cfg
         .all_profiles()
         .into_iter()
@@ -732,21 +780,25 @@ fn print_next_steps(bundle: &InviteBundle, published: bool) {
         "\nNext steps:\n\
          1. Reconnect Claude Code with /mcp (or start a new session) so the\n\
             server picks up the new profile.\n\
-         2. Verify the setup: hippius-mem doctor   (--offline to skip the gateway probe)"
+         2. Verify the setup: hippius-mem doctor   (--offline to skip the gateway probe)\n\
+            Run it, and `hippius-mem join`, from a checkout of one of the team's\n\
+            repositories: team commands act on the profile the git remote routes to."
     );
     if bundle.max_epoch.is_some() {
         if published {
             let _ = writeln!(
                 out,
                 "3. This team has ROTATED its key: your member key is published — ask the\n\
-                    founder to run `hippius-mem provision` so the newer epoch keys reach you."
+                    founder to run `hippius-mem provision`, which wraps every epoch key the\n\
+                    founder holds to you."
             );
         } else {
             let _ = writeln!(
                 out,
-                "3. This team has ROTATED its key: to receive wrapped epoch keys, set\n\
+                "3. This team has ROTATED its key: to receive its epoch keys, set\n\
                     HIPPIUS_MEM_MNEMONIC and run `hippius-mem join`, then ask the founder\n\
-                    to run `hippius-mem provision`."
+                    to run `hippius-mem provision`, which wraps every epoch key the founder\n\
+                    holds to you."
             );
         }
     }
@@ -1042,43 +1094,14 @@ mod tests {
         Ok(())
     }
 
+    /// A bundle from a team that rotated appends to a config whose top-level
+    /// `max_epoch` is lower, and raises it to the bundle's, so the range
+    /// startup tries when listing the wraps fails covers the joined team. The
+    /// append used to be refused, and then kept the lower value.
     #[test]
-    fn append_with_stale_max_epoch_is_refused_with_guidance() -> anyhow::Result<()> {
-        // The rotate gotcha: silently dropping max_epoch would hide every
-        // post-rotation note. The refusal names the exact top-level edit.
+    fn append_with_a_lower_max_epoch_is_accepted() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = existing_primary(dir.path())?;
-        let mut bundle = sample_bundle("acme");
-        bundle.max_epoch = NonZeroU64::new(2);
-        let err = write_config(
-            &path,
-            &bundle,
-            &hex64("cd"),
-            &["github.com/acme".to_owned()],
-        )
-        .expect_err("a stale top-level max_epoch must be refused");
-        assert!(
-            format!("{err:#}").contains("max_epoch = 2"),
-            "names the exact edit: {err:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn append_with_covering_max_epoch_is_accepted() -> anyhow::Result<()> {
-        // An existing max_epoch at or above the bundle's already bootstraps
-        // the rotated epochs — no conflict.
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("hippius-mem.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "max_epoch = 5\nteam = \"primary\"\nbucket = \"b1\"\naccess_key_id = \"AK1\"\n\
-                 secret = \"s1\"\nteam_key_hex = \"{key}\"\nauthor_seed_hex = \"{seed}\"\n",
-                key = hex64("11"),
-                seed = hex64("22"),
-            ),
-        )?;
         let mut bundle = sample_bundle("acme");
         bundle.max_epoch = NonZeroU64::new(2);
         write_config(
@@ -1087,9 +1110,93 @@ mod tests {
             &hex64("cd"),
             &["github.com/acme".to_owned()],
         )?;
-        let cfg = Config::from_toml_str(&std::fs::read_to_string(&path)?)?;
-        assert_eq!(cfg.max_epoch, 5);
+        let text = std::fs::read_to_string(&path)?;
+        let cfg = Config::from_toml_str(&text)?;
+        assert_eq!(cfg.max_epoch, 2);
         assert_eq!(cfg.teams[0].name, "acme");
+        assert!(
+            text.contains("team = \"primary\"\nbucket = \"b1\""),
+            "the existing lines are kept as written: {text}"
+        );
+        Ok(())
+    }
+
+    /// A config that already sets a lower top-level `max_epoch` has that line
+    /// replaced, not a second one added (a duplicate key would not load).
+    #[test]
+    fn append_replaces_a_lower_max_epoch_line() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = existing_primary(dir.path())?;
+        let text = format!("max_epoch = 1\n{}", std::fs::read_to_string(&path)?);
+        std::fs::write(&path, text)?;
+        let mut bundle = sample_bundle("acme");
+        bundle.max_epoch = NonZeroU64::new(3);
+        write_config(
+            &path,
+            &bundle,
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )?;
+        let text = std::fs::read_to_string(&path)?;
+        assert_eq!(Config::from_toml_str(&text)?.max_epoch, 3);
+        assert_eq!(text.matches("max_epoch").count(), 1, "{text}");
+        Ok(())
+    }
+
+    /// A config that is a symlink (a dotfiles manager's) stays one: the
+    /// append lands in the file it points to. A file planted at the staging
+    /// path, here a symlink to another file, is replaced, never written
+    /// through. The append used to rename its staged file over the symlink,
+    /// and opened the staging path following a symlink there.
+    #[test]
+    fn append_writes_through_a_symlinked_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let managed = dir.path().join("dotfiles");
+        std::fs::create_dir(&managed)?;
+        let target = existing_primary(&managed)?;
+        let path = dir.path().join("hippius-mem.toml");
+        std::os::unix::fs::symlink(&target, &path)?;
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "untouched")?;
+        std::os::unix::fs::symlink(&elsewhere, target.with_extension("toml.joining"))?;
+
+        write_config(
+            &path,
+            &sample_bundle("acme"),
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )?;
+        assert!(std::fs::symlink_metadata(&path)?.file_type().is_symlink());
+        let cfg = Config::from_toml_str(&std::fs::read_to_string(&target)?)?;
+        assert_eq!(cfg.teams[0].name, "acme");
+        assert_eq!(std::fs::read_to_string(&elsewhere)?, "untouched");
+        let mode = std::fs::metadata(&target)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        Ok(())
+    }
+
+    /// A leftover at the staging path that cannot be removed (here a
+    /// directory) stops the append with that cause, and the config is left
+    /// as it was. Taking every removal failure for "nothing there" would
+    /// report a confusing create failure instead.
+    #[test]
+    fn append_names_a_staging_leftover_it_cannot_remove() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = existing_primary(dir.path())?;
+        let before = std::fs::read(&path)?;
+        let staged = path.with_extension("toml.joining");
+        std::fs::create_dir(&staged)?;
+        std::fs::write(staged.join("inside"), "x")?;
+
+        let err = write_config(
+            &path,
+            &sample_bundle("acme"),
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )
+        .expect_err("the leftover cannot be removed");
+        assert!(format!("{err:#}").contains("removing the stale"), "{err:#}");
+        assert_eq!(std::fs::read(&path)?, before);
         Ok(())
     }
 

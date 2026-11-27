@@ -174,22 +174,44 @@ pub enum MemError {
         /// token-set Jaccard on a lexical build.
         similarity: f32,
     },
-    /// A key rotation found no published member key the current manifest
-    /// authorizes, so the new epoch's key would be wrapped to no one.
+    /// The team's founder has no published member key, so a new epoch would
+    /// be wrapped to every member but the founder (or to no one), or the
+    /// founder cannot be sent a key share. On an open team (no manifest, no
+    /// pin) it names the rotating author, which is the only signer a wrap of
+    /// that rotation must reach.
     //
-    // Refused BEFORE the write epoch advances: sealing future notes under a key
-    // that exists only in the rotating process would make them unreadable to the
-    // entire team once that process exits. Distinct from `Unauthorized` (the
-    // caller IS permitted to rotate; there is simply no one to rotate for) — the
-    // fix is operational (`join` + manifest), not a permission change.
+    // A rotation refuses this BEFORE it writes a wrap: the founder reads a
+    // rotated epoch only from a wrap addressed to its own member key, so an
+    // epoch minted without one is lost to the founder once the rotating
+    // process exits, and only the founder (or the recovery key) can wrap it.
     #[error(
-        "nothing to rotate for team {team}: no published member key is authorized by the current \
-         manifest; members must `join` (and the manifest must list them) before a rotation can \
-         wrap the new epoch key to anyone"
+        "the founder {founder} of team {team} has no published member key, so no wrap of a new \
+         epoch or key share can be addressed to it; run `hippius-mem join` on the founder's \
+         machine with HIPPIUS_MEM_MNEMONIC set (`rotate` and `remove` do this themselves when \
+         it is set), then retry"
     )]
-    NothingToRotate {
-        /// The team whose rotation found no authorized wrap target.
+    FounderHasNoMemberKey {
+        /// The team whose founder has no member key.
         team: String,
+        /// The founder's address.
+        founder: String,
+    },
+    /// The member key published for this machine's author names another
+    /// x25519 key than the one `HIPPIUS_MEM_MNEMONIC` derives, so a rotation
+    /// would wrap the new epoch to a key this mnemonic cannot open, or would
+    /// have to replace the published key and leave the older epochs wrapped to
+    /// the old one. Refused before any write.
+    #[error(
+        "the member key published for {member} on team {team} was made with another mnemonic \
+         than HIPPIUS_MEM_MNEMONIC; set it to the mnemonic this machine joined with, or run \
+         `hippius-mem join` to re-key on purpose (epochs already wrapped to the old key then \
+         stay unreadable to this machine)"
+    )]
+    MemberKeyMismatch {
+        /// The team.
+        team: String,
+        /// The author whose published member key differs.
+        member: String,
     },
     /// A wrap slot of the epoch a rotation picked was taken while it wrote (a
     /// concurrent rotation), so finishing would split that epoch between two

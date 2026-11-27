@@ -12,8 +12,8 @@ use hippius_mem_core::{
     BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyCheckMatch, KeyProbe, MemError,
     MemoryStore, OpLogStore, QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail,
     derive_identity, find_suppressed_tails, key_check_key, load_manifest,
-    matches_published_key_check, open, probe_create_only, read_heads, read_wrapped_key, seal,
-    wrapped_key_recipients,
+    matches_published_key_check, members_ever_listed, open, probe_create_only, read_heads,
+    read_wrapped_key, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -340,6 +340,9 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         for line in removed.await {
             tracing::warn!("{line}");
         }
+        for line in unrotated_removal_lines(blob, team, founder.as_ref(), epoch).await {
+            tracing::warn!("{line}");
+        }
         // Same best-effort placement and reasoning again: this check never
         // decrypts a wrap (no team key needed), only checks its provisioner
         // signature and, against the live manifest, its authorization -- so it
@@ -380,6 +383,17 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         }
         Some(_) | None => None,
     };
+
+    // A store of its own, because loading the rotated keys changes the ring and
+    // write epoch the key probes below run against.
+    if let Ok(reader) = key_probe_store(cfg, profile).await {
+        if let Some(mnemonic) = mnemonic.as_deref() {
+            crate::admin::bootstrap_epochs(&reader, mnemonic, cfg.max_epoch).await;
+        }
+        for line in keyless_epoch_lines(&reader, &author, mnemonic.is_some()).await {
+            tracing::warn!("{line}");
+        }
+    }
 
     probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store, epoch).await?;
     if let Some(line) = newest_epoch {
@@ -427,10 +441,10 @@ async fn newest_epoch_key_line(
     };
     let cause = match store.open_epoch_key(&identity, epoch).await {
         Err(MemError::NotFound { .. }) => {
+            let remedy = missing_epoch_remedy(store, author, epoch).await;
             return Some(format!(
                 "FAIL: team {team:?} rotated to epoch {epoch}, and no wrap of its key is \
-                 addressed to this machine ({author}); run `hippius-mem join` here, then ask \
-                 the founder to run `hippius-mem provision`"
+                 addressed to this machine ({author}); {remedy}"
             ));
         }
         Err(err @ (MemError::Unauthorized(_) | MemError::Serialize(_))) => format!(
@@ -448,6 +462,73 @@ async fn newest_epoch_key_line(
     Some(format!(
         "FAIL: team {team:?} epoch {epoch}: the wrap addressed to this machine ({author}) {cause}"
     ))
+}
+
+/// One warning line per epoch whose notes `store` leaves out because it holds
+/// no key for that epoch, after a sync, each naming the fix. `store` holds
+/// every key this machine can load (the caller bootstrapped it when
+/// `has_mnemonic`), so an epoch named here is one whose notes this machine's
+/// server does not show. A failed sync yields no lines: the storage probe
+/// reports it.
+///
+/// Costs one full sync: the op-log read and a GET per note this machine has
+/// not cached.
+async fn keyless_epoch_lines(
+    store: &MemoryStore,
+    author: &Ss58,
+    has_mnemonic: bool,
+) -> Vec<String> {
+    if store.sync().await.is_err() {
+        return Vec::new();
+    }
+    let team = store.team();
+    let mut lines = Vec::new();
+    for (epoch, notes) in store.keyless_notes() {
+        let remedy = if has_mnemonic {
+            missing_epoch_remedy(store, author.as_str(), epoch).await
+        } else {
+            "set HIPPIUS_MEM_MNEMONIC to this member's mnemonic, which loads the epochs wrapped \
+             to it, and run `hippius-mem doctor` again"
+                .to_owned()
+        };
+        lines.push(format!(
+            "WARN: team {team:?}: {notes} note(s) are sealed under epoch {epoch}, which this \
+             machine ({author}) holds no key for, so its server does not show them; {remedy}",
+            author = author.as_str(),
+        ));
+    }
+    lines
+}
+
+/// What a machine whose author is `author` does to get a wrap of `epoch` it
+/// lacks. A member asks the founder to provision. The founder cannot provision
+/// a key it does not hold: an epoch minted before the founder had a member key
+/// reached the members only, so a member sends the founder a key share, which
+/// the founder's next `provision` loads and wraps. No share can be made from a
+/// member wrap no reader accepts, so an epoch whose every member wrap a 0.8.0
+/// member `provision` replaced is lost, and the remedy says so.
+async fn missing_epoch_remedy(store: &MemoryStore, author: &str, epoch: u64) -> String {
+    let founder = store
+        .membership_manifest()
+        .await
+        .ok()
+        .flatten()
+        .map(|manifest| manifest.founder);
+    if founder.is_some_and(|founder| founder.as_str() == author) {
+        format!(
+            "this founder holds no key for epoch {epoch} (it was minted before this founder's \
+             member key was published, so only members received it); run `hippius-mem join` \
+             here if this machine has not, have a member who holds epoch {epoch} run \
+             `hippius-mem admin share-epoch-keys`, then run `hippius-mem provision` here with \
+             HIPPIUS_MEM_MNEMONIC set; if every member's attempt says it cannot share epoch \
+             {epoch}, a member's `provision` before 0.8.1 replaced their wraps and the epoch \
+             cannot be recovered"
+        )
+    } else {
+        "run `hippius-mem join` here if this machine has not, then ask the founder to run \
+         `hippius-mem provision`, which wraps every epoch the founder holds"
+            .to_owned()
+    }
 }
 
 /// The failure line when `key`, the key this machine loaded for the rotated
@@ -682,8 +763,8 @@ async fn check_team_key(
 ///
 /// This is the read-side detector for the recorded `rotate --members`
 /// non-atomicity gotcha: `publish_membership` can land while `rotate_key`
-/// then refuses (typically `MemError::NothingToRotate` because no remaining
-/// member has `join`ed yet), leaving a removed member's wrap for the CURRENT
+/// then fails (a storage fault, or another rotation taking the epoch),
+/// leaving a removed member's wrap for the CURRENT
 /// epoch on the bucket even though the manifest no longer lists them —
 /// `hippius-mem remove` is now resumable and reports this itself on the run
 /// that hits it (see `crate::admin::remove`), but a machine that never
@@ -736,6 +817,56 @@ async fn removed_member_still_holds_key_lines(
             format!(
                 "WARN: removed member {ss58} still holds the current epoch key; run: \
                  hippius-mem rotate (then revoke their sub-token in the console)",
+                ss58 = ss58.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// One warning line per member an earlier manifest listed and the live one
+/// does not, when the team never rotated past epoch 0 (`epoch`, the newest
+/// epoch the founder provisioned, is 0).
+///
+/// The complement of [`removed_member_still_holds_key_lines`], for the case it
+/// cannot see. A rotated epoch's key reaches a member only as a wrap, so for an
+/// epoch above 0 a removed member who still holds it holds a wrap of it, which
+/// that check reports. The founding key also travels without one: `join
+/// --bundle` hands it over as `team_key_hex`, and a member who never joined
+/// appears in no wrap at all. So while the team is still at epoch 0, every
+/// member ever listed may hold the key every note is sealed under (if they ever
+/// received it), and a removal that never rotated
+/// (a `remove` before 0.8.1 with nobody joined, or a rotation that failed after
+/// the roster shrank) leaves that open. Silent when the live manifest cannot
+/// be loaded (the storage probe reports that); one line saying the check did
+/// not run when the manifest history cannot be read.
+async fn unrotated_removal_lines(
+    blob: &dyn BlobStore,
+    team: &str,
+    founder: Option<&Ss58>,
+    epoch: u64,
+) -> Vec<String> {
+    if epoch != 0 {
+        return Vec::new();
+    }
+    let Ok(Some(manifest)) = load_manifest(blob, team, founder).await else {
+        return Vec::new();
+    };
+    let ever = match members_ever_listed(blob, team, &manifest).await {
+        Ok(ever) => ever,
+        Err(err) => {
+            return vec![format!(
+                "WARN: could not read the team's manifest history ({err}), so this run cannot \
+                 tell whether a member was removed without a rotation; run `hippius-mem doctor` \
+                 again"
+            )];
+        }
+    };
+    ever.difference(&manifest.members)
+        .map(|ss58| {
+            format!(
+                "WARN: {ss58} was removed from the roster, but the team key was never rotated, \
+                 so if they ever received it they still hold the key every note is sealed \
+                 under; run: hippius-mem rotate (then revoke their sub-token in the console)",
                 ss58 = ss58.as_str(),
             )
         })
@@ -1262,11 +1393,11 @@ mod tests {
 
     use super::{
         PROBE_KEY_PREFIX, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key,
-        config_for_key_probe, create_only_line, head_regression_lines, newest_epoch_key_line,
-        offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
-        probe_storage_then_team_key, quarantine_lines, removed_member_still_holds_key_lines,
-        resolve_profile_for_remote, suppressed_tail_lines,
-        unsigned_or_unauthorized_wrapped_key_lines,
+        config_for_key_probe, create_only_line, head_regression_lines, keyless_epoch_lines,
+        newest_epoch_key_line, offline_report_lines, op_log_integrity_lines,
+        probe_encryption_boundary, probe_live, probe_storage_then_team_key, quarantine_lines,
+        removed_member_still_holds_key_lines, resolve_profile_for_remote, suppressed_tail_lines,
+        unrotated_removal_lines, unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
     use crate::setup::hermes::HermesWiring;
@@ -2036,6 +2167,55 @@ mod tests {
             team.to_owned(),
             1,
         ))
+    }
+
+    /// A machine without the key of an epoch that holds notes is told, with the
+    /// epoch, the count and the fix; a machine that holds every key is told
+    /// nothing. `doctor` used to pass a member that could not read an older
+    /// epoch as long as it held the newest one.
+    #[tokio::test]
+    async fn keyless_epoch_lines_name_each_epoch_this_machine_cannot_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = key_store(&blob, TEAM, [41_u8; 32], [7_u8; 32])?;
+        founder
+            .join_as_member(&derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?)
+            .await?;
+        assert_eq!(founder.rotate_key(0).await?.new_epoch, 1);
+        for summary in ["one under epoch one", "two under epoch one"] {
+            founder
+                .remember(RememberInput {
+                    note_type: NoteType::Decision,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: summary.to_owned(),
+                    body: "body".to_owned(),
+                    force: true,
+                })
+                .await?;
+        }
+        let author = Sr25519Signer::from_seed_with_prefix(&[41_u8; 32], NetworkPrefix::HIPPIUS)?
+            .author_ss58();
+
+        let lagging = key_store(&blob, TEAM, [42_u8; 32], [7_u8; 32])?;
+        let lines = keyless_epoch_lines(&lagging, &author, true).await;
+        let [line] = lines.as_slice() else {
+            return Err(format!("one line expected: {lines:?}").into());
+        };
+        assert!(
+            line.contains("2 note(s) are sealed under epoch 1")
+                && line.contains("ask the founder to run `hippius-mem provision`"),
+            "{line}"
+        );
+        assert!(
+            keyless_epoch_lines(&founder, &author, true)
+                .await
+                .is_empty()
+        );
+        Ok(())
     }
 
     /// A store that refuses every request, as a gateway does for a wrong secret.
@@ -2892,6 +3072,87 @@ mod tests {
             "a bundle-provisioned member is invisible to this _keys/-only check by \
              construction -- `remove`'s always-rotate-on-removal is the primary guard \
              against their stale key, not this doctor check: {lines:?}"
+        );
+
+        // The manifest history sees them: the team never rotated past epoch 0,
+        // so the removed member still holds the key every note is sealed under.
+        // Before, `doctor` passed this team silently.
+        let lines = unrotated_removal_lines(&blob, TEAM, None, 0).await;
+        assert_eq!(lines.len(), 1, "one line for the removed member: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains(bundle_identity.ss58.as_str())
+                && line.contains("never rotated")
+                && line.contains("run: hippius-mem rotate"),
+            "{line}"
+        );
+        assert!(
+            unrotated_removal_lines(&blob, TEAM, None, 1)
+                .await
+                .is_empty(),
+            "a rotated epoch's key travels only in wraps, which the other check covers"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] whose `get` of one key fails with a storage error.
+    struct FailingGetBlobStore {
+        inner: MemoryBlobStore,
+        failing: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FailingGetBlobStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key == self.failing {
+                return Err(MemError::Storage("the gateway is down".to_owned()));
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// When an older manifest cannot be read, the unrotated-removal check says
+    /// it did not run instead of reporting nothing. One failed read used to
+    /// hide every removal warning, which reads as "no removal went unrotated".
+    #[tokio::test]
+    async fn unrotated_removal_lines_report_a_history_they_could_not_read() -> Result<(), MemError>
+    {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let removed = derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?.ss58;
+        let inner = MemoryBlobStore::default();
+        for (version, members) in [(0, BTreeSet::from([removed])), (1, BTreeSet::new())] {
+            let manifest =
+                TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), members, version);
+            publish_manifest(&inner, &manifest).await?;
+        }
+        let mut manifests = inner.list(&format!("{TEAM}/_manifest/")).await?;
+        manifests.sort();
+        let blob = FailingGetBlobStore {
+            inner,
+            failing: manifests[0].clone(),
+        };
+
+        let lines = unrotated_removal_lines(&blob, TEAM, None, 0).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("could not read the team's manifest history"),
+            "{}",
+            lines[0]
         );
         Ok(())
     }

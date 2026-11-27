@@ -78,11 +78,11 @@ pub use crate::ulid::Ulid;
 pub use error::{IntegrityFailure, MemError, Result as MemResult};
 pub use identity::{
     ChallengeResp, DEFAULT_CONSOLE_BASE_URL, FileManifestMarker, Identity, ManifestMarker,
-    MemberKey, MnemonicChallengeReq, S3Creds, SessionData, SubTokenReq, SubTokenResp, TeamManifest,
-    VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key, load_manifest,
-    load_member_keys, provision_team_key, publish_manifest, publish_member_key, read_wrapped_key,
-    rotate_team_key, signer_from_mnemonic, ss58_decode, ss58_encode, unwrap_team_key,
-    wrap_team_key, wrapped_key_key, wrapped_key_recipients,
+    MemberKey, MnemonicChallengeReq, Provisioned, S3Creds, SessionData, SubTokenReq, SubTokenResp,
+    TeamManifest, VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key,
+    load_manifest, load_member_keys, members_ever_listed, provision_team_key, publish_manifest,
+    publish_member_key, read_wrapped_key, rotate_team_key, signer_from_mnemonic, ss58_decode,
+    ss58_encode, unwrap_team_key, wrap_team_key, wrapped_key_key, wrapped_key_recipients,
 };
 #[cfg(feature = "console")]
 pub use identity::{ConsoleClient, eth_signer_from_mnemonic};
@@ -105,9 +105,10 @@ pub use report::{
 };
 pub use store::{
     AnchorProof, BlobStats, BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, Degradation,
-    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, KeyCheckMatch,
-    KeyCheckPublished, KeyProbe, MIN_GC_GRACE, MemoryBlobStore, MemoryStore, NoteHistory,
-    OpKindLabel, OpStats, PublishKeyCheck, RecallInput, RememberInput, RotationOutcome,
-    S3BlobStore, SealedRecord, TeamKeyCheck, copy_store, key_check_key, load_latest_snapshot,
-    matches_published_key_check, probe_create_only, save_snapshot,
+    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, Joined, KeyCheckMatch,
+    KeyCheckPublished, KeyProbe, KeyShares, MIN_GC_GRACE, MemoryBlobStore, MemoryStore,
+    NoteHistory, OpKindLabel, OpStats, PublishKeyCheck, RecallInput, RememberInput,
+    RotationOutcome, S3BlobStore, SealedRecord, TeamKeyCheck, breaks_a_line, copy_store,
+    key_check_key, load_latest_snapshot, matches_published_key_check, probe_create_only,
+    save_snapshot,
 };

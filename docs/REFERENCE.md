@@ -211,7 +211,7 @@ a project can pin its own config. (This resolution is identical on macOS and Lin
 | — | `HIPPIUS_MEM_STATE_DIR` | Base directory for this machine's local **state**: `hippius-mem/state/<team>/` holds `head-watermarks.json` (the per-author head high-water marks that back `reconcile`'s `head_regressions`) plus `writer.lock`, `writer-tip-v3-<bucket>.json` and `writer-tip.json` (the cross-process writer lock that serializes same-machine writers on every backend; this version's tip file, one per bucket (the bucket name, or a local vault's root, not the endpoint URL) with one entry per author key, so two author seeds, or one team name used against two buckets, each keep their own chain, and sessions that reach one bucket through different endpoint URLs (a trailing slash, a host alias, a proxy) share one tip; an author has one entry per endpoint, and a write uses another endpoint's newer entry only after a GET finds that entry's op in its bucket, so two gateways that each hold a bucket of the same name never chain to each other's ops or erase each other's entries (exact where the gateway's GET is read-after-write consistent; an entry whose unconfirmed op has not landed and whose committed op id is unknown is ignored); and the single-tip file hippius-mem 0.7.1 and earlier read, kept current for them during a rollout). A `writer-tip-v2-<location>.json` left by a pre-release 0.8.0 build is not read and can be deleted. Env var only, no TOML field. Unset resolves the first of `XDG_STATE_HOME`, `XDG_DATA_HOME`, `$HOME/.local/share` that is set, so on a default macOS/Linux box the files live under `~/.local/share/hippius-mem/state/`. Deleting a team's `head-watermarks.json` is the documented remedy for the benign regressions in [Security](SECURITY.md#threat-model--honest-limits); it also disables rollback detection until this machine verifies a head again (the lock and tip files are recreated on demand). |
 | — | `HIPPIUS_MEM_CACHE_DIR` | Root of the **disposable** encrypted blob cache (per-team subdirectory). Env var only, no TOML field. Unset uses `$XDG_CACHE_HOME`, else `~/.cache`, under `hippius-mem/<team>`; `off` or an empty value disables caching. Safe to delete — it is rebuilt from the bucket, and unlike the state directory nothing verified is lost with it. |
 | — | `HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT` | Opt out of the `https://`-only requirement on `s3_endpoint`, for a local or dev gateway (e.g. MinIO over http). Env var only. Env values are case-insensitive: unset/empty/`0`/`false`/`no`/`off` keep the requirement; anything else set opts out. Note bodies are E2E-encrypted regardless, but over http the object **keys and metadata** (note ids, key epochs, member SS58s) travel in cleartext — do not set this against a production gateway. |
-| — | `HIPPIUS_MEM_MNEMONIC` | The developer's BIP-39 mnemonic. Env var only — **never stored in the config file**. 🔒 Secret. Gates every mnemonic-derived flow (the list is not exhaustive): the startup epoch-key bootstrap wherever a store boots (`serve`, `brief`, `report`, `upgrade`, …), member-key publish (`join`), and console minting (`mint-token`, `invite`). Founder flows **degrade** without it: `rotate` / `remove` warn and rotate with only the configured key-ring. See [Operating model](#operating-model). |
+| — | `HIPPIUS_MEM_MNEMONIC` | The developer's BIP-39 mnemonic. Env var only — **never stored in the config file**. 🔒 Secret. Gates every mnemonic-derived flow (the list is not exhaustive): the startup epoch-key bootstrap wherever a store boots (`serve`, `brief`, `report`, `upgrade`, …), member-key publish (`join`), and console minting (`mint-token`, `invite`). `rotate` / `remove` refuse without it, before writing anything: the founder reads a rotated epoch only with it. See [Operating model](#operating-model). |
 | — | `HIPPIUS_MEM_RECALL_WINDOW_SECS` | Read by the **hooks**, not the server: how long one `recall` holds the PreToolUse edit-gate open for the session (default 1800 s). Env var only. See [Teams § Using it day to day](TEAMS.md#using-it-day-to-day). |
 | — | `HIPPIUS_MEM_HOOKS_BYPASS` | Read by the **hooks**, not the server: `1` bypasses the recall edit-gate for emergencies. Env var only. Use sparingly — the gate is the enforcement half of the recall discipline. |
 
@@ -293,6 +293,10 @@ team_key_hex = "…64 hex…"
 author_seed_hex = "…64 hex…"
 ```
 
+- **Team commands route the same way.** `join`, `provision`, `publish-membership`, `members`,
+  `rotate`, `remove`, `recover` and the `admin` commands act on the profile the current
+  directory's git remote routes to, as `doctor` and the server do: run them from a checkout of
+  that team's repository. `invite` still uses the primary profile.
 - **`name` is the note namespace** (the object-key prefix). A flat config's namespace is its
   `team` value, so upgrading a flat config to `[[teams]]` leaves existing notes in place.
 - **`orgs`** entries are the **bare** `host/org` (a whole org) or `host/org/repo` (one repo),
@@ -415,15 +419,21 @@ stated plainly.
 - **`join [--bundle [<path|->] [--orgs <host/org,...>]]` / `provision` / `members`** — the
   onboarding flow. `join --bundle` consumes a founder's invite bundle, writing the local
   config (a fresh machine's primary profile, or an org-routed `[[teams]]` profile on an
-  existing config with `--orgs`); a conflicting profile name, `s3_endpoint`, or too-low
-  `max_epoch` is refused with guidance, never silently overwritten. Easiest path: run
+  existing config with `--orgs`); a conflicting profile name or `s3_endpoint` is refused with
+  guidance, never silently overwritten. Easiest path: run
   `hippius-mem join --bundle` with no path, PASTE the bundle at the prompt, then press
   Ctrl-D on an empty line to finish; with
   stdin piped instead of a terminal, no-path `--bundle` reads to EOF exactly like
   `--bundle -`. Bare `join` (requires
   `HIPPIUS_MEM_MNEMONIC`) only publishes this member's signed key. The founder runs
-  `provision` to wrap the current-epoch team key to every published, manifest-authorized
-  member key; `members` prints the founder-signed membership (one SS58 per line, or a note
+  `provision` to wrap every epoch key it holds (the founding key, and each rotated epoch its
+  `HIPPIUS_MEM_MNEMONIC` loads) to every published, manifest-authorized member key, so a member
+  who joins after a rotation reads the older epochs too. Only the founder (or the manifest's recovery key) may run it: anyone else is
+  refused before anything is written, because readers refuse a wrap they signed. It never
+  replaces a wrap a reader accepts, so a re-run writes only the missing wraps. A wrap does not
+  record the x25519 key it is sealed to, so a member (the founder included) who re-joins with
+  another mnemonic cannot read the epochs already wrapped to the old one; only epochs minted
+  afterwards reach the new key. `members` prints the founder-signed membership (one SS58 per line, or a note
   that the team is open).
 - **`recover`** — the founder-key-loss escape hatch: rotate the founder identity itself
   through the team's published recovery key (the seed is prompted on the terminal or read
@@ -489,7 +499,7 @@ stated plainly.
   the op is included under that root. For a root anchored on-chain the output names the block and
   extrinsic to compare it with; for a locally recorded root it says the check is
   internal consistency only. It does not contact a chain and does not check signatures.
-- **`path-notes --repo-root <dir> --file <path> [--port <n>]`** — prints the notes tied
+- **`path-notes --repo-root <dir> --file <path> [--port <n>] [--token-file <path>]`** — prints the notes tied
   to one file by a `path:<file or directory>` tag, for the edit hook to inject (see
   [Teams § Using it day to day](TEAMS.md)). The repository name comes from the git
   remote of `--repo-root`. It asks the shared HTTP daemon's bearer-protected
@@ -497,9 +507,13 @@ stated plainly.
   0 when the question was answered (with notes or none) and non-zero when the daemon
   could not be asked (not running, still syncing, no or wrong token), so the hook asks
   again on the next edit. It looks for the daemon on the default port and for its token
-  beside the config `HIPPIUS_MEM_CONFIG` names (or the default config): a daemon started
-  with another `--port` or `--token-file` is not found. Builds without `http-mcp` accept
-  the command and print nothing.
+  in the file `HIPPIUS_MEM_TOKEN_FILE` names, else beside the config `HIPPIUS_MEM_CONFIG`
+  names (or the default config); `serve` picks its token file the same way. For a daemon
+  started with another `--port` or `--token-file`, pass the same `--port` and
+  `--token-file`; the edit hook passes neither flag, so for it export
+  `HIPPIUS_MEM_TOKEN_FILE` where both the daemon and the agent run. `recall`, `get`,
+  `remember` and `call` take both flags too. Builds without `http-mcp` accept the command
+  and print nothing.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
   the same predecessor; the losing branch lost convergence and is removable) versus
@@ -536,6 +550,14 @@ stated plainly.
   (the documented pre-strict residual), and a clean Accept-mode reconcile rules that
   out. The migration runbook: every member runs `admin resign-anchors` → watch
   `reconcile`'s `unsigned_anchor_records` reach 0 → enable `require_signed_anchors`.
+- **`admin share-epoch-keys`** (member, `HIPPIUS_MEM_MNEMONIC` required): for every epoch
+  this member holds a founder-signed wrap of and the founder holds none, writes a key share
+  to `{team}/_keyshares/{epoch:020}/{member}`. The founder's next `provision` (with its
+  mnemonic) opens its own founder-signed wrap with each share, loads the key, and wraps it
+  to the founder and every member. The repair for an epoch minted before the founder had a
+  member key; see [Repair an epoch the founder cannot read](TEAMS.md#repair-an-epoch-the-founder-cannot-read).
+  It fails, naming the epochs, when the founder lacks an epoch whose wrap on this machine
+  is not founder-signed or does not open with the mnemonic.
 - **`admin keycheck publish [--replace]`**: publishes the team-key check
   (`{team}/_keycheck/{epoch}`, see [Security](SECURITY.md#team-key-check)) for every epoch
   this machine holds a key for: the configured key, plus the rotated epochs
@@ -553,12 +575,16 @@ stated plainly.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, then says that
   every member must restart with `HIPPIUS_MEM_MNEMONIC` set. `--members` publishes a shrunk membership first.
-  It also publishes the new epoch's team-key check.
+  It also publishes the new epoch's team-key check. It requires `HIPPIUS_MEM_MNEMONIC`, and
+  publishes the founder's member key first when the founder has not run `join` (stdout says
+  so), so the new epoch is always wrapped to the founder; a rotation with no wrap for the
+  founder, or whose mnemonic is not the one the founder's published member key was made
+  with, is refused before anything is written.
 - **`remove <ss58>`** — founder-only: the member-removal runbook as one command —
   validates the target against the published roster, re-publishes membership without
   them, rotates the key (the same path as `rotate --members`), and prints the one
-  manual step left: revoking the removed member's sub-token in the console. Safe to
-  re-run with the same address (a not-yet-rotated key is reported, not a failure). See
+  manual step left: revoking the removed member's sub-token in the console. Requires
+  `HIPPIUS_MEM_MNEMONIC`, like `rotate`. Safe to re-run with the same address. See
   [Remove a member](TEAMS.md#remove-a-member).
 - **`brief [--tokens N]`** — prints a token-bounded SessionStart digest of the team's
   live memory (conventions/decisions first, then newest gotchas, then a compact index)
@@ -637,7 +663,8 @@ stated plainly.
 Size limits on `remember` and `edit`, refused with an error naming the limit: `summary` is one
 line of at most 512 characters, `body` at most 131072 characters, `tags` at most 64 of at most
 128 characters each. Characters are Unicode scalar values, not bytes, so a body of 131072
-four-byte characters (512 KiB of UTF-8) is accepted. An `edit` that leaves an older, larger body
+four-byte characters (512 KiB of UTF-8) is accepted. "One line" means no control character
+and no U+2028 or U+2029 separator. An `edit` that leaves an older, larger body
 or tag set unchanged is not refused.
 
 Every write tool (`remember`, `edit`, `forget`, `link`, `redact`) adds a `warnings` array of
@@ -646,11 +673,14 @@ Every write tool (`remember`, `edit`, `forget`, `link`, `redact`) adds a `warnin
 (an update that failed after the op was durable), or `team_key_unverified` (no key check is
 published and this machine's key opened fewer than half of the notes it tried). `recall` and
 `refresh` add `undecodable_notes` when notes are left out of recall because their ciphertext
-failed its integrity check. The key is absent when there is nothing to report. A write the server
+failed its integrity check, and `keyless_notes` when notes are left out because this process
+holds no key for the epoch they are sealed under (the `serve` daemon after a rotation, or a
+member the founder has not provisioned yet); its message names the epochs. The key is absent when there is nothing to report. A write the server
 refuses (another process holding the writer lock for over 30 s, a team key that does not match
 the published check, or an append the gateway did not confirm) fails with an error instead; only
 the last may have stored the note, and the error says not to re-issue it. `get` on a note whose stored ciphertext was altered, replaced or sealed under
-another key fails with "failed its integrity check", not "not found".
+another key fails with "failed its integrity check", not "not found", and `get` on a note sealed
+under an epoch this process holds no key for fails with "no team key for epoch N".
 
 > [!TIP]
 > **The `recall`/`get` split is the context-efficiency mechanism:** an agent searches

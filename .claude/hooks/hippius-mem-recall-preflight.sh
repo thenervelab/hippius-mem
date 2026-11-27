@@ -146,7 +146,9 @@ esac
 # the missing-jq/sha path: allow the edit, but say the gate is inactive.
 #
 # "Available" = EITHER a hippius-mem binary on PATH OR the MCP server registered
-# somewhere this session could load the recall tool from -- global ~/.claude.json
+# (as a `command`, or as a `url` for the loopback HTTP daemon, which needs no
+# binary on this hook's PATH) somewhere this session could load the recall
+# tool from -- global ~/.claude.json
 # .mcpServers, project-local .projects["<repo>"].mcpServers (probed under this
 # root AND, from a linked git worktree, under the MAIN repository root, since
 # .projects is keyed by the main checkout's path), or a committed .mcp.json at
@@ -161,8 +163,8 @@ hippius_mem_reachable() {
   command -v hippius-mem >/dev/null 2>&1 && return 0
   claude_json="${HOME:-}/.claude.json"
   if [[ -n "${HOME:-}" && -f "$claude_json" ]]; then
-    [[ -n "$(jq -r '.mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
-    [[ -n "$(jq -r --arg r "$repo_root" '.projects[$r].mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
+    [[ -n "$(jq -r '.mcpServers["hippius-mem"] | (.command // .url // empty)' "$claude_json" 2>/dev/null || true)" ]] && return 0
+    [[ -n "$(jq -r --arg r "$repo_root" '.projects[$r].mcpServers["hippius-mem"] | (.command // .url // empty)' "$claude_json" 2>/dev/null || true)" ]] && return 0
     # In a linked git WORKTREE (e.g. .claude/worktrees/*) or under a symlinked
     # launch path, repo_root above resolves to the WORKTREE path while
     # .projects is keyed by the MAIN repo path -- the probe above misses and
@@ -184,11 +186,18 @@ hippius_mem_reachable() {
       [[ "$common_dir" == */.git ]] && main_root="${common_dir%/.git}"
     fi
     if [[ -n "$main_root" && "$main_root" != "$repo_root" ]]; then
-      [[ -n "$(jq -r --arg r "$main_root" '.projects[$r].mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
+      [[ -n "$(jq -r --arg r "$main_root" '.projects[$r].mcpServers["hippius-mem"] | (.command // .url // empty)' "$claude_json" 2>/dev/null || true)" ]] && return 0
     fi
   fi
   if [[ -f "$repo_root/.mcp.json" ]]; then
-    [[ -n "$(jq -r '.mcpServers["hippius-mem"].command // empty' "$repo_root/.mcp.json" 2>/dev/null || true)" ]] && return 0
+    [[ -n "$(jq -r '.mcpServers["hippius-mem"] | (.command // .url // empty)' "$repo_root/.mcp.json" 2>/dev/null || true)" ]] && return 0
+  fi
+  # Grok runs this hook too, and `install --agent grok` registers the server as
+  # a `[mcp_servers.hippius-mem]` table (a `url` to the daemon) in its own TOML
+  # config, which jq cannot read; the table header alone means registered.
+  grok_toml="${HOME:-}/.grok/config.toml"
+  if [[ -n "${HOME:-}" && -f "$grok_toml" ]]; then
+    grep -Eq '^[[:space:]]*\[mcp_servers\.("hippius-mem"|hippius-mem)\][[:space:]]*$' "$grok_toml" && return 0
   fi
   return 1
 }

@@ -39,6 +39,7 @@ struct Args {
     repo_root: PathBuf,
     file: PathBuf,
     port: u16,
+    token_file: PathBuf,
 }
 
 /// Print the notes tied to `--file` in the repository at `--repo-root`.
@@ -52,7 +53,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
     let Some((repo, file)) = question(&args) else {
         return Ok(());
     };
-    let token = daemon_client::token()?;
+    let token = daemon_client::token(&args.token_file)?;
     let target = format!(
         "/path-notes?repo={}&path={}",
         percent_encode(&repo),
@@ -77,11 +78,12 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn parse_args(args: &[String]) -> anyhow::Result<Args> {
-    const USAGE: &str =
-        "usage: hippius-mem path-notes --repo-root <dir> --file <path> [--port <n>]";
+    const USAGE: &str = "usage: hippius-mem path-notes --repo-root <dir> --file <path> [--port <n>] \
+         [--token-file <path>]";
     let mut repo_root = None;
     let mut file = None;
     let mut port = DEFAULT_HTTP_PORT;
+    let mut token_file = None;
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
         let Some(value) = rest.next() else {
@@ -90,6 +92,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Args> {
         match flag.as_str() {
             "--repo-root" => repo_root = Some(PathBuf::from(value)),
             "--file" => file = Some(PathBuf::from(value)),
+            "--token-file" => token_file = Some(value.as_str()),
             "--port" => {
                 port = value
                     .parse()
@@ -103,6 +106,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Args> {
             repo_root,
             file,
             port,
+            token_file: daemon_client::token_path(token_file),
         }),
         _ => anyhow::bail!("{USAGE}"),
     }

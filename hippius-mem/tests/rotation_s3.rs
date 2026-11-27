@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use hippius_mem_core::{
-    BlobStore, NetworkPrefix, OpLogStore, S3BlobStore, Signer as _, Sr25519Signer,
+    BlobStore, NetworkPrefix, OpLogStore, S3BlobStore, SecretKey, Signer as _, Sr25519Signer, Ss58,
+    load_member_keys, rotate_team_key, wrap_team_key, wrapped_key_key,
 };
 use serde_json::{Value, json};
 
@@ -65,10 +66,10 @@ impl Machine {
         self.home.path().join("hippius-mem.toml")
     }
 
-    fn write_config(&self, live: &Live, founder: &str) -> anyhow::Result<()> {
+    fn write_config(&self, live: &Live, team: &str, founder: &str) -> anyhow::Result<()> {
         let toml = format!(
             "s3_endpoint = \"{endpoint}\"\ns3_region = \"{region}\"\nbucket = \"{bucket}\"\n\
-             access_key_id = \"{access}\"\nsecret = \"{secret}\"\nteam = \"{TEAM}\"\n\
+             access_key_id = \"{access}\"\nsecret = \"{secret}\"\nteam = \"{team}\"\n\
              team_key_hex = \"{TEAM_KEY_HEX}\"\nauthor_seed_hex = \"{seed}\"\n\
              founder_ss58 = \"{founder}\"\nsemantic_embeddings = false\n",
             endpoint = live.endpoint,
@@ -171,6 +172,19 @@ impl Live {
     }
 }
 
+/// Every object under `prefix`, with its bytes.
+async fn objects_under(
+    bucket: &dyn BlobStore,
+    prefix: &str,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut objects = Vec::new();
+    for key in bucket.list(prefix).await? {
+        let bytes = bucket.get(&key).await?;
+        objects.push((key, bytes));
+    }
+    Ok(objects)
+}
+
 async fn clear_team(bucket: &dyn BlobStore, team: &str) {
     for key in bucket
         .list(&format!("{team}/"))
@@ -249,22 +263,40 @@ impl Server {
 
     /// Call `remember` and return the tool result (`isError` and text).
     fn remember(&mut self, summary: &str) -> anyhow::Result<(bool, String)> {
+        self.call(
+            "remember",
+            &json!({
+                "note_type": "decision",
+                "summary": summary,
+                "body": "written after the removal",
+                "repo": "global",
+            }),
+        )
+    }
+
+    /// Call `remember`, require it to succeed, and return the new note's id.
+    fn remember_id(&mut self, summary: &str) -> anyhow::Result<String> {
+        let (refused, text) = self.remember(summary)?;
+        if refused {
+            bail!("remember was refused: {text}");
+        }
+        let answer: Value = serde_json::from_str(&text)?;
+        answer["id"]
+            .as_str()
+            .map(str::to_owned)
+            .with_context(|| format!("remember answer has no id: {text}"))
+    }
+
+    /// Call the tool `name` and return the tool result (`isError` and text).
+    fn call(&mut self, name: &str, arguments: &Value) -> anyhow::Result<(bool, String)> {
         let reply = self.request(
             "tools/call",
-            &json!({
-                "name": "remember",
-                "arguments": {
-                    "note_type": "decision",
-                    "summary": summary,
-                    "body": "written after the removal",
-                    "repo": "global",
-                }
-            }),
+            &json!({ "name": name, "arguments": arguments }),
         )?;
         let result = &reply["result"];
         let text = result["content"][0]["text"]
             .as_str()
-            .with_context(|| format!("remember reply has no text: {reply}"))?
+            .with_context(|| format!("{name} reply has no text: {reply}"))?
             .to_owned();
         Ok((result["isError"].as_bool() == Some(true), text))
     }
@@ -279,8 +311,17 @@ impl Drop for Server {
 
 /// The key epoch of each of `author`'s ops on the bucket, in Lamport order.
 async fn key_epochs_of(bucket: S3BlobStore, author: &str) -> anyhow::Result<Vec<u64>> {
+    key_epochs_of_team(bucket, TEAM, author).await
+}
+
+/// [`key_epochs_of`] for `team`.
+async fn key_epochs_of_team(
+    bucket: S3BlobStore,
+    team: &str,
+    author: &str,
+) -> anyhow::Result<Vec<u64>> {
     let blob: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(bucket);
-    let ops = OpLogStore::new(blob).read_all(TEAM).await?;
+    let ops = OpLogStore::new(blob).read_all(team).await?;
     let mut ops: Vec<_> = ops
         .iter()
         .filter(|op| op.author.as_str() == author)
@@ -315,7 +356,7 @@ async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyho
     )?;
     let founder_address = founder.address()?;
     for machine in [&founder, &member, &removed] {
-        machine.write_config(&live, &founder_address)?;
+        machine.write_config(&live, TEAM, &founder_address)?;
     }
 
     for machine in [&founder, &member, &removed] {
@@ -366,14 +407,36 @@ async fn after_a_removal_a_member_server_seals_only_under_the_new_key() -> anyho
     );
 
     let mut with_mnemonic = Server::spawn(&member, Mnemonic::Set)?;
-    let (refused, text) = with_mnemonic.remember("sealed under the rotated key")?;
-    assert!(!refused, "a server with the mnemonic loads epoch 1: {text}");
+    let sealed_at_1 = with_mnemonic.remember_id("sealed under the rotated key")?;
     drop(with_mnemonic);
     assert_eq!(
         key_epochs_of(live.raw_bucket(), &member.address()?).await?,
         [0, 1],
         "the member's write after the removal is sealed under the rotated key"
     );
+
+    // A process without the epoch-1 key says the note exists and why it
+    // cannot open it, instead of "not found".
+    let mut daemon_like = Server::spawn(&member, Mnemonic::Unset)?;
+    let (failed, text) = daemon_like.call("get", &json!({ "id": sealed_at_1 }))?;
+    assert!(
+        failed && text.contains("no team key for epoch 1"),
+        "get names the missing epoch: {text}"
+    );
+    for (tool, arguments) in [
+        ("refresh", json!({})),
+        (
+            "recall",
+            json!({ "text": "sealed under the rotated key", "repo": "global" }),
+        ),
+    ] {
+        let (failed, text) = daemon_like.call(tool, &arguments)?;
+        assert!(
+            !failed && text.contains("keyless_notes") && text.contains("epoch 1"),
+            "{tool} warns that notes are left out: {text}"
+        );
+    }
+    drop(daemon_like);
 
     clear_team(&live.raw_bucket(), TEAM).await;
     Ok(())
@@ -418,5 +481,834 @@ async fn joining_by_bundle_with_a_mnemonic_publishes_the_member_key() -> anyhow:
     assert_eq!(member_keys.len(), 1, "one member key: {member_keys:?}");
 
     clear_team(&live.raw_bucket(), JOIN_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the member-provision test owns.
+const PROVISION_TEAM: &str = "rw-provision-live";
+
+/// After a rotation, a member's `provision` (with or without a recovery key)
+/// fails before it writes: every wrap and the manifest stay byte for byte, and
+/// the founder still reads its epoch-1 note from a fresh session. A member's
+/// `provision` used to replace the founder's wraps with ones only it signed,
+/// which no reader accepts, so the epoch-1 notes became unreadable to everyone.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_members_provision_changes_no_wrap_and_the_founder_keeps_reading() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, PROVISION_TEAM).await;
+
+    let founder = Machine::new(
+        41,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        42,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, PROVISION_TEAM, &founder_address)?;
+        machine.run(&["join"])?;
+    }
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+    founder.run(&["rotate"])?;
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under epoch one by the founder")?;
+    drop(session);
+
+    let keys = format!("{PROVISION_TEAM}/_keys/");
+    let manifests = format!("{PROVISION_TEAM}/_manifest/");
+    let wraps_before = objects_under(&bucket, &keys).await?;
+    let manifests_before = objects_under(&bucket, &manifests).await?;
+    for args in [&["provision", "--no-recovery"][..], &["provision"][..]] {
+        let output = member.command(Mnemonic::Set).args(args).output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && stderr.contains("only the team founder")
+                && !stderr.contains("key shares failed"),
+            "a member's `{}` must be refused, as itself: {stderr}",
+            args.join(" ")
+        );
+    }
+    assert_eq!(objects_under(&bucket, &keys).await?, wraps_before);
+    assert_eq!(objects_under(&bucket, &manifests).await?, manifests_before);
+
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let (failed, text) = session.call("get", &json!({ "id": id }))?;
+    assert!(
+        !failed && text.contains("written after the removal"),
+        "the founder reads its epoch-1 note: {text}"
+    );
+    drop(session);
+
+    clear_team(&bucket, PROVISION_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the recovery-key retirement test owns.
+const RECOVERY_TEAM: &str = "rw-recovery-wraps-live";
+
+/// The recovery seed a `provision` printed: the line after its banner.
+fn printed_recovery_seed(stdout: &str) -> anyhow::Result<[u8; 32]> {
+    let line = stdout
+        .lines()
+        .skip_while(|line| !line.contains("RECOVERY SEED"))
+        .nth(1)
+        .with_context(|| format!("provision printed no recovery seed: {stdout}"))?;
+    let bytes = hippius_mem_core::hex::decode(line.trim())?;
+    <[u8; 32]>::try_from(bytes.as_slice()).context("a recovery seed is 32 bytes")
+}
+
+/// A founder's default `provision`, which names a new recovery key, leaves
+/// every member able to read an epoch whose wraps the previous recovery key
+/// signed: the wraps are signed again by the founder in the same run. The
+/// wrap pass used to keep them (the recovery key was still trusted at that
+/// moment) and then retire their signer, so no reader accepted them again.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn retiring_the_recovery_key_keeps_the_epochs_it_wrapped_readable() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, RECOVERY_TEAM).await;
+
+    let founder = Machine::new(
+        45,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        46,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, RECOVERY_TEAM, &founder_address)?;
+        machine.run(&["join"])?;
+    }
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    let seed = printed_recovery_seed(&founder.run(&["provision"])?)?;
+
+    // Epoch 1, wrapped to both machines by the recovery key's holder.
+    let recovery = Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?;
+    let wrapped = rotate_team_key(
+        &bucket,
+        RECOVERY_TEAM,
+        &SecretKey::from_bytes([92_u8; 32]),
+        1,
+        &load_member_keys(&bucket, RECOVERY_TEAM).await?,
+        Some(&Ss58::new(&founder_address)?),
+        &recovery,
+    )
+    .await?;
+    assert_eq!(
+        wrapped.len(),
+        2,
+        "epoch 1 reaches the founder and the member"
+    );
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under the epoch the recovery key wrapped")?;
+    drop(session);
+
+    let provision = founder.run(&["provision"])?;
+    assert!(
+        provision.contains("REPLACES the previous recovery seed"),
+        "{provision}"
+    );
+
+    for machine in [&member, &founder] {
+        let mut session = Server::spawn(machine, Mnemonic::Set)?;
+        let (failed, text) = session.call("get", &json!({ "id": id }))?;
+        assert!(!failed, "the epoch-1 note is still readable: {text}");
+    }
+
+    clear_team(&bucket, RECOVERY_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the late-member test owns.
+const LATE_TEAM: &str = "rw-late-member-live";
+
+/// A member who joins after two rotations is first told by `doctor` which
+/// epochs it cannot read, and after the founder's `provision` reads the notes
+/// of every epoch. `provision` used to wrap only the current epoch, and
+/// `doctor` passed while the epoch-1 notes stayed unreadable.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_member_who_joins_after_two_rotations_reads_every_epoch() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, LATE_TEAM).await;
+
+    let founder = Machine::new(
+        51,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        52,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let late = Machine::new(
+        53,
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member, &late] {
+        machine.write_config(&live, LATE_TEAM, &founder_address)?;
+    }
+    founder.run(&["join"])?;
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+    let mut ids = Vec::new();
+    for summary in ["sealed under epoch one", "sealed under epoch two"] {
+        founder.run(&["rotate"])?;
+        let mut session = Server::spawn(&member, Mnemonic::Set)?;
+        ids.push(session.remember_id(summary)?);
+    }
+
+    late.run(&["join"])?;
+    let roster = [member.address()?, late.address()?].join(",");
+    founder.run(&["publish-membership", "--members", &roster])?;
+    let doctor = late.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_err.contains("1 note(s) are sealed under epoch 1, which this machine"),
+        "doctor names the epoch the late member cannot read: {doctor_err}"
+    );
+
+    founder.run(&["provision", "--no-recovery"])?;
+    let mut session = Server::spawn(&late, Mnemonic::Set)?;
+    for id in &ids {
+        let (failed, text) = session.call("get", &json!({ "id": id }))?;
+        assert!(!failed, "the late member reads {id}: {text}");
+    }
+    drop(session);
+    let doctor = late.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor.status.success() && !doctor_err.contains("holds no key for"),
+        "doctor passes once every epoch is wrapped: {doctor_err}"
+    );
+
+    clear_team(&bucket, LATE_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the mnemonic-mismatch test owns.
+const MISMATCH_TEAM: &str = "rw-mnemonic-mismatch-live";
+
+/// `rotate` and `remove` with a mnemonic other than the one the founder joined
+/// with, or run by a member, or with nothing to rotate, write nothing: the
+/// published member keys and the wraps stay byte for byte. `rotate` used to
+/// replace the founder's member key with one for the other mnemonic before
+/// any check, so the older epochs stayed wrapped to the first key and the new
+/// one to the second.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_rotation_with_another_mnemonic_writes_nothing() -> anyhow::Result<()> {
+    const OTHER_MNEMONIC: &str =
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, MISMATCH_TEAM).await;
+
+    let founder = Machine::new(
+        47,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        48,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let outsider = Machine::new(49, OTHER_MNEMONIC)?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member, &outsider] {
+        machine.write_config(&live, MISMATCH_TEAM, &founder_address)?;
+    }
+    founder.run(&["join"])?;
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    let watched = [
+        format!("{MISMATCH_TEAM}/_memberkeys/"),
+        format!("{MISMATCH_TEAM}/_keys/"),
+        format!("{MISMATCH_TEAM}/_manifest/"),
+    ];
+    let mut before = Vec::new();
+    for prefix in &watched {
+        before.push(objects_under(&bucket, prefix).await?);
+    }
+
+    let member_address = member.address()?;
+    let attempts: [(&Machine, &[&str], &str); 4] = [
+        (&founder, &["rotate"], "made with another mnemonic"),
+        (
+            &founder,
+            &["remove", &member_address],
+            "made with another mnemonic",
+        ),
+        (&outsider, &["rotate"], "only the team founder"),
+        (
+            &founder,
+            &["remove", &outsider.address()?],
+            "skipping rotation",
+        ),
+    ];
+    for (machine, args, expected) in attempts {
+        let output = machine
+            .command(Mnemonic::Unset)
+            .env("HIPPIUS_MEM_MNEMONIC", OTHER_MNEMONIC)
+            .args(args)
+            .output()?;
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(said.contains(expected), "`{}`: {said}", args.join(" "));
+    }
+    for (prefix, before) in watched.iter().zip(&before) {
+        assert_eq!(
+            &objects_under(&bucket, prefix).await?,
+            before,
+            "{prefix} unchanged"
+        );
+    }
+
+    clear_team(&bucket, MISMATCH_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the never-joined-founder test owns.
+const FOUNDER_TEAM: &str = "rw-founder-live";
+
+/// A founder that follows the runbook without `join` and runs `rotate` still
+/// reads the epoch it minted: `rotate` publishes the founder's member key
+/// first and says so, the new epoch is wrapped to the founder, and its fresh
+/// session reads a member's note sealed under it. Without the mnemonic,
+/// `rotate` is refused before it writes anything. The founder used to be left
+/// out of the new epoch, with only a stderr warning, and could never read it.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_founder_who_never_joined_reads_the_epoch_its_rotate_mints() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, FOUNDER_TEAM).await;
+
+    let founder = Machine::new(
+        61,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        62,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, FOUNDER_TEAM, &founder_address)?;
+    }
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    let keys = format!("{FOUNDER_TEAM}/_keys/");
+    let before = objects_under(&bucket, &keys).await?;
+    let unset = founder.command(Mnemonic::Unset).arg("rotate").output()?;
+    let unset_err = String::from_utf8_lossy(&unset.stderr);
+    assert!(
+        !unset.status.success() && unset_err.contains("require HIPPIUS_MEM_MNEMONIC"),
+        "rotate without the mnemonic is refused: {unset_err}"
+    );
+    assert_eq!(
+        objects_under(&bucket, &keys).await?,
+        before,
+        "nothing written"
+    );
+
+    let rotation = founder.run(&["rotate"])?;
+    assert!(
+        rotation.contains("published this machine's member key")
+            && rotation.contains(&format!("  {founder_address}")),
+        "rotate says it published the founder's key and wraps the founder: {rotation}"
+    );
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under epoch one by a member")?;
+    drop(session);
+
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let (failed, text) = session.call("get", &json!({ "id": id }))?;
+    assert!(
+        !failed,
+        "the founder reads the member's epoch-1 note: {text}"
+    );
+    drop(session);
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    assert!(
+        doctor.status.success(),
+        "doctor passes for the founder: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    clear_team(&bucket, FOUNDER_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the stranded-epoch repair test owns.
+const STRANDED_TEAM: &str = "rw-stranded-live";
+
+/// An epoch an older release minted without the founder (wrapped by the
+/// founder to the member only) is repaired: `doctor` names the repair, the
+/// member's `admin share-epoch-keys` sends the founder the opening of its own
+/// founder-signed wrap, and the founder's `provision` loads the key from that
+/// wrap and wraps it to the founder, whose fresh session then reads the
+/// member's note. Before, no command could give the founder that epoch.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_founder_stranded_by_an_older_rotation_recovers_the_epoch() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, STRANDED_TEAM).await;
+
+    let founder = Machine::new(
+        71,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        72,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, STRANDED_TEAM, &founder_address)?;
+    }
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    // What an older `rotate` by a founder that never joined left behind.
+    let founder_signer =
+        Sr25519Signer::from_seed_with_prefix(&founder.seed, NetworkPrefix::HIPPIUS)?;
+    let member_keys = load_member_keys(&bucket, STRANDED_TEAM).await?;
+    let founder_pin = Ss58::new(&founder_address)?;
+    let wrapped = rotate_team_key(
+        &bucket,
+        STRANDED_TEAM,
+        &SecretKey::from_bytes([91_u8; 32]),
+        1,
+        &member_keys,
+        Some(&founder_pin),
+        &founder_signer,
+    )
+    .await?;
+    assert_eq!(wrapped.len(), 1, "epoch 1 reaches the member only");
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    let id = session.remember_id("sealed under the stranded epoch")?;
+    drop(session);
+
+    founder.run(&["join"])?;
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        !doctor.status.success() && doctor_err.contains("admin share-epoch-keys"),
+        "doctor names the repair: {doctor_err}"
+    );
+
+    let shared = member.run(&["admin", "share-epoch-keys"])?;
+    assert!(
+        shared.contains("shared the key of epoch 0, 1 with"),
+        "{shared}"
+    );
+    let provision = founder.run(&["provision", "--no-recovery"])?;
+    assert!(
+        provision.contains("loaded the key of epoch 1"),
+        "provision loads the shared epoch: {provision}"
+    );
+
+    let mut session = Server::spawn(&founder, Mnemonic::Set)?;
+    let (failed, text) = session.call("get", &json!({ "id": id }))?;
+    assert!(
+        !failed,
+        "the founder reads the stranded epoch's note: {text}"
+    );
+    drop(session);
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    assert!(
+        doctor.status.success(),
+        "doctor passes once the founder holds the epoch: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    clear_team(&bucket, STRANDED_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the unrecoverable-epoch test owns.
+const LOST_TEAM: &str = "rw-lost-epoch-live";
+
+/// When the founder lacks an epoch and the member's own wrap of it is one no
+/// reader accepts (what a member's 0.8.0 `provision` left), `admin
+/// share-epoch-keys` fails and names the epoch, and `doctor` on the founder's
+/// machine says such an epoch cannot be recovered. The command used to exit 0
+/// saying the founder already held every epoch.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn an_epoch_no_member_can_share_is_named_as_lost() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, LOST_TEAM).await;
+
+    let founder = Machine::new(
+        73,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        74,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member] {
+        machine.write_config(&live, LOST_TEAM, &founder_address)?;
+    }
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    // Epoch 1 reached only the member, and the member's wrap of it was then
+    // replaced by one the member signed.
+    let epoch_key = SecretKey::from_bytes([93_u8; 32]);
+    let founder_signer =
+        Sr25519Signer::from_seed_with_prefix(&founder.seed, NetworkPrefix::HIPPIUS)?;
+    let member_keys = load_member_keys(&bucket, LOST_TEAM).await?;
+    let founder_pin = Ss58::new(&founder_address)?;
+    rotate_team_key(
+        &bucket,
+        LOST_TEAM,
+        &epoch_key,
+        1,
+        &member_keys,
+        Some(&founder_pin),
+        &founder_signer,
+    )
+    .await?;
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    session.remember_id("sealed under the epoch that is lost")?;
+    drop(session);
+    let member_signer = Sr25519Signer::from_seed_with_prefix(&member.seed, NetworkPrefix::HIPPIUS)?;
+    let member_address = member.address()?;
+    let member_key = member_keys
+        .iter()
+        .find(|key| key.ss58.as_str() == member_address)
+        .context("the member joined")?;
+    let replaced = wrap_team_key(
+        LOST_TEAM,
+        &epoch_key,
+        &member_key.x25519_public,
+        1,
+        &member_signer,
+    )?;
+    bucket
+        .put(
+            &wrapped_key_key(LOST_TEAM, 1, &member_address),
+            serde_json::to_vec(&replaced)?,
+        )
+        .await?;
+
+    founder.run(&["join"])?;
+    let shared = member
+        .command(Mnemonic::Set)
+        .args(["admin", "share-epoch-keys"])
+        .output()?;
+    let shared_err = String::from_utf8_lossy(&shared.stderr);
+    assert!(
+        !shared.status.success() && shared_err.contains("could not share epoch 1"),
+        "share-epoch-keys names the epoch it cannot share: {shared_err}"
+    );
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_err.contains("the epoch cannot be recovered"),
+        "doctor says when the epoch is lost: {doctor_err}"
+    );
+
+    clear_team(&bucket, LOST_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the live-session removal test owns.
+const SESSION_TEAM: &str = "rw-live-session-live";
+
+/// A member's session that wrote a moment before the founder removed someone
+/// is refused its next write, after `refresh` and without one, instead of
+/// sealing it under the key the removed member holds. The session used to
+/// keep sealing under the old key for a minute after its last write.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_session_that_just_wrote_is_refused_after_a_removal() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, SESSION_TEAM).await;
+
+    let founder = Machine::new(
+        81,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        82,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let removed = Machine::new(
+        83,
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    )?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member, &removed] {
+        machine.write_config(&live, SESSION_TEAM, &founder_address)?;
+        machine.run(&["join"])?;
+    }
+    let roster = [member.address()?, removed.address()?].join(",");
+    founder.run(&["publish-membership", "--members", &roster])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    let mut session = Server::spawn(&member, Mnemonic::Set)?;
+    session.remember_id("written before the removal")?;
+    founder.run(&["remove", &removed.address()?])?;
+
+    let (refused, text) = session.remember("written right after the removal")?;
+    assert!(
+        refused && text.contains("rotated its key to epoch 1"),
+        "the session refuses at once: {text}"
+    );
+    let (failed, text) = session.call("refresh", &json!({}))?;
+    assert!(!failed, "{text}");
+    let (refused, text) = session.remember("written after a refresh")?;
+    assert!(
+        refused && text.contains("rotated its key to epoch 1"),
+        "the session refuses after a refresh: {text}"
+    );
+    drop(session);
+    assert_eq!(
+        key_epochs_of_team(live.raw_bucket(), SESSION_TEAM, &member.address()?).await?,
+        [0],
+        "nothing was sealed after the removal"
+    );
+
+    clear_team(&bucket, SESSION_TEAM).await;
+    Ok(())
+}
+
+/// The team namespace the never-rotated removal test owns.
+const UNROTATED_TEAM: &str = "rw-unrotated-live";
+
+/// A roster that shrank while the team stayed at epoch 0 (what `remove` left
+/// when it could not rotate before 0.8.1) is flagged by `doctor`, a `remove`
+/// re-run says it did not rotate instead of pointing at "the rotation above",
+/// and `rotate` clears the warning. `doctor` used to pass such a team.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_removal_that_never_rotated_is_flagged_until_a_rotation() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, UNROTATED_TEAM).await;
+
+    let founder = Machine::new(
+        91,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let kept = Machine::new(
+        92,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let removed = Machine::new(
+        93,
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    )?;
+    let founder_address = founder.address()?;
+    founder.write_config(&live, UNROTATED_TEAM, &founder_address)?;
+    let removed_address = removed.address()?;
+    let both = [kept.address()?, removed_address.clone()].join(",");
+    founder.run(&["publish-membership", "--members", &both])?;
+    founder.run(&["publish-membership", "--members", &kept.address()?])?;
+
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_err.contains(&format!(
+            "{removed_address} was removed from the roster, but the team key was never rotated"
+        )),
+        "doctor flags the unrotated removal: {doctor_err}"
+    );
+
+    let removal = founder.run(&["remove", &removed_address])?;
+    assert!(
+        removal.contains("already excludes")
+            && removal.contains("This run did not rotate")
+            && !removal.contains("the rotation above"),
+        "the banner does not claim a rotation: {removal}"
+    );
+
+    founder.run(&["rotate"])?;
+    let doctor = founder.command(Mnemonic::Set).arg("doctor").output()?;
+    let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        !doctor_err.contains("was removed from the roster"),
+        "a rotation clears the warning: {doctor_err}"
+    );
+
+    clear_team(&bucket, UNROTATED_TEAM).await;
+    Ok(())
+}
+
+/// The primary profile's namespace in the routing test.
+const ROUTING_PRIMARY: &str = "rw-routing-primary-live";
+
+/// Run `members`, `admin quarantine`, `provision` and `recover` from
+/// `checkout`, as the routing test's founder, and check each answered for the
+/// routed team.
+fn other_team_commands_act_on(founder: &Machine, checkout: &std::path::Path) -> anyhow::Result<()> {
+    let routed = |args: &[&str]| {
+        founder
+            .command(Mnemonic::Set)
+            .current_dir(checkout)
+            .args(args)
+            .output()
+    };
+    let members = routed(&["members"])?;
+    assert!(
+        String::from_utf8_lossy(&members.stdout).contains(&founder.address()?),
+        "members lists the routed roster: {}",
+        String::from_utf8_lossy(&members.stderr)
+    );
+    let quarantine = routed(&["admin", "quarantine"])?;
+    assert!(
+        quarantine.status.success()
+            && String::from_utf8_lossy(&quarantine.stderr).contains("no quarantine"),
+        "admin quarantine inspects the routed op-log: {}",
+        String::from_utf8_lossy(&quarantine.stderr)
+    );
+    let provision = routed(&["provision"])?;
+    let seed = printed_recovery_seed(&String::from_utf8_lossy(&provision.stdout))?;
+    let mut recover = founder
+        .command(Mnemonic::Set)
+        .current_dir(checkout)
+        .arg("recover")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    writeln!(
+        recover.stdin.take().context("stdin is piped")?,
+        "{}",
+        hippius_mem_core::hex::encode(seed)
+    )?;
+    let recovered = recover.wait_with_output()?;
+    assert!(
+        recovered.status.success()
+            && String::from_utf8_lossy(&recovered.stdout).contains("New founder"),
+        "recover acts on the routed team: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    Ok(())
+}
+
+/// The `[[teams]]` profile's namespace in the routing test.
+const ROUTING_TEAM: &str = "rw-routing-team-live";
+
+/// Team commands (`publish-membership`, `members`, `admin quarantine`,
+/// `provision`, `recover`) run from a checkout whose remote routes to a
+/// `[[teams]]` profile act on that profile, as `doctor` and the server do. Team commands
+/// used to act on the primary profile wherever they ran, so a founder of an
+/// org-routed team published its roster into the personal namespace.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_team_command_acts_on_the_profile_the_remote_routes_to() -> anyhow::Result<()> {
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    for team in [ROUTING_PRIMARY, ROUTING_TEAM] {
+        clear_team(&bucket, team).await;
+    }
+
+    let founder = Machine::new(
+        95,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    // Both profiles share the bucket, credentials, key and seed; only the
+    // namespace tells them apart.
+    let profile = format!(
+        "bucket = \"{bucket}\"\naccess_key_id = \"{access}\"\nsecret = \"{secret}\"\n\
+         team_key_hex = \"{TEAM_KEY_HEX}\"\nauthor_seed_hex = \"{seed}\"\n\
+         founder_ss58 = \"{founder}\"\n",
+        bucket = live.bucket,
+        access = live.access_key_id,
+        secret = live.secret,
+        seed = hippius_mem_core::hex::encode(founder.seed),
+        founder = founder.address()?,
+    );
+    std::fs::write(
+        founder.config_path(),
+        format!(
+            "s3_endpoint = \"{endpoint}\"\ns3_region = \"{region}\"\nsemantic_embeddings = false\n\
+             team = \"{ROUTING_PRIMARY}\"\n{primary}\n[[teams]]\nname = \"{ROUTING_TEAM}\"\n\
+             orgs = [\"github.com/acme\"]\n{routed}",
+            endpoint = live.endpoint,
+            region = live.region,
+            primary = profile,
+            routed = profile,
+        ),
+    )?;
+    let checkout = founder.home.path().join("app");
+    std::fs::create_dir_all(&checkout)?;
+    for args in [
+        &["init", "-q"][..],
+        &["remote", "add", "origin", "git@github.com:acme/app.git"][..],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&checkout)
+            .status()?;
+        assert!(status.success(), "git {}", args.join(" "));
+    }
+
+    let output = founder
+        .command(Mnemonic::Set)
+        .current_dir(&checkout)
+        .args(["publish-membership", "--members", &founder.address()?])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        bucket
+            .list(&format!("{ROUTING_TEAM}/_manifest/"))
+            .await?
+            .len(),
+        1,
+        "the routed profile's roster is published"
+    );
+    other_team_commands_act_on(&founder, &checkout)?;
+    assert_eq!(
+        bucket
+            .list(&format!("{ROUTING_TEAM}/_manifest/"))
+            .await?
+            .len(),
+        3,
+        "the roster, the recovery key and the recovery, all on the routed profile"
+    );
+    assert!(
+        bucket
+            .list(&format!("{ROUTING_PRIMARY}/_manifest/"))
+            .await?
+            .is_empty(),
+        "the primary profile is untouched"
+    );
+
+    for team in [ROUTING_PRIMARY, ROUTING_TEAM] {
+        clear_team(&bucket, team).await;
+    }
     Ok(())
 }

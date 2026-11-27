@@ -350,14 +350,24 @@ fn team_commands_refuse_a_local_profile() -> anyhow::Result<()> {
     // the S3 sub-token `upgrade --access-key-id` needs, so it must remain
     // usable against a local trial profile — see
     // `mint_token_reaches_arg_parsing_on_a_local_profile` below.
-    let mut commands = vec!["join", "provision"];
+    // `rotate` and `remove` used to skip the check and rotate the trial vault,
+    // whose mnemonic-less daemon then refused every write; `admin
+    // share-epoch-keys` failed later without naming the cause.
+    let member = "5DfhGyQdFobKM8NsWvEeAKk5EQQgYe9AydgJ7rMB6E1EqRzV";
+    let mut commands = vec![
+        vec!["join"],
+        vec!["provision"],
+        vec!["rotate"],
+        vec!["remove", member],
+        vec!["admin", "share-epoch-keys"],
+    ];
     if cfg!(feature = "console") {
-        commands.push("invite");
+        commands.push(vec!["invite"]);
     }
 
     for command in commands {
-        let output = run_team_command(&config_path, dir.path(), &[command])?;
-        assert_refuses_local_profile(&output, command);
+        let output = run_team_command(&config_path, dir.path(), &command)?;
+        assert_refuses_local_profile(&output, &command.join(" "));
     }
 
     Ok(())

@@ -8,7 +8,7 @@
 //! standing up a client<->server round-trip.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -1235,9 +1235,7 @@ impl MemoryServer {
             total_matched: result.total_matched,
             pointers,
             semantic: self.store.is_semantic(),
-            warnings: undecodable_warning(self.store.undecodable_notes())
-                .into_iter()
-                .collect(),
+            warnings: index_warnings(&self.store),
         })
     }
 
@@ -1247,9 +1245,7 @@ impl MemoryServer {
         let indexed = self.store.sync().await?;
         Ok(RefreshOutput {
             indexed,
-            warnings: undecodable_warning(self.store.undecodable_notes())
-                .into_iter()
-                .collect(),
+            warnings: index_warnings(&self.store),
         })
     }
 
@@ -1900,7 +1896,8 @@ fn note_to_dto(note: &Note, version: String) -> NoteDto {
 #[derive(Debug, Serialize)]
 struct Warning {
     /// Stable, snake-case: `unserialized_write`, `tip_not_recorded`,
-    /// `head_not_published`, `team_key_unverified` or `undecodable_notes`.
+    /// `head_not_published`, `team_key_unverified`, `undecodable_notes` or
+    /// `keyless_notes`.
     code: &'static str,
     /// What went degraded and what to do about it.
     message: String,
@@ -1946,6 +1943,39 @@ fn degradation_warning(found: Degradation) -> Warning {
         code,
         message: message.to_owned(),
     }
+}
+
+/// The warnings for notes the index leaves out: undecodable ones, and ones
+/// sealed under an epoch this process holds no key for. Reported on `recall`
+/// and `refresh`, which read the index.
+fn index_warnings(store: &MemoryStore) -> Vec<Warning> {
+    undecodable_warning(store.undecodable_notes())
+        .into_iter()
+        .chain(keyless_warning(&store.keyless_notes()))
+        .collect()
+}
+
+/// The warning for notes left out of the index because this process holds no
+/// key for their epoch, if there are any.
+fn keyless_warning(keyless_notes: &BTreeMap<u64, usize>) -> Option<Warning> {
+    let notes: usize = keyless_notes.values().sum();
+    (notes > 0).then(|| {
+        let epochs = keyless_notes
+            .keys()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Warning {
+            code: "keyless_notes",
+            message: format!(
+                "{notes} note(s) are left out of recall because this process holds no team key \
+                 for the epoch they are sealed under (epoch {epochs}); they exist, so do not \
+                 re-create them. Restart this server with HIPPIUS_MEM_MNEMONIC set (the `serve` \
+                 daemon runs without it and cannot load rotated keys), and run `hippius-mem \
+                 doctor`, which names the fix"
+            ),
+        }
+    })
 }
 
 /// The warning for notes left out of the index as undecodable, if there are
@@ -2263,6 +2293,58 @@ mod tests {
         );
         let wire = serde_json::to_value(&out).unwrap();
         assert_eq!(wire["warnings"][0]["code"], "unserialized_write", "{wire}");
+    }
+
+    /// A store over `blob` signing with `seed`, holding only the epoch-0 key
+    /// [`test_store`] uses.
+    fn store_over(blob: &Arc<dyn BlobStore>, seed: u8) -> Arc<MemoryStore> {
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed_with_prefix(&[seed; 32], NetworkPrefix::HIPPIUS)
+                .expect("valid test seed"),
+        );
+        Arc::new(MemoryStore::new(
+            Arc::clone(blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        ))
+    }
+
+    /// `refresh` and `recall` on a server without the key of a rotated epoch
+    /// carry the `keyless_notes` warning naming that epoch, and a server that
+    /// reads every note carries none. Both used to read as if the notes did
+    /// not exist, which invites an agent to write them again.
+    #[tokio::test]
+    async fn notes_this_process_cannot_read_are_named_in_a_warning() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(&blob, 5);
+        let identity = hippius_mem_core::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)
+            .expect("valid test phrase");
+        founder.join_as_member(&identity).await.unwrap();
+        assert_eq!(founder.rotate_key(0).await.unwrap().new_epoch, 1);
+        let writer = MemoryServer::new(Arc::clone(&founder));
+        writer.logic_remember(sample_remember()).await.unwrap();
+
+        let reads_all = writer.logic_refresh().await.unwrap();
+        assert!(reads_all.warnings.is_empty(), "{:?}", reads_all.warnings);
+
+        let lagging = MemoryServer::new(store_over(&blob, 6));
+        let refreshed = lagging.logic_refresh().await.unwrap();
+        assert_eq!(refreshed.warnings.len(), 1, "{:?}", refreshed.warnings);
+        assert_eq!(refreshed.warnings[0].code, "keyless_notes");
+        assert!(
+            refreshed.warnings[0].message.starts_with("1 note(s)")
+                && refreshed.warnings[0].message.contains("(epoch 1)"),
+            "{}",
+            refreshed.warnings[0].message
+        );
     }
 
     /// A blob store that holds the first armed note-blob PUT until released,

@@ -33,7 +33,8 @@ usage:
   hippius-mem remember --type <note_type> --summary <text> --repo <name> [--body <text>]
                        [--tag <tag>]... [--force]
                        (the body is read from stdin when --body is omitted or `-`)
-all take [--port <n>]. `--repo` defaults to the repository of the current directory;
+all take [--port <n>] [--token-file <path>] (the token file `serve --token-file` was given).
+`--repo` defaults to the repository of the current directory;
 pass `--repo global` for team-wide. `remember` outside a repository needs `--repo`.";
 
 /// Command-line arguments split into flags and positional words.
@@ -98,20 +99,27 @@ fn parse(args: &[String], value_flags: &[&str], switch_flags: &[&str]) -> anyhow
     Ok(parsed)
 }
 
-/// The tool to call, its JSON arguments, and the daemon port, for `command`.
-fn request(command: &str, args: &[String]) -> anyhow::Result<(String, Value, u16)> {
+/// Where the daemon listens and the file holding its token.
+#[derive(Debug)]
+struct Daemon {
+    port: u16,
+    token_file: std::path::PathBuf,
+}
+
+/// The tool to call, its JSON arguments, and the daemon to ask, for `command`.
+fn request(command: &str, args: &[String]) -> anyhow::Result<(String, Value, Daemon)> {
     let (tool, arguments, parsed) = match command {
         "call" => {
-            let parsed = parse(args, &["--port"], &[])?;
+            let parsed = parse(args, &["--port", "--token-file"], &[])?;
             let (tool, arguments) = call_arguments(&parsed.words)?;
             (tool, arguments, parsed)
         }
         "recall" => {
-            let parsed = parse(args, &["--port", "--repo", "--k"], &[])?;
+            let parsed = parse(args, &["--port", "--token-file", "--repo", "--k"], &[])?;
             ("recall".to_owned(), recall_arguments(&parsed)?, parsed)
         }
         "get" => {
-            let parsed = parse(args, &["--port"], &[])?;
+            let parsed = parse(args, &["--port", "--token-file"], &[])?;
             let [id] = parsed.words.as_slice() else {
                 anyhow::bail!("{USAGE}");
             };
@@ -120,7 +128,15 @@ fn request(command: &str, args: &[String]) -> anyhow::Result<(String, Value, u16
         "remember" => {
             let parsed = parse(
                 args,
-                &["--port", "--type", "--summary", "--body", "--repo", "--tag"],
+                &[
+                    "--port",
+                    "--token-file",
+                    "--type",
+                    "--summary",
+                    "--body",
+                    "--repo",
+                    "--tag",
+                ],
                 &["--force"],
             )?;
             ("remember".to_owned(), remember_arguments(&parsed)?, parsed)
@@ -133,7 +149,8 @@ fn request(command: &str, args: &[String]) -> anyhow::Result<(String, Value, u16
             .with_context(|| format!("invalid --port value `{value}`"))?,
         None => DEFAULT_HTTP_PORT,
     };
-    Ok((tool, arguments, port))
+    let token_file = daemon_client::token_path(parsed.value("--token-file"));
+    Ok((tool, arguments, Daemon { port, token_file }))
 }
 
 /// Run one of the four commands; `command` is the subcommand name.
@@ -143,8 +160,8 @@ fn request(command: &str, args: &[String]) -> anyhow::Result<(String, Value, u16
 /// Returns an error for malformed arguments, when the daemon cannot be
 /// reached, and when the tool itself fails (with the tool's message).
 pub(crate) fn run(command: &str, args: &[String]) -> anyhow::Result<()> {
-    let (tool, arguments, port) = request(command, args)?;
-    let token = daemon_client::token()?;
+    let (tool, arguments, Daemon { port, token_file }) = request(command, args)?;
+    let token = daemon_client::token(&token_file)?;
     let target = format!("/call/{}", percent_encode(&tool));
     let body = arguments.to_string();
     let (status, answer) = daemon_client::send(
@@ -296,7 +313,7 @@ mod tests {
                 "writer", "--port", "9", "lock", "--repo", "widget", "--k", "3",
             ]),
         )?;
-        assert_eq!((tool.as_str(), port), ("recall", 9));
+        assert_eq!((tool.as_str(), port.port), ("recall", 9));
         assert_eq!(
             arguments,
             json!({ "text": "writer lock", "repo": "widget", "k": 3 })
@@ -324,7 +341,7 @@ mod tests {
             ]),
         )?;
         assert_eq!(stored["body"], "--port");
-        assert_eq!(port, DEFAULT_HTTP_PORT);
+        assert_eq!(port.port, DEFAULT_HTTP_PORT);
         Ok(())
     }
 
