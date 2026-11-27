@@ -49,7 +49,9 @@ Nothing else in the storage format changes.
   profile.
 - Each `remember` and `edit` lists `{team}/_keys/` once before it seals the
   note, where 0.8.0 kept the answer for a minute; a failed listing fails the
-  write.
+  write. While an object sits under `_keys/` above the epoch being written
+  (for example a wrap no founder signed), each write also loads the manifest
+  and reads those wraps.
 - `get` of a note sealed under an epoch this process holds no key for fails
   with "no team key for epoch N" instead of "not found", and `recall` and
   `refresh` carry a `keyless_notes` warning.

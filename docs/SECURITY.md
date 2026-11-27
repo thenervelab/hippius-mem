@@ -632,7 +632,9 @@ manifest's founder or trusted recovery key, and `provision` refuses any other si
 writes. Every wrap write reads the slot first and keeps a wrap a reader accepts, so neither a
 member's `provision` nor a re-run by the founder can replace a wrap that holds an epoch key
 (the read comes first because a gateway that ignores `If-None-Match` would overwrite a
-create-only write). The signed transcript is `hippius-memory-teamkey-wrap-sign/v2`
+create-only write). That check runs in the 0.8.1 client: a member still on 0.8.0, or anyone
+with bucket write, can still overwrite a wrap object. Readers then refuse the replacement,
+and the founder's next `provision` re-creates the wrap for every epoch the founder holds. The signed transcript is `hippius-memory-teamkey-wrap-sign/v2`
 (every field length-framed, including `epoch`). `/v1` used a raw-LE `epoch` and is not
 read: this is a pre-release clean break, so upgrade means re-`provision` / `rotate`
 rather than a dual-read window. A joining member who was never handed the key **bootstraps**

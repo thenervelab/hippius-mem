@@ -326,7 +326,9 @@ through a member who holds it:
 3. On the founder's machine: `HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem
    provision`. It opens the founder-signed wrap with each share, so the key it loads is
    the one the founder sealed (a share cannot substitute another key), and wraps it to the
-   founder and to every member. Restart the founder's server.
+   founder and to every member. Restart the founder's server. The shares under
+   `{team}/_keyshares/` can then be deleted: each opens only a wrap whose key the founder
+   now holds, and every later `provision` lists them until they are gone.
 
 An epoch whose every founder-signed wrap was overwritten (by a member's `provision` before
 0.8.1) cannot be repaired this way: no wrap the founder signed holds its key any more. On
