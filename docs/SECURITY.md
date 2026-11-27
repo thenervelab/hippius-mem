@@ -653,8 +653,10 @@ the AEAD key of its own founder-signed wrap of that epoch, and the founder's `pr
 opens that founder-signed ciphertext with it. The founder trusts no member for the key
 itself: a share carrying any other AEAD key fails the Poly1305 tag of the founder's
 ciphertext, and a share is only ever used with a wrap the founder or the recovery key
-signed. The share's additional data names its own domain
-(`hippius-memory-keyshare-v1`), so a share never opens as a wrap of a team key. A share
+signed. A share is its own object, not a wrap: it names its sender as `holder` (a wrap has
+a `provisioner`), it is signed under its own transcript (`hippius-memory-keyshare-sign/v1`),
+and its additional data names its own domain (`hippius-memory-keyshare-v1`), so a share
+copied into a wrap slot neither parses, verifies nor opens as a wrap of a team key. A share
 reveals nothing the bucket does not already guard: it opens only that one wrap, whose key
 the member already holds, and only the founder's x25519 secret opens the share.
 

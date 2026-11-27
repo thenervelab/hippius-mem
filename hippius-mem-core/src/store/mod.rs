@@ -61,12 +61,12 @@ use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
-    Identity, ManifestMarker, MemberKey, Provisioned, TeamManifest, WrappedKey, accepted_wrap,
-    create_wraps, first_provisioned_epoch, key_share_key, key_shares_prefix, load_manifest,
-    load_member_keys, next_free_manifest_version, open_key_share, parse_key_share_key,
-    provision_wraps, provisioner_authorized, publish_manifest, publish_member_key, read_slot,
-    read_wrapped_key, seal_key_share, seal_wraps, unauthorized_wrap, unwrap_team_key,
-    wrap_epochs_addressed_to, wrap_keys_above,
+    Identity, KeyShare, ManifestMarker, MemberKey, Provisioned, TeamManifest, WrappedKey,
+    accepted_wrap, create_wraps, first_provisioned_epoch, key_share_key, key_shares_prefix,
+    load_manifest, load_member_keys, next_free_manifest_version, open_key_share,
+    parse_key_share_key, provision_wraps, provisioner_authorized, publish_manifest,
+    publish_member_key, read_slot, read_wrapped_key, seal_key_share, seal_wraps, unauthorized_wrap,
+    unwrap_team_key, wrap_epochs_addressed_to, wrap_keys_above,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -8621,7 +8621,7 @@ impl MemoryStore {
         holder_key: &MemberKey,
         manifest: &TeamManifest,
     ) -> Result<SecretKey, MemError> {
-        let share: WrappedKey = serde_json::from_slice(&self.blob.get(share_key).await?)?;
+        let share: KeyShare = serde_json::from_slice(&self.blob.get(share_key).await?)?;
         let holder = holder_key.ss58.as_str();
         let holder_wrap = read_wrapped_key(self.blob.as_ref(), &self.team, epoch, holder).await?;
         if !provisioner_authorized(&holder_wrap, Some(manifest), self.founder.as_ref()) {

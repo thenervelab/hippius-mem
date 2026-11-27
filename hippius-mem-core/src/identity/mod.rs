@@ -63,15 +63,16 @@ pub(crate) use manifest::next_free_manifest_version;
 pub use marker::{FileManifestMarker, ManifestMarker};
 #[cfg(test)]
 pub(crate) use teamkey::MEMBERKEY_DOMAIN;
+pub(crate) use teamkey::{
+    KeyShare, accepted_wrap, create_wraps, first_provisioned_epoch, key_share_key,
+    key_shares_prefix, open_key_share, parse_key_share_key, provision_wraps,
+    provisioner_authorized, read_slot, seal_key_share, seal_wraps, unauthorized_wrap,
+    wrap_epochs_addressed_to, wrap_keys_above,
+};
 pub use teamkey::{
     MemberKey, Provisioned, WrappedKey, fetch_team_key, load_member_keys, provision_team_key,
     publish_member_key, read_wrapped_key, rotate_team_key, unwrap_team_key, wrap_team_key,
     wrapped_key_key, wrapped_key_recipients,
-};
-pub(crate) use teamkey::{
-    accepted_wrap, create_wraps, first_provisioned_epoch, key_share_key, key_shares_prefix,
-    open_key_share, parse_key_share_key, provision_wraps, provisioner_authorized, read_slot,
-    seal_key_share, seal_wraps, unauthorized_wrap, wrap_epochs_addressed_to, wrap_keys_above,
 };
 
 use blake2::{Blake2b512, Digest};
