@@ -54,7 +54,7 @@ Nothing else in the storage format changes.
   with "no team key for epoch N" instead of "not found", and `recall` and
   `refresh` carry a `keyless_notes` warning.
 - A summary containing U+2028 or U+2029 is refused. Stored notes are not
-  changed.
+  changed, and `import claude-mem` drops them from the titles it imports.
 
 ### Added
 

@@ -43,7 +43,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use hippius_mem_core::{MemError, MemoryStore, NoteType, RememberInput, RepoScope};
+use hippius_mem_core::{MemError, MemoryStore, NoteType, RememberInput, RepoScope, breaks_a_line};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
 
@@ -790,8 +790,8 @@ fn to_remember_input(obs: &Observation) -> RememberInput {
 /// leading line of the narrative, truncated to a sane length so `recall`'s pointer
 /// list stays readable.
 ///
-/// The result must satisfy `store::validate_summary` — a single, non-blank,
-/// control-character-free line — because ingestion rejects anything else and
+/// The result must satisfy `store::validate_summary` — a single, non-blank
+/// line free of the characters [`breaks_a_line`] names — because ingestion rejects anything else and
 /// `run` aborts the whole import on a rejected observation. So each candidate is
 /// reduced to its FIRST line before the non-empty pick (a multi-line title would
 /// otherwise reach ingestion), and any stray control character is dropped from
@@ -803,7 +803,7 @@ fn build_summary(obs: &Observation) -> String {
         obs.subtitle.as_deref().map(first_line),
         obs.narrative.as_deref().map(first_line),
     ]);
-    // Strip control chars from the chosen first line, THEN fall back to the
+    // Strip line-breaking chars from the chosen first line, THEN fall back to the
     // placeholder if nothing printable survives. The fallback has to run after
     // the strip, not before: `first_non_empty` rejects a candidate only when it
     // is WHITESPACE-empty (`str::trim`), so a title of all non-whitespace control
@@ -812,7 +812,7 @@ fn build_summary(obs: &Observation) -> String {
     let headline: String = raw
         .unwrap_or("")
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !breaks_a_line(c))
         .collect();
     let headline = headline.trim();
     let headline = if headline.is_empty() {
@@ -1104,6 +1104,11 @@ mod tests {
             "no control character survives into the summary: {s:?}"
         );
         assert_eq!(s, "tabbedtitle");
+
+        // A Unicode line or paragraph separator is refused by ingestion too,
+        // and used to survive this filter and abort the import.
+        obs.title = Some("one\u{2028}line\u{2029}title".to_owned());
+        assert_eq!(build_summary(&obs), "onelinetitle");
 
         // An all-control-char winner (control chars are not whitespace, so it
         // survives `first_non_empty`) must NOT strip to a blank summary — that

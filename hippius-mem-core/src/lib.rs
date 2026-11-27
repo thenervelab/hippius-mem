@@ -108,6 +108,7 @@ pub use store::{
     FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, Joined, KeyCheckMatch,
     KeyCheckPublished, KeyProbe, KeyShares, MIN_GC_GRACE, MemoryBlobStore, MemoryStore,
     NoteHistory, OpKindLabel, OpStats, PublishKeyCheck, RecallInput, RememberInput,
-    RotationOutcome, S3BlobStore, SealedRecord, TeamKeyCheck, copy_store, key_check_key,
-    load_latest_snapshot, matches_published_key_check, probe_create_only, save_snapshot,
+    RotationOutcome, S3BlobStore, SealedRecord, TeamKeyCheck, breaks_a_line, copy_store,
+    key_check_key, load_latest_snapshot, matches_published_key_check, probe_create_only,
+    save_snapshot,
 };

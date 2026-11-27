@@ -9009,9 +9009,11 @@ fn validate_summary(summary: &str) -> Result<(), MemError> {
     Ok(())
 }
 
-/// Whether `c` is refused in a summary (see [`validate_summary`]): a control
-/// character, or a Unicode line or paragraph separator.
-fn breaks_a_line(c: char) -> bool {
+/// Whether `c` is refused in a note summary: a control character, or a Unicode
+/// line or paragraph separator (U+2028, U+2029). A caller that builds a
+/// summary from foreign text drops these first, or the note is refused.
+#[must_use]
+pub fn breaks_a_line(c: char) -> bool {
     c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
 }
 
