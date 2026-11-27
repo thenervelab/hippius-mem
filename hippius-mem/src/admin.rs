@@ -1211,22 +1211,23 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Stray arguments, `HIPPIUS_MEM_MNEMONIC` unset or invalid, a store that
-/// cannot be built, a team without a manifest, a founder without a member key,
+/// Stray arguments, a local trial vault, `HIPPIUS_MEM_MNEMONIC` unset or
+/// invalid, a store that cannot be built, a team without a manifest, a founder without a member key,
 /// an epoch the founder lacks whose wrap here could not be shared, or a failed
 /// read or write.
 async fn share_epoch_keys(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
     reject_args("admin share-epoch-keys", args)?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+    let (profile, store) = routed_store(&cfg).await?;
+    crate::config::require_s3(&profile, "admin share-epoch-keys")?;
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").context(
         "`admin share-epoch-keys` requires HIPPIUS_MEM_MNEMONIC (this member's mnemonic), which \
          opens this member's wraps",
     )?;
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
-    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let (_profile, store) = routed_store(&cfg).await?;
 
     let KeyShares { shared, skipped } = store.share_epoch_keys(&identity).await?;
     let list = |epochs: &[u64]| {

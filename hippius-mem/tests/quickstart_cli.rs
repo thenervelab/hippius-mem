@@ -351,13 +351,15 @@ fn team_commands_refuse_a_local_profile() -> anyhow::Result<()> {
     // usable against a local trial profile — see
     // `mint_token_reaches_arg_parsing_on_a_local_profile` below.
     // `rotate` and `remove` used to skip the check and rotate the trial vault,
-    // whose mnemonic-less daemon then refused every write.
+    // whose mnemonic-less daemon then refused every write; `admin
+    // share-epoch-keys` failed later without naming the cause.
     let member = "5DfhGyQdFobKM8NsWvEeAKk5EQQgYe9AydgJ7rMB6E1EqRzV";
     let mut commands = vec![
         vec!["join"],
         vec!["provision"],
         vec!["rotate"],
         vec!["remove", member],
+        vec!["admin", "share-epoch-keys"],
     ];
     if cfg!(feature = "console") {
         commands.push(vec!["invite"]);
