@@ -272,6 +272,9 @@ sub-token revocation, is the manual step above):
 without it: the founder reads a rotated epoch only with its mnemonic. When the founder has
 not run `join`, they publish the founder's member key first and say so, so the new epoch is
 always wrapped to the founder, and the rotation never waits for another member to `join`.
+They never replace a member key the founder already published: when `HIPPIUS_MEM_MNEMONIC` is
+not the mnemonic the founder joined with, they refuse before writing anything, because the
+epochs already wrapped to the published key would stay wrapped to it.
 
 **Resumable.** Steps 2 and 3 are not atomic (they are `rotate --members`'s semantics):
 the rotation can fail (a storage fault, or another rotation taking the same epoch) after

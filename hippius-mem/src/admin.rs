@@ -375,12 +375,12 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
 /// under a pin, or nothing to rotate — see the typed `MemError` variants).
 pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
     let members = parse_rotate_args(args)?;
-    let (cfg, store) = load_rotation_store().await?;
+    let (cfg, store, founder) = load_rotation_store().await?;
     // `rotate`'s whole point is rotating: always attempt it. The
     // should-we-bother guard `remove` uses (see `removal_requires_rotation`)
     // is meaningless here — there is no single removal target to check
     // against.
-    publish_and_rotate(&cfg, &store, members, true).await
+    publish_and_rotate(&cfg, &store, &founder, members, true).await
 }
 
 /// Run `remove <ss58>`: as the founder, fuse the removable parts of the
@@ -412,7 +412,7 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 ///   as already excluded on a re-run; its error says to finish with
 ///   `hippius-mem rotate`.
 /// - The rotation always has a recipient: the founder, whose member key
-///   [`load_rotation_store`] publishes first, so it no longer waits for a
+///   [`publish_and_rotate`] publishes first when it has none, so it no longer waits for a
 ///   remaining member to `join`.
 /// - The manual revoke reminder — the one step no CLI reaches — prints on
 ///   every run, success or not, resumed or not, rotated or not: the
@@ -430,7 +430,7 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
     let target = parse_remove_args(args)?;
-    let (cfg, store) = load_rotation_store().await?;
+    let (cfg, store, founder) = load_rotation_store().await?;
     let manifest = store.membership_manifest().await?;
     let step = plan_removal(manifest, &target)?;
 
@@ -469,7 +469,8 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     // reading stderr and will finish via plain `rotate` (the half-applied
     // recovery), which never mentions the sub-token — so the reminder rides
     // the error chain itself rather than a stdout banner around an error.
-    if let Err(err) = publish_and_rotate(&cfg, &store, members_to_publish, should_rotate).await {
+    let published = publish_and_rotate(&cfg, &store, &founder, members_to_publish, should_rotate);
+    if let Err(err) = published.await {
         return Err(err.context(pending_revoke_reminder(&target)));
     }
 
@@ -667,26 +668,23 @@ async fn routed_store(cfg: &Config) -> anyhow::Result<(TeamProfile, MemoryStore)
 }
 
 /// Shared preamble of the rotation-driving commands (`rotate`, `remove`): load
-/// the config, build the routed profile's store, run the epoch bootstrap, and
-/// publish this founder's member key when it is missing.
+/// the config, build the routed profile's store, derive the founder identity from `HIPPIUS_MEM_MNEMONIC`, and run the epoch
+/// bootstrap. Writes nothing.
 ///
-/// `HIPPIUS_MEM_MNEMONIC` is required, and checked before anything else: the
-/// founder loads a rotated epoch's key only from a wrap addressed to its member
-/// key, opened with that mnemonic, so a rotation without it mints an epoch this
-/// founder cannot read once the command exits, and nobody else may wrap it to
-/// the founder again.
+/// `HIPPIUS_MEM_MNEMONIC` is required: the founder loads a rotated epoch's key
+/// only from a wrap addressed to its member key, opened with that mnemonic, so
+/// a rotation without it mints an epoch this founder cannot read once the
+/// command exits, and nobody else may wrap it to the founder again.
 ///
 /// The bootstrap runs BEFORE any rotation for two reasons: the new epoch must
 /// clear every epoch this founder can see (a stale local ring must not re-mint
 /// an existing epoch), and these entry points read/write full team memory, so
 /// skipping it would silently pin them to the founding epoch (the recorded
-/// `bootstrap_epochs` gotcha). This machine's member key is published before
-/// the membership publish and the rotation, so the new epoch is wrapped to the
-/// founder; stdout says when that happened. It is published before the
-/// founder check those two make, so a non-founder's attempt also publishes its
-/// member key, which is what `join` does and grants nothing.
-async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
-    use std::io::Write;
+/// `bootstrap_epochs` gotcha). The founder's member key is published later, by
+/// [`publish_and_rotate`], only once the command is going to rotate.
+async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore, Identity)> {
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+    let (_profile, store) = routed_store(&cfg).await?;
 
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").context(
         "`rotate` and `remove` require HIPPIUS_MEM_MNEMONIC (the founder's mnemonic): the \
@@ -695,19 +693,9 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     )?;
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the founder identity from HIPPIUS_MEM_MNEMONIC failed")?;
-    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let (_profile, store) = routed_store(&cfg).await?;
-
     bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
-    if store.ensure_joined(&identity).await? == Joined::Now {
-        let _ = writeln!(
-            std::io::stdout(),
-            "published this machine's member key (what `hippius-mem join` does), so the new \
-             epoch is wrapped to it too"
-        );
-    }
 
-    Ok((cfg, store))
+    Ok((cfg, store, identity))
 }
 
 /// Publish `members` (when given) and rotate the team key — the shared tail of
@@ -729,10 +717,21 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
 async fn publish_and_rotate(
     cfg: &Config,
     store: &MemoryStore,
+    founder: &Identity,
     members: Option<BTreeSet<Ss58>>,
     should_rotate: bool,
 ) -> anyhow::Result<()> {
     use std::io::Write;
+
+    // Before the membership publish, so a refusal here (not the founder, or a
+    // member key made with another mnemonic) leaves nothing half-applied.
+    if should_rotate && store.publish_rotating_founder_key(founder).await? == Joined::Now {
+        let _ = writeln!(
+            std::io::stdout(),
+            "published this machine's member key (what `hippius-mem join` does), so the new \
+             epoch is wrapped to it too"
+        );
+    }
 
     let published_members = members.is_some();
     if let Some(members) = members {
@@ -2433,24 +2432,67 @@ mod tests {
         }
     }
 
+    /// A bucket that refuses every wrap write, so a rotation fails after the
+    /// membership publish.
+    struct RefusesWraps(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for RefusesWraps {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<hippius_mem_core::CreateOutcome, MemError> {
+            if key.starts_with(&format!("{TEAM}/_keys/")) {
+                return Err(MemError::Storage("wrap writes are refused here".to_owned()));
+            }
+            self.0.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
     /// A rotation that fails after the membership publish says the membership
-    /// landed and how to finish, and keeps the cause in the chain. Here the
-    /// founder has no member key, so the rotation is refused before any wrap
-    /// is written.
+    /// landed and how to finish, and keeps the cause in the chain.
     #[tokio::test]
     async fn a_rotation_failing_after_the_publish_names_the_half_applied_state()
     -> anyhow::Result<()> {
-        let bucket = Arc::new(MemoryBlobStore::default());
-        let store = epoch0_store(&bucket)?;
+        let blob: Arc<dyn BlobStore> = Arc::new(RefusesWraps(MemoryBlobStore::default()));
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            Arc::new(signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([1u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            16,
+        );
         let cfg = rotation_test_config();
         store
             .publish_membership(BTreeSet::from([Ss58::new(DEV)?]))
             .await?;
-        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let roster = Some(BTreeSet::from([founder.ss58.clone()]));
 
-        let err = publish_and_rotate(&cfg, &store, Some(BTreeSet::from([founder])), true)
+        let err = publish_and_rotate(&cfg, &store, &founder, roster, true)
             .await
-            .expect_err("the founder has no member key");
+            .expect_err("the wrap writes are refused");
         assert!(
             format!("{err:#}").contains("membership WAS already published"),
             "{err:#}"
@@ -2458,12 +2500,12 @@ mod tests {
         assert!(
             err.chain().any(|cause| matches!(
                 cause.downcast_ref::<MemError>(),
-                Some(MemError::FounderHasNoMemberKey { .. })
+                Some(MemError::Storage(_))
             )),
             "{err:#}"
         );
         assert!(
-            bucket.list(&format!("{TEAM}/_keys/")).await?.is_empty(),
+            blob.list(&format!("{TEAM}/_keys/")).await?.is_empty(),
             "no wrap is written"
         );
         Ok(())
@@ -2479,9 +2521,10 @@ mod tests {
         let bucket = Arc::new(MemoryBlobStore::default());
         let store = epoch0_store(&bucket)?;
         let cfg = rotation_test_config();
-        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let roster = Some(BTreeSet::from([founder.ss58.clone()]));
 
-        publish_and_rotate(&cfg, &store, Some(BTreeSet::from([founder])), false).await?;
+        publish_and_rotate(&cfg, &store, &founder, roster, false).await?;
 
         assert_eq!(
             store.current_epoch(),
@@ -2555,7 +2598,14 @@ mod tests {
         let RemovalStep::Publish(remaining) = step else {
             anyhow::bail!("expected a Publish step");
         };
-        publish_and_rotate(&cfg, &store, Some(remaining), should_rotate).await?;
+        publish_and_rotate(
+            &cfg,
+            &store,
+            &founder_identity,
+            Some(remaining),
+            should_rotate,
+        )
+        .await?;
 
         assert_eq!(
             store.current_epoch(),
@@ -2589,7 +2639,8 @@ mod tests {
         let should_rotate = removal_requires_rotation(&step);
         assert!(!should_rotate, "an already-excluded target must not rotate");
 
-        publish_and_rotate(&cfg, &store, None, should_rotate).await?;
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        publish_and_rotate(&cfg, &store, &founder, None, should_rotate).await?;
 
         assert_eq!(
             store.current_epoch(),

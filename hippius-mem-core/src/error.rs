@@ -198,6 +198,23 @@ pub enum MemError {
         /// The founder's address.
         founder: String,
     },
+    /// The member key published for this machine's author names another
+    /// x25519 key than the one `HIPPIUS_MEM_MNEMONIC` derives, so a rotation
+    /// would wrap the new epoch to a key this mnemonic cannot open, or would
+    /// have to replace the published key and leave the older epochs wrapped to
+    /// the old one. Refused before any write.
+    #[error(
+        "the member key published for {member} on team {team} was made with another mnemonic \
+         than HIPPIUS_MEM_MNEMONIC; set it to the mnemonic this machine joined with, or run \
+         `hippius-mem join` to re-key on purpose (epochs already wrapped to the old key then \
+         stay unreadable to this machine)"
+    )]
+    MemberKeyMismatch {
+        /// The team.
+        team: String,
+        /// The author whose published member key differs.
+        member: String,
+    },
     /// A wrap slot of the epoch a rotation picked was taken while it wrote (a
     /// concurrent rotation), so finishing would split that epoch between two
     /// keys. The rotation deleted the wraps it had written.

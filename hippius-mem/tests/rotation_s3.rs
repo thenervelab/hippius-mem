@@ -695,6 +695,92 @@ async fn a_member_who_joins_after_two_rotations_reads_every_epoch() -> anyhow::R
     Ok(())
 }
 
+/// The team namespace the mnemonic-mismatch test owns.
+const MISMATCH_TEAM: &str = "rw-mnemonic-mismatch-live";
+
+/// `rotate` and `remove` with a mnemonic other than the one the founder joined
+/// with, or run by a member, or with nothing to rotate, write nothing: the
+/// published member keys and the wraps stay byte for byte. `rotate` used to
+/// replace the founder's member key with one for the other mnemonic before
+/// any check, so the older epochs stayed wrapped to the first key and the new
+/// one to the second.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_rotation_with_another_mnemonic_writes_nothing() -> anyhow::Result<()> {
+    const OTHER_MNEMONIC: &str =
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+    let live = Live::from_env()?;
+    let bucket = live.raw_bucket();
+    clear_team(&bucket, MISMATCH_TEAM).await;
+
+    let founder = Machine::new(
+        47,
+        "bottom drive obey lake curtain smoke basket hold race lonely fit walk",
+    )?;
+    let member = Machine::new(
+        48,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )?;
+    let outsider = Machine::new(49, OTHER_MNEMONIC)?;
+    let founder_address = founder.address()?;
+    for machine in [&founder, &member, &outsider] {
+        machine.write_config(&live, MISMATCH_TEAM, &founder_address)?;
+    }
+    founder.run(&["join"])?;
+    member.run(&["join"])?;
+    founder.run(&["publish-membership", "--members", &member.address()?])?;
+    founder.run(&["provision", "--no-recovery"])?;
+
+    let watched = [
+        format!("{MISMATCH_TEAM}/_memberkeys/"),
+        format!("{MISMATCH_TEAM}/_keys/"),
+        format!("{MISMATCH_TEAM}/_manifest/"),
+    ];
+    let mut before = Vec::new();
+    for prefix in &watched {
+        before.push(objects_under(&bucket, prefix).await?);
+    }
+
+    let member_address = member.address()?;
+    let attempts: [(&Machine, &[&str], &str); 4] = [
+        (&founder, &["rotate"], "made with another mnemonic"),
+        (
+            &founder,
+            &["remove", &member_address],
+            "made with another mnemonic",
+        ),
+        (&outsider, &["rotate"], "only the team founder"),
+        (
+            &founder,
+            &["remove", &outsider.address()?],
+            "skipping rotation",
+        ),
+    ];
+    for (machine, args, expected) in attempts {
+        let output = machine
+            .command(Mnemonic::Unset)
+            .env("HIPPIUS_MEM_MNEMONIC", OTHER_MNEMONIC)
+            .args(args)
+            .output()?;
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(said.contains(expected), "`{}`: {said}", args.join(" "));
+    }
+    for (prefix, before) in watched.iter().zip(&before) {
+        assert_eq!(
+            &objects_under(&bucket, prefix).await?,
+            before,
+            "{prefix} unchanged"
+        );
+    }
+
+    clear_team(&bucket, MISMATCH_TEAM).await;
+    Ok(())
+}
+
 /// The team namespace the never-joined-founder test owns.
 const FOUNDER_TEAM: &str = "rw-founder-live";
 

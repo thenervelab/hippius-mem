@@ -1316,8 +1316,8 @@ impl fmt::Debug for MemoryStore {
     }
 }
 
-/// Whether [`MemoryStore::ensure_joined`] had to publish this author's member
-/// key.
+/// Whether [`MemoryStore::publish_rotating_founder_key`] had to publish this
+/// author's member key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Joined {
     /// A member key naming the identity's x25519 key was already published.
@@ -8182,34 +8182,7 @@ impl MemoryStore {
         // under a pin is necessarily the pin's — the author check below then
         // reduces to "is this signer the founder".
         let manifest = self.current_manifest().await?;
-        match (&manifest, &self.founder) {
-            (Some(manifest), _) if manifest.founder != self.author => {
-                return Err(MemError::Unauthorized(format!(
-                    "only the team founder may rotate the team key: {:?} is not founder {:?}",
-                    self.author.as_str(),
-                    manifest.founder.as_str(),
-                )));
-            }
-            (None, Some(pinned)) => {
-                // Even the pinned founder gets a refusal here: with no trusted
-                // manifest the wrap gate is fail-closed and would wrap to no
-                // one, so the actionable fix (publish membership) is named
-                // instead of minting a dead epoch.
-                if &self.author != pinned {
-                    return Err(MemError::Unauthorized(format!(
-                        "only the pinned team founder may rotate the team key: {:?} is not \
-                         founder {:?}",
-                        self.author.as_str(),
-                        pinned.as_str(),
-                    )));
-                }
-                return Err(MemError::ManifestUnavailable {
-                    team: self.team.clone(),
-                });
-            }
-            // Open team (no pin, no manifest) or the founder themselves.
-            (Some(_) | None, _) => {}
-        }
+        self.require_rotator(manifest.as_ref())?;
 
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
         let new_epoch = self
@@ -8253,6 +8226,34 @@ impl MemoryStore {
             wrapped,
             key_check,
         })
+    }
+
+    /// Refuse a signer that may not rotate the team key (see
+    /// [`rotate_key`](Self::rotate_key)'s authorization).
+    fn require_rotator(&self, manifest: Option<&TeamManifest>) -> Result<(), MemError> {
+        match (manifest, &self.founder) {
+            (Some(manifest), _) if manifest.founder != self.author => {
+                Err(MemError::Unauthorized(format!(
+                    "only the team founder may rotate the team key: {:?} is not founder {:?}",
+                    self.author.as_str(),
+                    manifest.founder.as_str(),
+                )))
+            }
+            // Even the pinned founder gets a refusal here: with no trusted
+            // manifest the wrap gate is fail-closed and would wrap to no one, so
+            // the actionable fix (publish membership) is named instead of
+            // minting a dead epoch.
+            (None, Some(pinned)) if &self.author != pinned => Err(MemError::Unauthorized(format!(
+                "only the pinned team founder may rotate the team key: {:?} is not founder {:?}",
+                self.author.as_str(),
+                pinned.as_str(),
+            ))),
+            (None, Some(_)) => Err(MemError::ManifestUnavailable {
+                team: self.team.clone(),
+            }),
+            // Open team (no pin, no manifest) or the founder themselves.
+            (Some(_) | None, _) => Ok(()),
+        }
     }
 
     /// The epoch a rotation mints: the first epoch above the highest of the
@@ -8325,26 +8326,45 @@ impl MemoryStore {
         publish_member_key(self.blob.as_ref(), &self.team, &member_key).await
     }
 
-    /// [`join_as_member`](Self::join_as_member) unless this store's author
-    /// already has a published member key naming `identity`'s x25519 key.
+    /// Founder action before a rotation: check that this signer may rotate
+    /// (the authorization [`rotate_key`](Self::rotate_key) applies), then
+    /// publish its member key, naming `identity`'s x25519 key, when this author
+    /// has none, so the new epoch is wrapped to the founder.
     ///
-    /// One LIST and a GET per member key, then the publish only when needed. A
-    /// member key that names another x25519 key (an older mnemonic) is
-    /// replaced, since a wrap to it would not open with `identity`.
+    /// Never replaces a published member key: one that names another x25519
+    /// key was made with another mnemonic, and the epochs already wrapped to it
+    /// stay wrapped to it (wraps are kept, see `provision_wraps`). Replacing it
+    /// would leave no mnemonic that opens both the older epochs and the new
+    /// one, so that is refused instead. Nothing is written when this errs.
+    ///
+    /// The manifest, one LIST and a GET per member key, then the publish only
+    /// when needed.
     ///
     /// # Errors
     ///
-    /// Whatever [`load_member_keys`] or the publish report.
-    pub async fn ensure_joined(&self, identity: &Identity) -> Result<Joined, MemError> {
+    /// What [`rotate_key`](Self::rotate_key) refuses this signer for
+    /// ([`MemError::Unauthorized`], [`MemError::ManifestUnavailable`]),
+    /// [`MemError::MemberKeyMismatch`] when this author's published member key
+    /// names another x25519 key, or whatever the reads or the publish report.
+    pub async fn publish_rotating_founder_key(
+        &self,
+        identity: &Identity,
+    ) -> Result<Joined, MemError> {
+        let manifest = self.current_manifest().await?;
+        self.require_rotator(manifest.as_ref())?;
+
         let published = load_member_keys(self.blob.as_ref(), &self.team).await?;
-        let current = published
-            .iter()
-            .any(|key| key.ss58 == self.author && key.x25519_public == identity.x25519_public());
-        if current {
-            return Ok(Joined::Already);
+        match published.iter().find(|key| key.ss58 == self.author) {
+            Some(key) if key.x25519_public == identity.x25519_public() => Ok(Joined::Already),
+            Some(_) => Err(MemError::MemberKeyMismatch {
+                team: self.team.clone(),
+                member: self.author.as_str().to_owned(),
+            }),
+            None => {
+                self.join_as_member(identity).await?;
+                Ok(Joined::Now)
+            }
         }
-        self.join_as_member(identity).await?;
-        Ok(Joined::Now)
     }
 
     /// Member action: send the founder what it needs to load each epoch key it
@@ -12003,11 +12023,15 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(
-            founder.ensure_joined(&founder_identity).await?,
+            founder
+                .publish_rotating_founder_key(&founder_identity)
+                .await?,
             crate::Joined::Now
         );
         assert_eq!(
-            founder.ensure_joined(&founder_identity).await?,
+            founder
+                .publish_rotating_founder_key(&founder_identity)
+                .await?,
             crate::Joined::Already
         );
         assert_eq!(member.share_epoch_keys(&member_identity).await?, [1]);
@@ -12028,6 +12052,65 @@ mod tests {
         assert!(
             member.share_epoch_keys(&member_identity).await?.is_empty(),
             "nothing is left to share once the founder holds the epoch"
+        );
+        Ok(())
+    }
+
+    /// The member-key publish ahead of a rotation never replaces a published
+    /// key and writes nothing for a signer that may not rotate. A founder that
+    /// joined with one mnemonic and rotated with another used to have its
+    /// member key replaced, so the older epochs stayed wrapped to the first
+    /// key and the new one to the second, and no mnemonic opened both.
+    #[tokio::test]
+    async fn the_rotating_founder_key_is_published_once_and_never_replaced() -> TestResult {
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const OTHER_PHRASE: &str =
+            "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let member = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        founder
+            .publish_membership(BTreeSet::from([member.author.clone()]))
+            .await?;
+        let founder_identity = crate::derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let other_identity = crate::derive_identity(OTHER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member_keys = format!("{TEAM}/_memberkeys/");
+
+        let refused = member.publish_rotating_founder_key(&other_identity).await;
+        assert!(
+            matches!(refused, Err(MemError::Unauthorized(_))),
+            "{refused:?}"
+        );
+        assert!(
+            blob.list(&member_keys).await?.is_empty(),
+            "a non-founder writes nothing"
+        );
+
+        assert_eq!(
+            founder
+                .publish_rotating_founder_key(&founder_identity)
+                .await?,
+            crate::Joined::Now
+        );
+        let published = blob.list(&member_keys).await?;
+        let bytes = blob.get(&published[0]).await?;
+        let refused = founder.publish_rotating_founder_key(&other_identity).await;
+        assert!(
+            matches!(refused, Err(MemError::MemberKeyMismatch { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(blob.list(&member_keys).await?, published);
+        assert_eq!(
+            blob.get(&published[0]).await?,
+            bytes,
+            "the published key stays"
+        );
+        assert_eq!(
+            founder
+                .publish_rotating_founder_key(&founder_identity)
+                .await?,
+            crate::Joined::Already
         );
         Ok(())
     }

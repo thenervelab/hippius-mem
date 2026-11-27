@@ -573,7 +573,8 @@ stated plainly.
   It also publishes the new epoch's team-key check. It requires `HIPPIUS_MEM_MNEMONIC`, and
   publishes the founder's member key first when the founder has not run `join` (stdout says
   so), so the new epoch is always wrapped to the founder; a rotation with no wrap for the
-  founder is refused before anything is written.
+  founder, or whose mnemonic is not the one the founder's published member key was made
+  with, is refused before anything is written.
 - **`remove <ss58>`** — founder-only: the member-removal runbook as one command —
   validates the target against the published roster, re-publishes membership without
   them, rotates the key (the same path as `rotate --members`), and prints the one

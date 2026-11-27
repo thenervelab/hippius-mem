@@ -22,7 +22,8 @@ Nothing else in the storage format changes.
 - **`rotate` and `remove` require `HIPPIUS_MEM_MNEMONIC`** and refuse before
   writing anything without it. When the founder has not run `join`, they
   publish the founder's member key first and say so on stdout, so every new
-  epoch is wrapped to the founder.
+  epoch is wrapped to the founder. They refuse, before writing, a mnemonic
+  other than the one the founder's published member key was made with.
 - **Run `provision` once on the founder's machine after upgrading**, with
   `HIPPIUS_MEM_MNEMONIC` set. It now wraps every epoch the founder holds, so a
   member who joined after a rotation receives the epochs in between, and it
