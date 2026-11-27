@@ -147,10 +147,15 @@ async fn adopt_shared_epoch_keys(store: &MemoryStore, mnemonic: &str) -> anyhow:
 
     let identity = derive_identity(mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the identity from HIPPIUS_MEM_MNEMONIC failed")?;
-    let adopted = store
-        .adopt_shared_epoch_keys(&identity)
-        .await
-        .context("reading the members' key shares failed")?;
+    // A refused signer is reported as itself: the refusal comes before any
+    // share is read, so "reading the shares failed" would misname it.
+    let adopted = match store.adopt_shared_epoch_keys(&identity).await {
+        Ok(adopted) => adopted,
+        Err(err @ MemError::Unauthorized(_)) => return Err(err.into()),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context("reading the members' key shares failed"));
+        }
+    };
     for epoch in adopted {
         let _ = writeln!(
             std::io::stdout(),

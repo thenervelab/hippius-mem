@@ -527,8 +527,10 @@ async fn a_members_provision_changes_no_wrap_and_the_founder_keeps_reading() -> 
         let output = member.command(Mnemonic::Set).args(args).output()?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            !output.status.success() && stderr.contains("only the team founder"),
-            "a member's `{}` must be refused: {stderr}",
+            !output.status.success()
+                && stderr.contains("only the team founder")
+                && !stderr.contains("key shares failed"),
+            "a member's `{}` must be refused, as itself: {stderr}",
             args.join(" ")
         );
     }
